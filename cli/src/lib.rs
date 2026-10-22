@@ -57,9 +57,17 @@ mod interrupt {
     const SIGINT: i32 = 2;
     const SIGTERM: i32 = 15;
     static PENDING: AtomicBool = AtomicBool::new(false);
-    extern "C" { fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize; }
-    extern "C" fn note(_signal: i32) { PENDING.store(true, Ordering::SeqCst) }
-    pub fn install() { unsafe { signal(SIGINT, note); signal(SIGTERM, note); } }
+    // `SIG_DFL` is 0 in every libc we build against, so the handler is installed and restored as a
+    // plain address and the handler can put the default disposition back by itself.
+    extern "C" { fn signal(signum: i32, handler: usize) -> usize; }
+    extern "C" fn note(signum: i32) {
+        PENDING.store(true, Ordering::SeqCst);
+        // Installing a handler replaced the default disposition, so a second Ctrl-C would be swallowed
+        // by a run that is stuck (a blocked accept, a write that cannot finish). One signal asks for a
+        // clean save and exit; the next one kills the process, as it would without this module.
+        unsafe { signal(signum, 0) };
+    }
+    pub fn install() { unsafe { signal(SIGINT, note as *const () as usize); signal(SIGTERM, note as *const () as usize); } }
     pub fn pending() -> bool { PENDING.load(Ordering::SeqCst) }
 }
 
@@ -499,7 +507,9 @@ fn run<S: Soc>(mut m: Machine<S>, o: &Opts) {
 }
 
 /// Instructions between polls for a handled signal. Only a run with a `--flash-file` polls at all:
-/// without one the run is a single `Machine::run` call, exactly as before.
+/// without one the run is a single `Machine::run` call, exactly as before. 16 M instructions is about
+/// 0.2 s of emulated work at native speed (the JIT tiers, a loaded host and a slower guest widen it),
+/// which is the grain the report quotes as "interrupted by a signal".
 const SIGNAL_POLL_INSNS: u64 = 1 << 24;
 
 /// Write the flash where the command line asked: `--flash-file` (the persistent image, also what the

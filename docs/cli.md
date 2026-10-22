@@ -50,9 +50,11 @@ exit: the next run starts from the same image again. `--flash-file F` makes the 
 
 - It is loaded at start when it already holds an image, so the run begins where the previous one ended.
 - It is written back at exit, after the report, and also when `SIGINT`/`SIGTERM` interrupts the run: the
-  loop is split into chunks so a signal is noticed within a fraction of a second, the report then says
-  `interrupted by a signal`, and the exit status is 130. A run without `--flash-file` is killed by a
-  signal exactly as before.
+  loop is split into chunks of 16 M instructions — about 0.2 s of emulated work at native speed — so a
+  signal is noticed within that grain, and a second signal kills the process as it would without a
+  handler. The report then says `interrupted by a signal`, and the exit status is 130. A run without
+  `--flash-file` is killed by a signal exactly as before. With `--web` the write happens when `run`
+  returns instead, so closing the page and letting the server exit is the clean way out of a web run.
 - It is written atomically — a `.<name>.<pid>.tmp` file in the same directory, flushed and renamed over
   the target — so a killed run leaves the previous image, never half of one.
 - The file is exactly the configured flash size (`--flash-mb`). A longer file is refused (exit status 2);
