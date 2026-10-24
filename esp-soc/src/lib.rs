@@ -26,6 +26,7 @@ pub mod pins;
 pub mod png;
 pub mod serial_tcp;
 pub mod soc;
+pub mod toml;
 pub mod uart;
 pub mod web;
 pub mod wifi;
