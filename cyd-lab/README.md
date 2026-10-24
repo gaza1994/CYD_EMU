@@ -11,7 +11,35 @@ target, and it also builds and runs on Linux.
 
 ![screenshot](../cyd-lab-screenshot-3.png)
 
-## Status (v0.4)
+## Quick start (Windows release zip)
+
+1. Unzip `cyd-lab-windows-x64.zip` anywhere and run `cyd-lab\cyd-lab.exe`. The exe isn't
+   signed yet, so SmartScreen may ask: **More info > Run anyway**.
+2. First run only: cyd-lab downloads Espressif's ESP32 mask ROM (esp-rom-elfs 20260528,
+   about 5 MB, SHA-256 checked) with a progress bar. If it fails you get the error and
+   **Retry**, or **I already have the ROM ELFs** to pick a folder.
+3. **+ New device** > ESP32-2432S028R > **Create**, then **Power on**. A new board has blank
+   flash and loops on `invalid header`, the same as a real erased chip.
+4. Drag a firmware `.bin` onto the window, or use **Install from web** with a manifest URL.
+   cyd-lab guesses the offset from the image (`0xE9` at 0 = merged/factory at 0x0,
+   at 0x1000 = merged with bootloader, an app image alone = 0x10000, partition table =
+   0x8000), asks when it can't tell, and power-cycles the device around the write.
+5. **Use with...** (device toolbar) shows copy-paste commands for esptool, PlatformIO,
+   Arduino, ESPHome and a serial terminal, all on `rfc2217://127.0.0.1:PORT`.
+6. **Set up Arduino IDE** copies the bundled board package into
+   `Documents\Arduino\hardware\cydlab\esp32\`. If Espressif's esp32 core isn't installed
+   yet it says so in one step (Boards Manager > esp32 by Espressif > Install). Restart the
+   IDE, pick **ESP32-2432S028R CYD (cyd-lab, emulated)** and the **CYD 1 (cyd-lab)** port.
+
+**Portable mode:** put an empty file called `portable` next to `cyd-lab.exe` and all data
+(ROMs, devices, settings, `running.json`) lives in `data\` beside it instead of `%APPDATA%`.
+
+Everything listens on 127.0.0.1 only, so Windows Firewall doesn't prompt. No drivers, no
+admin rights, no installer. The zip needs Windows 8 or later (static CRT, no VC++
+redistributable). Graphics use DirectX 12 through wgpu (WARP on GPU-less VMs and RDP) and
+fall back to OpenGL if that fails.
+
+## Status (v0.5)
 
 | Works | Stubbed / not yet |
 | --- | --- |
@@ -26,6 +54,7 @@ target, and it also builds and runs on Linux.
 | Engine feature detection (`--help`, binary scan as a fallback), shown in Settings and as badges | |
 | PNG fallback (`--tft-png`), console with a 5000-line ring buffer | |
 | [Install from web installer](#install-from-web-installer): ESP Web Tools manifests (URL or file), tested with openHASP | Improv Wi-Fi provisioning |
+| First run: bundled engine, pinned ROM download with progress/error/retry, portable mode, drag-and-drop `.bin` with offset guessing, **Set up Arduino IDE**, **Use with...** | Exe not code-signed (SmartScreen) |
 | [Arduino IDE 2 / arduino-cli](#arduino-ide-2--arduino-cli-no-driver) over the network: discovery, upload, monitor (arduino-cli on Linux) | Arduino IDE 2 on Windows not yet run; the package index isn't hosted anywhere yet |
 
 ## Architecture
@@ -326,7 +355,17 @@ device's Screen view to 270° for this landscape sketch.
 
 ![CydHello uploaded with arduino-cli](../cyd-lab-screenshot-arduino.png)
 
-### Arduino IDE 2 on Windows (same steps; not yet run on Windows)
+### Arduino IDE 2 on Windows: the button (tested under wine, not yet on real Windows)
+
+The release zip carries the package in `arduino\`. **Set up Arduino IDE** writes it to
+`Documents\Arduino\hardware\cydlab\esp32\` (the sketchbook `hardware` folder, so no package
+index or server is needed), generates `platform.txt` against the installed esp32 core under
+`%LOCALAPPDATA%\Arduino15`, and records where `running.json` is. Under Linux arduino-cli
+found the board and port from that folder and compiled and uploaded CydHello. Under wine the
+same files were written with Windows paths, and the installed `cyd-lab-discovery.exe` listed the
+running device.
+
+### Arduino IDE 2 on Windows, via Boards Manager (same steps; not yet run on Windows)
 
 1. Run cyd-lab and power a device on.
 2. Serve the package (`py -m http.server -d arduino\dist 8765`, or wherever it is hosted).
@@ -369,7 +408,9 @@ The discovery reads `%APPDATA%\cyd-lab\running.json`. If you start cyd-lab with 
 ## Data layout
 
 ```
-%APPDATA%\cyd-lab\            (Linux: ~/.local/share/cyd-lab; override with CYD_LAB_HOME)
+%APPDATA%\cyd-lab\            (Linux: ~/.local/share/cyd-lab; override with CYD_LAB_HOME;
+                              portable mode: data\ next to the exe)
+  roms\esp32_rev300_rom.elf   downloaded on first run (SHA-256 pinned)
   settings.toml               engine exe, ROM dir, live link, ports, ...
   running.json                powered-on devices + serial ports (read by cyd-lab-discovery)
   profiles\*.toml             user profiles (a matching id replaces a built-in)
@@ -386,8 +427,8 @@ The discovery reads `%APPDATA%\cyd-lab\running.json`. If you start cyd-lab with 
 1. Install Rust with the MSVC toolchain from <https://rustup.rs> (Visual Studio Build Tools
    with "Desktop development with C++").
 2. `cargo run --release`
-3. In **Settings**, set the esp32sim exe (`esp32sim.exe`) and the ROM directory (the folder
-   with `esp32_rev300_rom.elf`, from esp32sim's `tools/fetch-rom-elfs.sh`).
+3. cyd-lab looks for `esp32sim.exe` next to itself, then on `PATH`. Otherwise set it in
+   **Settings**. The ROM is downloaded on first run.
 4. **+ New device** → ESP32-2432S028R. Import a merged image at `0x0`, or a bootloader at
    `0x1000`, partitions at `0x8000` and app at `0x10000`. Then **Power on**.
 
@@ -406,6 +447,29 @@ rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu
 # -> target/x86_64-pc-windows-gnu/release/cyd-lab.exe
 ```
+
+### Release zip
+
+```
+# engine from the esp32sim fork (gaza1994/CYD_EMU, branch cyd-2432s028r), static CRT:
+(cd ../esp32sim-applab && RUSTFLAGS="-C target-feature=+crt-static" \
+   cargo build --release -p esp32sim --bin esp32sim --target x86_64-pc-windows-gnu)
+cargo build --release --bins --target x86_64-pc-windows-gnu   # crt-static via .cargo/config.toml
+python3 tools/package_windows.py --bin-dir target/x86_64-pc-windows-gnu/release \
+  --engine ../esp32sim-applab/target/x86_64-pc-windows-gnu/release/esp32sim.exe \
+  --engine-src ../esp32sim-applab --strip x86_64-w64-mingw32-strip \
+  --out ../release/cyd-lab-windows-x64.zip
+x86_64-w64-mingw32-objdump -p cyd-lab.exe | grep "DLL Name"   # system DLLs only
+```
+
+The zip holds `cyd-lab/` with `cyd-lab.exe`, `esp32sim.exe`, `arduino/tools/*.exe`,
+`arduino/examples/`, `README-QUICKSTART.txt` and `LICENSES/` (both MIT licences, NOTICE with
+esp32sim's authors and upstream PR credits, and generated third-party crate lists).
+
+`.github/workflows/release.yml` does the same on `windows-latest` with the MSVC target:
+run it by hand with `engine_repo` (default `gaza1994/CYD_EMU`) and `engine_ref` (default
+`cyd-2432s028r`), or push a `v*` tag to also make a draft release. It checks the DLL imports
+with dumpbin, smoke-runs the exes and uploads the zip as an artifact.
 
 ### Tests
 
