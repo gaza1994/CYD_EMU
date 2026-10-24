@@ -21,7 +21,10 @@ fn help(chip: &str, code: i32) -> ! {
     eprintln!("  --rom F               the chip's mask ROM ELF; default: $ESP32SIM_ROM_DIR, then ~/.espressif/tools/esp-rom-elfs/*/");
     eprintln!("                        (Espressif's, not in the tarball: tools/fetch-rom-elfs.sh DIR downloads all four)");
     eprintln!("  --board NAME          board model (S3: atech14, waveshare-lcd4b, waveshare-amoled18-v2, waveshare-cam, none;");
-    eprintln!("                        C6: waveshare-c6-lcd147, none; classic: ttgo-tdisplay, cyd-2432s028r, esp32dev, none)");
+    eprintln!("                        C6: waveshare-c6-lcd147, none; classic: ttgo-tdisplay, cyd-2432s028r (cyd), cyd-2432s028r-2usb (cyd-2usb),");
+    eprintln!("                        cyd-2432s024r/c, cyd-2432s032r/c, cyd-3248s035r/c, generic-display, esp32dev, none)");
+    eprintln!("  --board-config F.toml   a classic board profile: SPI display, touch, backlight, LED (docs/board-profiles.md);");
+    eprintln!("                        with --board generic-display, or instead of a built-in --board name");
     eprintln!("  --flash-mb N, --psram-mb N   memory sizes (S3 default 8 / 2, C3, C6 and classic 4 / 0)");
     eprintln!("  --max-seconds S       stop after S emulated seconds (always give one: the run returns)");
     eprintln!("  --console usb|uart0|both|none   which consoles to print (uart0 shows the ROM and bootloader)");
@@ -166,7 +169,7 @@ pub struct Opts {
     pub flash_octal: bool,
     pub boot: Option<String>, pub flash_mb: Option<usize>, pub psram_mb: Option<usize>,
     pub mac: Option<[u8; 6]>, pub strap: Option<u32>, pub reset_cause: Option<u32>, pub efuse_regs: Option<String>, pub regs_init: Option<String>,
-    pub board: String, pub wifi: Option<String>, pub wifi_nearby: Vec<String>, pub ble: bool, pub ble_full: bool, pub ble_observe: bool, pub ble_scan: bool, pub net: String, pub hostfwd: Vec<String>, pub mdns_relay: Option<String>, pub cam_image: Option<String>, pub cam_stream: Option<String>, pub cam_size: Option<String>, pub cam_fps: f64,
+    pub board: String, pub board_config: Option<String>, pub wifi: Option<String>, pub wifi_nearby: Vec<String>, pub ble: bool, pub ble_full: bool, pub ble_observe: bool, pub ble_scan: bool, pub net: String, pub hostfwd: Vec<String>, pub mdns_relay: Option<String>, pub cam_image: Option<String>, pub cam_stream: Option<String>, pub cam_size: Option<String>, pub cam_fps: f64,
     pub spi2_timing: bool, pub measured_te: bool,
     pub max_insns: u64, pub max_seconds: Option<f64>, pub script: Option<String>, pub serial: Option<String>,
     pub console: Option<String>, pub console_prefix: bool, pub realtime: bool, pub web_port: Option<u16>, pub web_dir: Option<String>, pub no_reboot: bool, pub serial_tcp: Option<String>, pub quit_on_stdin_eof: bool,
@@ -211,6 +214,7 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--efuse-regs" => o.efuse_regs = Some(next()),
             "--regs-init" => o.regs_init = Some(next()),
             "--board" => o.board = next(),
+            "--board-config" => o.board_config = Some(next()),
             "--spi2-timing" => o.spi2_timing = true,
             "--measured-te" => o.measured_te = true,
             "--wifi" => o.wifi = Some(next()),
@@ -331,6 +335,7 @@ pub fn run_cli(default_chip: &str) {
     if o.cooja { return run_cooja(&mut o); }
     match o.chip.as_str() {
         "esp32" => { let m = setup_esp32(&o); run(m, &o) }
+        _ if o.board_config.is_some() => usage_error("--board-config: board profiles are for the classic ESP32 (--chip esp32)"),
         "s3" | "esp32s3" => { let m = setup_s3(&o); run(m, &o) }
         "c3" | "esp32c3" => { let m = setup_c3(&o); run(m, &o) }
         "c6" | "esp32c6" => { let m = setup_c6(&o); run(m, &o) }
@@ -498,7 +503,11 @@ fn setup_esp32(o: &Opts) -> esp32::Machine {
     m.bus.set_flash_size(o.flash_mb.unwrap_or(4) << 20);
     if !o.debug.is_empty() { let mut f = esp_soc::DebugFlags::from_env(); for d in &o.debug { f.parse(d); } m.set_debug(&f); }
     let board = if o.board == "atech14" { "none" } else { &o.board };
-    m.bus.board = esp32::board::make_board(board).unwrap_or_else(|| usage_error(&format!("unknown classic ESP32 board '{board}' (none, bare, esp32dev, ttgo-tdisplay, cyd-2432s028r)")));
+    m.bus.board = match &o.board_config {
+        Some(path) => esp32::board::make_board_config(path, "esp32").unwrap_or_else(|e| usage_error(&format!("--board-config {e}"))),
+        None if board == "generic-display" => usage_error("--board generic-display needs --board-config FILE.toml"),
+        None => esp32::board::make_board(board).unwrap_or_else(|| usage_error(&format!("unknown classic ESP32 board '{board}' (none, bare, esp32dev, ttgo-tdisplay, {}, generic-display)", esp32::board::profile_names().join(", ")))),
+    };
     m.bus.attach_board_devices();
     if let Some(spec) = &o.wifi {
         let (cfg, nat) = wifi_config(spec, o.net == "nat" || o.net == "user", m.bus.debug.has("net"), &o.hostfwd, o.mdns_relay.as_deref());
