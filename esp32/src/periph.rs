@@ -499,11 +499,32 @@ impl Device for ClassicGpio {
 
 // The classic UART adds UART_MEM_RX_STATUS (uart_reg.h, UART_MEM_RX_STATUS_REG at 0x60):
 // bits 13-23 hold the receive FIFO write pointer, modelled as the queued count mod 128.
-pub struct ClassicUart(pub Uart);
+/// The second field is `rx_seen` when AUTOBAUD_EN last went high: the edges counted since. The
+/// third is set while a TX_DONE cleared through INT_CLR stays down: no byte has been sent since.
+/// The ROM's `uart_tx_wait_idle` (0x40009278) clears TX_DONE and spins while the raw bit is still
+/// set, so the shared device's always-raised TX_DONE would hang the flasher stub.
+pub struct ClassicUart(pub Uart, u32, bool);
 impl ClassicUart {
     const MEM_RX_STATUS: u32 = 0x60;
+    /// ESP-IDF v5.5.4 components/soc/esp32/register/soc/uart_reg.h: AUTOBAUD (en at bit 0),
+    /// LOWPULSE/HIGHPULSE (min pulse widths, 20 bits, reset 0xfffff), RXD_CNT (edges, 10 bits),
+    /// POSPULSE/NEGPULSE.
+    const AUTOBAUD: u32 = 0x18;
+    /// The download-mode ROM (rev3 `uart_baudrate_detect`, 0x40009034) enables autobaud, waits for
+    /// RXD_CNT above 127 edges, then sets CLKDIV to (LOWPULSE + HIGHPULSE) / 2 + 9. A virtual line
+    /// has no bit timing, so once a byte has arrived the widths read as a 115200 bit cell at the
+    /// ROM's 40 MHz APB (XTAL) clock less that 9: the divider comes out at 347, which esptool reads
+    /// back as a 40 MHz crystal. Any host baud works because bytes are not timed here.
+    const AUTOBAUD_PULSE: u32 = 40_000_000 / 115_200 - 9;
+    const TX_DONE: u32 = 1 << 14;
     fn new(layout: UartLayout) -> Self {
-        Self(Uart::new(layout))
+        Self(Uart::new(layout), 0, false)
+    }
+    fn tx_done_mask(&self) -> u32 { if self.2 { !Self::TX_DONE } else { !0 } }
+    /// Line edges since autobaud was enabled: up to ten per byte (a 0x55 SYNC byte has ten).
+    fn autobaud_edges(&self) -> u32 {
+        if self.0.reg(Self::AUTOBAUD) & 1 == 0 { return 0; }
+        self.0.rx_seen.wrapping_sub(self.1).saturating_mul(10)
     }
 }
 impl std::ops::Deref for ClassicUart {
@@ -519,18 +540,24 @@ impl std::ops::DerefMut for ClassicUart {
 }
 impl Device for ClassicUart {
     fn read(&mut self, off: u32) -> u32 {
-        if off == Self::MEM_RX_STATUS {
-            ((self.0.rx_pending() % 128) as u32) << 13
-        } else {
-            self.0.read(off)
+        match off {
+            Self::MEM_RX_STATUS => ((self.0.rx_pending() % 128) as u32) << 13,
+            0x28 | 0x2c | 0x68 | 0x6c => if self.autobaud_edges() != 0 { Self::AUTOBAUD_PULSE } else { 0xfffff },
+            0x30 => self.autobaud_edges().min(0x3ff),
+            0x4 | 0x8 => self.0.read(off) & self.tx_done_mask(),
+            _ => self.0.read(off),
         }
     }
     fn write(&mut self, off: u32, v: u32) -> WriteEffect {
+        // A rising AUTOBAUD_EN restarts the measurement.
+        if off == Self::AUTOBAUD && v & 1 != 0 && self.0.reg(off) & 1 == 0 { self.1 = self.0.rx_seen; }
+        // INT_CLR takes TX_DONE down until the next byte, which the virtual line sends at once.
+        match off { 0x0 => self.2 = false, 0x10 if v & Self::TX_DONE != 0 => self.2 = true, _ => {} }
         self.0.write(off, v);
         WriteEffect::NONE
     }
     fn irq_sources(&self) -> u64 {
-        self.0.irq() as u64
+        (self.0.int_raw & self.0.int_ena & self.tx_done_mask() != 0) as u64
     }
 }
 
@@ -1020,6 +1047,36 @@ mod tests {
         let mut p = Peripherals::new([0x24, 0x6f, 0x28, 0, 0x11, 0x22]);
         assert_eq!(p.read32(0x3ff5_a004), 0x2800_1122);
         assert_eq!(p.read32(0x3ff5_a008), 0x00cf_246f);
+    }
+
+    /// The download ROM's baud detection: nothing counts until AUTOBAUD_EN rises, then the SYNC
+    /// bytes give edges and a 115200 bit cell at the ROM's 40 MHz APB clock.
+    #[test]
+    fn classic_uart_autobaud_measures_host_bytes_after_enable() {
+        let mut p = Peripherals::new([0; 6]);
+        p.uart[0].host_input(&[0x55; 4]);
+        assert_eq!((p.read32(0x3ff4_0030), p.read32(0x3ff4_0028)), (0, 0xfffff));
+        p.write32(0x3ff4_0018, 1);
+        assert_eq!(p.read32(0x3ff4_0030), 0);
+        p.uart[0].host_input(&[0x55; 3]);
+        assert_eq!(p.read32(0x3ff4_0030), 30);
+        for off in [0x28, 0x2c, 0x68, 0x6c] { assert_eq!(p.read32(0x3ff4_0000 + off), 338); }
+        p.uart[0].host_input(&[0x55; 200]);
+        assert_eq!(p.read32(0x3ff4_0030), 0x3ff);
+        assert_eq!(p.uart[0].rx_room(), 0);
+        p.write32(0x3ff4_0018, 0);
+        p.write32(0x3ff4_0018, 1);
+        assert_eq!(p.read32(0x3ff4_0030), 0);
+    }
+
+    #[test]
+    fn classic_uart_tx_done_stays_cleared_until_the_next_byte() {
+        let mut p = Peripherals::new([0; 6]);
+        assert_ne!(p.read32(0x3ff4_0004) & (1 << 14), 0);
+        p.write32(0x3ff4_0010, 1 << 14);
+        assert_eq!(p.read32(0x3ff4_0004) & (1 << 14), 0);
+        p.write32(0x3ff4_0000, b'x' as u32);
+        assert_ne!(p.read32(0x3ff4_0004) & (1 << 14), 0);
     }
 
     #[test]

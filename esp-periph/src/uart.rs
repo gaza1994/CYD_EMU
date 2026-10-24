@@ -37,11 +37,14 @@ impl UartLayout {
 }
 
 // ------------------------------------------------------------------ UART
-pub struct Uart { pub tx_out: Vec<u8>, pub int_raw: u32, pub int_ena: u32, layout: UartLayout, rx: VecDeque<u8>, ram: RegRam }
+/// `rx_seen` counts every byte the host offered, kept or dropped (wrapping): the classic autobaud
+/// counters measure the line, not the FIFO.
+pub struct Uart { pub tx_out: Vec<u8>, pub int_raw: u32, pub int_ena: u32, pub rx_seen: u32, layout: UartLayout, rx: VecDeque<u8>, ram: RegRam }
 impl Uart {
-    pub fn new(layout: UartLayout) -> Self { Uart { tx_out: Vec::new(), int_raw: INT_ALWAYS, int_ena: 0, layout, rx: VecDeque::new(), ram: RegRam::new() } }
+    pub fn new(layout: UartLayout) -> Self { Uart { tx_out: Vec::new(), int_raw: INT_ALWAYS, int_ena: 0, rx_seen: 0, layout, rx: VecDeque::new(), ram: RegRam::new() } }
     /// Bytes from the host into the receive FIFO; what does not fit is dropped and flagged RXFIFO_OVF.
     pub fn host_input(&mut self, data: &[u8]) {
+        self.rx_seen = self.rx_seen.wrapping_add(data.len() as u32);
         for &b in data {
             if self.rx.len() >= RX_FIFO_SIZE { self.int_raw |= INT_RXFIFO_OVF; break; }
             self.rx.push_back(b);
@@ -70,7 +73,11 @@ impl Uart {
         Some((source * 16 * d / (n * uart_div)) as u32)
     }
     pub fn clock_config(&self) -> u32 { self.ram.read(0x78) }
+    /// A plain register as last written, for a chip wrapper that overlays its own fields.
+    pub fn reg(&self, off: u32) -> u32 { self.ram.read(off) }
     pub fn rx_pending(&self) -> usize { self.rx.len() }
+    /// Free receive FIFO slots: a host bridge feeds no more than this, as a paced line would.
+    pub fn rx_room(&self) -> usize { RX_FIFO_SIZE - self.rx.len().min(RX_FIFO_SIZE) }
     /// Classic ESP32 has a 20-bit divider and selects APB or the 1 MHz reference tick.
     /// ESP-IDF v5.5.4: components/soc/esp32/register/soc/uart_reg.h
     /// (UART_CLKDIV, UART_CLKDIV_FRAG, UART_TICK_REF_ALWAYS_ON) and
