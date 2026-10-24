@@ -1,0 +1,43 @@
+# The two-USB (micro-USB + USB-C) ESP32-2432S028R. Batches differ: this is the ILI9341-driven unit
+# with native landscape 320x240 glass (ESPHome: model ILI9341, dimensions 320x240, LVGL rotation
+# 180, MADCTL 0x48). Units reported with an ST7789 need controller = "st7789" and the T-Display's
+# colour handling; see docs/board-profiles.md.
+name = "cyd-2432s028r-2usb"
+aliases = ["cyd-2usb"]
+chip = "esp32"
+description = "Sunton ESP32-2432S028R two-USB: 320x240 landscape glass on an ILI9341-compatible controller, XPT2046 on its own pins"
+sources = ["https://github.com/witnessmenow/ESP32-Cheap-Yellow-Display/blob/main/PINS.md", "https://github.com/rzeldent/platformio-espressif32-sunton/blob/main/esp32-2432S028Rv3.json", "an owner's unit: ESPHome model ILI9341 320x240, rotation 180, xpt2046 calibration x 208..3823 y 282..3835 with swap_xy, mirror_x, mirror_y"]
+
+[display]
+controller = "ili9342"        # 320x240 RAM
+width = 320
+height = 240
+flip_y = true                 # MADCTL 0x48 plus LVGL's 180-degree rotation is upright
+bgr = true
+sclk = 14
+mosi = 13
+miso = 12
+cs = 15
+dc = 2
+backlight = 21
+
+[touch]
+controller = "xpt2046"
+sclk = 25
+mosi = 32
+miso = 39
+cs = 33
+irq = 36
+swap_xy = true                # X runs down the glass, Y across it
+raw_x = [282, 3835]
+raw_y = [208, 3823]
+
+[led]
+pins = [4, 16, 17]            # red, green, blue: common anode
+active = "low"
+
+[board]
+boot = 0
+ldr = 34
+sd = [18, 23, 19, 5]
+speaker = 26

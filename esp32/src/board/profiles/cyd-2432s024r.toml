@@ -1,0 +1,38 @@
+name = "cyd-2432s024r"
+chip = "esp32"
+description = "Sunton ESP32-2432S024R: 2.4-inch ILI9341 240x320, XPT2046 on the panel's bus"
+sources = ["https://github.com/rzeldent/platformio-espressif32-sunton/blob/main/esp32-2432S024R.json"]
+
+[display]
+controller = "ili9341"
+width = 240
+height = 320
+mirror_x = true
+bgr = true
+ips = false
+sclk = 14
+mosi = 13
+miso = 12
+cs = 15
+dc = 2
+backlight = 27
+
+[touch]
+controller = "xpt2046"          # shares the panel's SPI wires
+sclk = 14
+mosi = 13
+miso = 12
+cs = 33
+irq = 36
+raw_x = [3800, 240]
+raw_y = [200, 3700]
+
+[led]
+pins = [4, 16, 17]            # red, green, blue: common anode
+active = "low"
+
+[board]
+boot = 0
+ldr = 34
+sd = [18, 23, 19, 5]
+speaker = 26

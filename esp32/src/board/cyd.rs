@@ -22,9 +22,19 @@
 //! action is in glass pixels (240×320 portrait) and becomes raw readings with the calibration the
 //! common CYD sketches carry: on rotation 1 (landscape) they map XPT2046_Touchscreen's x
 //! (channel 001) 200..3700 onto 0..319 and y (channel 101) 240..3800 onto 0..239.
+//!
+//! The ESP32-2432S028R is the first of a family of `GenericDisplay` boards described by a profile
+//! (`profile.rs`; built-ins in `profiles/`, any other with `--board generic-display --board-config
+//! FILE.toml`): another controller and glass size, a mirror, colour order and IPS inversion, the
+//! XPT2046 on its own pins or sharing the panel's (then its CS picks it), a GT911 or CST816S/CST820
+//! over I2C instead, the backlight and LED active levels. LEDC PWM on the backlight pin scales the
+//! picture by its duty; a plain level on it is not applied.
+use std::sync::{Arc, Mutex};
 use esp_soc::board::{BoardEdge, SpiPins, VirtualCycle};
+use esp_soc::devices::touch_i2c::{Cst820, Gt911, TouchState};
 use esp_soc::devices::{DcsPanel, Xpt2046};
 use esp_soc::BoardModel;
+use super::profile::{I2cTouch, Profile, Touch};
 
 pub const PIN_LCD_SCLK: u8 = 14;
 pub const PIN_LCD_MOSI: u8 = 13;
@@ -42,149 +52,221 @@ pub const PIN_TOUCH_CLK: u8 = 25;
 pub const PIN_TOUCH_MOSI: u8 = 32;
 pub const PIN_TOUCH_MISO: u8 = 39;
 pub const PIN_TOUCH_CS: u8 = 33;
-const TOUCH_PINS: (u8, u8, u8) = (PIN_TOUCH_CLK, PIN_TOUCH_MOSI, PIN_TOUCH_CS);
 
 pub const LCD_COLS: usize = 240;
 pub const LCD_ROWS: usize = 320;
 
-/// What the glass shows, as a portrait 240×320 frame. The panel shows the controller's whole RAM,
-/// with the columns mirrored: the drivers' upright portrait (rotation 0) is MADCTL 0x48, MX | BGR,
-/// in Adafruit_ILI9341 and TFT_eSPI's ILI9341 drivers, so the driver's column 0 lands in RAM
-/// column 239 and that is the glass's left edge. Display Function Control (B6h) can reverse the
-/// scans: GS shows the rows bottom to top, SS undoes the column mirror (its effect on the R/B dot
-/// order is not modelled). LovyanGFX's `Panel_ILI9341` sends GS with MADCTL 0x08 as rotation 0,
-/// which is why CYD setups for it use `offset_rotation = 2` (MX | MY): unadjusted, as in openHASP's
-/// `esp32-2432s028r` build, the picture is upside down (rotated 180°) until its `rotate` is 2. Red and blue are
-/// exchanged unless MADCTL's BGR bit is set (all three drivers set it). INVON inverts every pixel:
-/// unlike the T-Display's IPS glass, this TN panel shows colours as sent with inversion off
-/// (TFT_eSPI's CYD setups leave `TFT_INVERSION_ON` undefined). Asleep or off, the glass is black.
-/// The backlight is not applied: LEDC dimming on GPIO 21 is common and its PWM is not a level.
-pub fn lcd_visible(p: &DcsPanel) -> Vec<u16> {
-    let mut out = Vec::with_capacity(LCD_COLS * LCD_ROWS);
-    let exchange = p.madctl & 0x08 == 0;
-    let blank = !p.on || p.sleeping;
-    for y in 0..LCD_ROWS {
-        let row = if p.gate_reversed { LCD_ROWS - 1 - y } else { y } * p.cols;
-        for x in 0..LCD_COLS {
-            let mut px = p.gram[row + if p.source_reversed { x } else { LCD_COLS - 1 - x }];
-            if exchange { px = (px & 0x07e0) | ((px & 0xf800) >> 11) | ((px & 0x001f) << 11); }
-            if p.inverted { px = !px; }
-            if blank { px = 0; }
-            out.push(px);
-        }
-    }
-    out
-}
+/// The ESP32-2432S028R: the `cyd-2432s028r` profile.
+pub type Cyd2432S028R = GenericDisplay;
 
-/// The Sunton ESP32-2432S028R.
-pub struct Cyd2432S028R {
-    /// the ILI9341; `lcd_visible` is what the glass shows
+/// An ESP32 with an SPI display, wired as its `Profile` says.
+pub struct GenericDisplay {
+    pub profile: Profile,
+    /// the controller; `lcd_visible` is what the glass shows
     pub panel: DcsPanel,
-    /// the CS line, high (deselected) until the firmware drives GPIO 15 low
+    /// the CS line, high (deselected) until the firmware drives it low
     pub cs_high: bool,
     pub backlight: bool,
-    /// the RGB LED as the UI's one-LED ring (each channel full on while its GPIO is low)
+    /// LEDC duty on the backlight pin (0..65535), while PWM drives it
+    pub backlight_duty: Option<u32>, backlight_changes: u64,
+    /// the RGB LED as the UI's one-LED ring (each channel full on while its GPIO is active)
     pub led: [[u8; 3]; 1],
     pub led_updates: u64,
     pub gpio_events: u64,
-    /// SPI bytes delivered to the controller / dropped (CS high, or not on GPIO 14/13)
+    /// SPI bytes delivered to the controller / dropped (CS high, or not on its SCLK/MOSI)
     pub spi_bytes: u64, pub spi_dropped: u64,
     /// the XPT2046 and the bytes it took over hardware SPI
     pub touch: Xpt2046, pub touch_bytes: u64,
+    /// what an I2C touch controller reports
+    pub touch_state: Arc<Mutex<TouchState>>,
     cycle: VirtualCycle, edges: Vec<BoardEdge>, irq: bool, dout: bool,
 }
-impl Default for Cyd2432S028R { fn default() -> Self { Self::new() } }
-impl Cyd2432S028R {
-    pub fn new() -> Self {
-        Cyd2432S028R { panel: DcsPanel::ili9341(), cs_high: true, backlight: false, led: [[0; 3]], led_updates: 0, gpio_events: 0, spi_bytes: 0, spi_dropped: 0,
-                       touch: Xpt2046::new(), touch_bytes: 0, cycle: 0, edges: Vec::new(), irq: true, dout: false }
+impl Default for GenericDisplay { fn default() -> Self { Self::new() } }
+impl GenericDisplay {
+    /// The ESP32-2432S028R.
+    pub fn new() -> Self { Self::from_profile(super::profile::builtin("cyd-2432s028r").expect("built-in cyd profile")) }
+    pub fn from_profile(profile: Profile) -> Self {
+        let panel = DcsPanel::by_name(&profile.controller).expect("profile controller");
+        GenericDisplay { profile, panel, cs_high: true, backlight: false, backlight_duty: None, backlight_changes: 0, led: [[0; 3]], led_updates: 0, gpio_events: 0, spi_bytes: 0, spi_dropped: 0,
+                         touch: Xpt2046::new(), touch_bytes: 0, touch_state: Default::default(), cycle: 0, edges: Vec::new(), irq: true, dout: false }
     }
-    /// Glass pixel (portrait, as `display()`) to the controller's raw (X, Y): channel 101 runs
-    /// 3800..240 across the portrait width, channel 001 200..3700 down its height.
-    pub fn touch_raw(x: u16, y: u16) -> (u16, u16) {
-        let (x, y) = (u32::from(x.min(LCD_COLS as u16 - 1)), u32::from(y.min(LCD_ROWS as u16 - 1)));
-        ((3800 - x * 3560 / (LCD_COLS as u32 - 1)) as u16, (200 + y * 3500 / (LCD_ROWS as u32 - 1)) as u16)
+    /// Glass pixel to the XPT2046's raw (X, Y), from the profile's readings at the first and last
+    /// pixel; the ESP32-2432S028R's channel 101 runs 3800..240 across the portrait width, channel
+    /// 001 200..3700 down its height.
+    pub fn touch_raw(&self, x: u16, y: u16) -> (u16, u16) {
+        let Touch::Xpt2046 { raw_x, raw_y, swap_xy, .. } = self.profile.touch else { return (0, 0) };
+        let lerp = |(a, b): (i32, i32), g: u16, n: usize| (a + i32::from(g).min(n as i32 - 1) * (b - a) / (n as i32 - 1)).clamp(0, 4095) as u16;
+        let (w, h) = (self.profile.width, self.profile.height);
+        if swap_xy { (lerp(raw_x, y, h), lerp(raw_y, x, w)) } else { (lerp(raw_x, x, w), lerp(raw_y, y, h)) }
     }
-    /// Queue edges for PENIRQ (GPIO 36) and DOUT (GPIO 39) where the controller changed them.
+    /// What the glass shows, as a `width`×`height` frame. On the ESP32-2432S028R the panel shows the controller's whole RAM,
+    /// with the columns mirrored: the drivers' upright portrait (rotation 0) is MADCTL 0x48, MX | BGR,
+    /// in Adafruit_ILI9341 and TFT_eSPI's ILI9341 drivers, so the driver's column 0 lands in RAM
+    /// column 239 and that is the glass's left edge. Display Function Control (B6h) can reverse the
+    /// scans: GS shows the rows bottom to top, SS undoes the column mirror (its effect on the R/B dot
+    /// order is not modelled). LovyanGFX's `Panel_ILI9341` sends GS with MADCTL 0x08 as rotation 0,
+    /// which is why CYD setups for it use `offset_rotation = 2` (MX | MY): unadjusted, as in openHASP's
+    /// `esp32-2432s028r` build, the picture is upside down (rotated 180°) until its `rotate` is 2. Red and blue are
+    /// exchanged unless MADCTL's BGR bit is set (all three drivers set it). INVON inverts every pixel:
+    /// unlike the T-Display's IPS glass, this TN panel shows colours as sent with inversion off
+    /// (TFT_eSPI's CYD setups leave `TFT_INVERSION_ON` undefined). Asleep or off, the glass is black.
+    pub fn lcd_visible(&self) -> Vec<u16> {
+        let (p, pr) = (&self.panel, &self.profile);
+        let exchange = (p.madctl & 0x08 != 0) != pr.bgr;
+        let invert = p.inverted != pr.ips;
+        let blank = !p.on || p.sleeping;
+        let mx = pr.mirror_x != (pr.scan_control && p.source_reversed);
+        let my = pr.flip_y != (pr.scan_control && p.gate_reversed);
+        let level = self.backlight_duty.map(|d| if pr.backlight_high { d } else { 65535 - d.min(65535) });
+        let mut out = Vec::with_capacity(pr.width * pr.height);
+        for gy in 0..pr.height {
+            let ry = gy + pr.offset.1;
+            let row = if my { p.rows - 1 - ry } else { ry } * p.cols;
+            for gx in 0..pr.width {
+                let rx = gx + pr.offset.0;
+                let mut px = p.gram[row + if mx { p.cols - 1 - rx } else { rx }];
+                if exchange { px = (px & 0x07e0) | ((px & 0xf800) >> 11) | ((px & 0x001f) << 11); }
+                if invert { px = !px; }
+                if blank { px = 0; }
+                if let Some(l) = level {
+                    let scale = |v: u16| (u32::from(v) * l / 65535) as u16;
+                    px = (scale(px >> 11) << 11) | (scale((px >> 5) & 0x3f) << 5) | scale(px & 0x1f);
+                }
+                out.push(px);
+            }
+        }
+        out
+    }
+    /// Queue edges for PENIRQ and DOUT where the XPT2046 changed them.
     fn sync_touch_pins(&mut self) {
+        let Touch::Xpt2046 { irq: irq_pin, miso, .. } = self.profile.touch else { return };
         let (irq, dout) = (self.touch.irq(), self.touch.dout());
-        if irq != self.irq { self.irq = irq; self.edges.push(BoardEdge { cycle: self.cycle, pin: PIN_TOUCH_IRQ, level: irq }); }
-        if dout != self.dout { self.dout = dout; self.edges.push(BoardEdge { cycle: self.cycle, pin: PIN_TOUCH_MISO, level: dout }); }
+        if irq != self.irq { self.irq = irq; self.edges.push(BoardEdge { cycle: self.cycle, pin: irq_pin, level: irq }); }
+        if dout != self.dout { self.dout = dout; self.edges.push(BoardEdge { cycle: self.cycle, pin: miso, level: dout }); }
     }
     /// Whether a transaction with these routes is on the panel's wires; undecodable routes are
     /// taken as the panel's, as on the T-Display.
-    fn on_panel_wires(pins: &SpiPins) -> bool {
+    fn on_panel_wires(&self, pins: &SpiPins) -> bool {
         let routed = pins.sclk != 0 || pins.mosi != 0;
-        !routed || (pins.sclk & (1 << PIN_LCD_SCLK) != 0 && pins.mosi & (1 << PIN_LCD_MOSI) != 0)
+        !routed || (pins.sclk & (1 << self.profile.sclk) != 0 && pins.mosi & (1 << self.profile.mosi) != 0)
     }
     fn set_led(&mut self, channel: usize, level: bool) {
-        let v = if level { 0 } else { 255 };
+        let v = if level == self.profile.led_high { 255 } else { 0 };
         if self.led[0][channel] != v { self.led[0][channel] = v; self.led_updates += 1; }
     }
+    fn touch_irq_pin(&self) -> Option<u8> {
+        match self.profile.touch { Touch::Xpt2046 { irq, .. } => Some(irq), Touch::I2c { int, .. } => int, Touch::None => None }
+    }
 }
-impl BoardModel for Cyd2432S028R {
-    fn name(&self) -> &'static str { "cyd-2432s028r" }
+impl BoardModel for GenericDisplay {
+    fn name(&self) -> &'static str { self.profile.name }
     fn gpio_changes(&mut self, changes: &[(u8, bool)]) {
+        let pr = &self.profile;
+        let (cs, dc, rst, bl, led) = (pr.cs, pr.dc, pr.rst, pr.backlight, pr.led);
+        let xpt = if let Touch::Xpt2046 { sclk, mosi, cs, .. } = pr.touch { Some((sclk, mosi, cs)) } else { None };
         for &(pin, level) in changes {
             self.gpio_events += 1;
-            match pin {
-                PIN_LCD_CS => self.cs_high = level,
-                PIN_LCD_DC => self.panel.dc = level,
-                PIN_LCD_BL => self.backlight = level,
-                PIN_LED_R => self.set_led(0, level),
-                PIN_LED_G => self.set_led(1, level),
-                PIN_LED_B => self.set_led(2, level),
-                PIN_TOUCH_CLK | PIN_TOUCH_MOSI | PIN_TOUCH_CS => { self.touch.pin(TOUCH_PINS, pin, level); }
-                _ => {}
-            }
+            if pin == cs { self.cs_high = level; }
+            if pin == dc { self.panel.dc = level; }
+            if rst == Some(pin) && !level { self.panel.reset(); }
+            if bl == Some(pin) { self.backlight = level == self.profile.backlight_high; }
+            if let Some(i) = led.and_then(|l| l.iter().position(|&p| p == pin)) { self.set_led(i, level); }
+            if let Some(t) = xpt.filter(|t| pin == t.0 || pin == t.1 || pin == t.2) { self.touch.pin(t, pin, level); }
         }
         self.sync_touch_pins();
     }
     fn uses_spi_pins(&self) -> bool { true }
     fn spi_transfer_pins(&mut self, _host: u8, pins: SpiPins, tx: &[u8], rx_len: usize) -> Vec<u8> {
-        if pins.sclk & (1 << PIN_TOUCH_CLK) != 0 && pins.mosi & (1 << PIN_TOUCH_MOSI) != 0 {
-            self.touch.select(pins.cs & (1 << PIN_TOUCH_CS) != 0);
-            if !self.touch.selected() { self.spi_dropped += tx.len() as u64; return vec![0; rx_len]; }
-            // full duplex (MOSI and MISO phases together) unless the read phase is the longer one,
-            // which is a half-duplex read clocked after the write
-            let n = if rx_len > tx.len() { tx.len() + rx_len } else { tx.len() };
-            let rx: Vec<u8> = (0..n).map(|i| self.touch.byte(tx.get(i).copied().unwrap_or(0))).collect();
-            self.touch_bytes += n as u64;
-            self.sync_touch_pins();
-            return if rx_len > tx.len() { rx[tx.len()..].to_vec() } else { rx[..rx_len].to_vec() };
+        if let Touch::Xpt2046 { sclk, mosi, cs, .. } = self.profile.touch {
+            if pins.sclk & (1 << sclk) != 0 && pins.mosi & (1 << mosi) != 0 {
+                let selected = pins.cs & (1 << cs) != 0;
+                self.touch.select(selected);
+                if selected {
+                    // full duplex (MOSI and MISO phases together) unless the read phase is the longer one,
+                    // which is a half-duplex read clocked after the write
+                    let n = if rx_len > tx.len() { tx.len() + rx_len } else { tx.len() };
+                    let rx: Vec<u8> = (0..n).map(|i| self.touch.byte(tx.get(i).copied().unwrap_or(0))).collect();
+                    self.touch_bytes += n as u64;
+                    self.sync_touch_pins();
+                    return if rx_len > tx.len() { rx[tx.len()..].to_vec() } else { rx[..rx_len].to_vec() };
+                }
+                // its own wires: nothing else listens; shared with the panel: the panel's CS decides
+                if !self.profile.shared_touch_bus() { self.spi_dropped += tx.len() as u64; return vec![0; rx_len]; }
+            }
         }
-        if !self.cs_high && Self::on_panel_wires(&pins) {
+        if !self.cs_high && self.on_panel_wires(&pins) {
             self.spi_bytes += tx.len() as u64;
             for &b in tx { self.panel.byte(b); }
         } else {
             self.spi_dropped += tx.len() as u64;
         }
-        vec![0xff; rx_len]   // MISO is wired (GPIO 12) but the controller's read commands are not modelled
+        vec![0xff; rx_len]   // MISO is wired but the controller's read commands are not modelled
     }
     fn gpio_events(&self) -> u64 { self.gpio_events }
-    fn input_levels(&self) -> Vec<(u8, bool)> { vec![(PIN_BOOT, true), (PIN_TOUCH_IRQ, self.irq), (PIN_TOUCH_MISO, self.dout)] }
+    fn input_levels(&self) -> Vec<(u8, bool)> {
+        let mut v = vec![(self.profile.boot, true)];
+        match self.profile.touch {
+            Touch::Xpt2046 { irq, miso, .. } => { v.push((irq, self.irq)); v.push((miso, self.dout)); }
+            Touch::I2c { int: Some(int), .. } => v.push((int, !self.touch_state.lock().unwrap().down)),
+            _ => {}
+        }
+        v
+    }
+    fn i2c_devices(&mut self) -> Vec<(u8, u8, Box<dyn esp_periph::i2c::I2cDevice>)> {
+        let Touch::I2c { chip, addr, .. } = self.profile.touch else { return Vec::new() };
+        let (w, h) = (self.profile.width as u16, self.profile.height as u16);
+        // the bus the firmware routes to SDA/SCL is not known here: both controllers get it, and a
+        // GT911 answers at both of its addresses (its INT level at reset picks one)
+        let mut v: Vec<(u8, u8, Box<dyn esp_periph::i2c::I2cDevice>)> = Vec::new();
+        for bus in [0, 1] {
+            match chip {
+                I2cTouch::Gt911 => for a in [addr, if addr == 0x5d { 0x14 } else { 0x5d }] { v.push((bus, a, Box::new(Gt911::new(self.touch_state.clone(), w, h)))); },
+                I2cTouch::Cst820 => v.push((bus, addr, Box::new(Cst820::new(self.touch_state.clone())))),
+            }
+        }
+        v
+    }
     fn touch(&mut self, x: u16, y: u16, down: bool) {
-        self.touch.pen = down.then(|| Self::touch_raw(x, y));
-        self.sync_touch_pins();
+        match self.profile.touch {
+            Touch::Xpt2046 { .. } => { self.touch.pen = down.then(|| self.touch_raw(x, y)); self.sync_touch_pins(); }
+            Touch::I2c { swap_xy, invert_x, invert_y, int, .. } => {
+                let (w, h) = (self.profile.width as u16, self.profile.height as u16);
+                let (x, y) = (x.min(w - 1), y.min(h - 1));
+                let (x, y) = (if invert_x { w - 1 - x } else { x }, if invert_y { h - 1 - y } else { y });
+                let (x, y) = if swap_xy { (y, x) } else { (x, y) };
+                let was = self.touch_state.lock().unwrap().down;
+                self.touch_state.lock().unwrap().update(x, y, down);
+                if let Some(pin) = int.filter(|_| was != down) { self.edges.push(BoardEdge { cycle: self.cycle, pin, level: !down }); }
+            }
+            Touch::None => {}
+        }
     }
     fn touch_at(&mut self, cycle: VirtualCycle, x: u16, y: u16, down: bool) { self.cycle = self.cycle.max(cycle); self.touch(x, y, down); }
     fn advance_to(&mut self, cycle: VirtualCycle) { self.cycle = cycle; }
     fn take_edges(&mut self) -> Vec<BoardEdge> { std::mem::take(&mut self.edges) }
     fn named_pin(&self, name: &str) -> Option<u8> {
-        match name { "boot" | "btn1" => Some(PIN_BOOT), "ldr" => Some(PIN_LDR), "touch-irq" => Some(PIN_TOUCH_IRQ), _ => None }
+        match name { "boot" | "btn1" => Some(self.profile.boot), "ldr" => self.profile.ldr, "touch-irq" => self.touch_irq_pin(), "backlight" => self.profile.backlight, _ => None }
     }
     fn display(&self) -> Option<(u32, u32, Vec<u16>, u64)> {
-        Some((LCD_COLS as u32, LCD_ROWS as u32, lcd_visible(&self.panel), self.panel.pixels_written))
+        Some((self.profile.width as u32, self.profile.height as u32, self.lcd_visible(), self.panel.pixels_written))
     }
-    fn display_version(&self) -> u64 { self.panel.pixels_written }
+    fn display_version(&self) -> u64 { self.panel.pixels_written + self.backlight_changes }
     fn display_frames(&self) -> u64 { self.panel.frames }
     fn gram(&self) -> Option<(Vec<u16>, usize, usize)> { Some((self.panel.gram.clone(), self.panel.cols, self.panel.rows)) }
-    fn leds(&self) -> Option<(&[[u8; 3]], u64)> { Some((&self.led, self.led_updates)) }
+    fn leds(&self) -> Option<(&[[u8; 3]], u64)> { self.profile.led.map(|_| (&self.led[..], self.led_updates)) }
+    fn pwm_pins(&self) -> u64 { self.profile.backlight.map_or(0, |p| 1 << p) }
+    fn pwm_duty(&mut self, _pin: u8, duty: Option<u32>) { if self.backlight_duty != duty { self.backlight_duty = duty; self.backlight_changes += 1; } }
     fn report(&self) -> String {
         let p = &self.panel;
-        format!("[emu] cyd-2432s028r: {} RAMWR, {} pixels, madctl={:#x} (written {:x?}) gs={} ss={} colmod={:#x} inverted={} on={} backlight={} bbox={:?}; spi {} bytes to the panel, {} dropped (CS high or off GPIO 14/13); rgb led={:?}; touch {} conversions, {} spi bytes, pen={:?}; gpio events {}",
-                p.frames, p.pixels_written, p.madctl, p.madctl_writes, p.gate_reversed, p.source_reversed, p.colmod, p.inverted, p.on, self.backlight, p.bbox(), self.spi_bytes, self.spi_dropped, self.led[0],
-                self.touch.conversions, self.touch_bytes, self.touch.pen, self.gpio_events)
+        let pwm = self.backlight_duty.map_or(String::new(), |d| format!(" (pwm duty {}%)", d * 100 / 65535));
+        let touch = match self.profile.touch {
+            Touch::Xpt2046 { .. } => format!("touch {} conversions, {} spi bytes, pen={:?}", self.touch.conversions, self.touch_bytes, self.touch.pen),
+            Touch::I2c { chip, .. } => { let t = *self.touch_state.lock().unwrap(); format!("touch {chip:?} down={} at ({}, {})", t.down, t.x, t.y) }
+            Touch::None => "no touch".into(),
+        };
+        format!("[emu] {}: {} RAMWR, {} pixels, madctl={:#x} (written {:x?}) gs={} ss={} colmod={:#x} inverted={} on={} backlight={}{pwm} bbox={:?}; spi {} bytes to the panel, {} dropped (CS high or off GPIO {}/{}); rgb led={:?}; {touch}; gpio events {}",
+                self.profile.name, p.frames, p.pixels_written, p.madctl, p.madctl_writes, p.gate_reversed, p.source_reversed, p.colmod, p.inverted, p.on, self.backlight, p.bbox(),
+                self.spi_bytes, self.spi_dropped, self.profile.sclk, self.profile.mosi, self.led[0], self.gpio_events)
     }
 }
 
@@ -359,7 +441,7 @@ mod tests {
         let vspi = SpiPins { sclk: 1 << PIN_TOUCH_CLK, mosi: 1 << PIN_TOUCH_MOSI, miso: Some(PIN_TOUCH_MISO), cs: 1 << PIN_TOUCH_CS };
         b.touch_at(100, 120, 160, true);
         assert_eq!(b.take_edges(), vec![BoardEdge { cycle: 100, pin: PIN_TOUCH_IRQ, level: false }], "pressed: PENIRQ falls");
-        let (x, y) = Cyd2432S028R::touch_raw(120, 160);
+        let (x, y) = b.touch_raw(120, 160);
         assert_eq!((x, y), (2013, 1955));
         let rx = b.spi_transfer_pins(3, vspi, &[0xd0, 0, 0], 3);
         assert_eq!(u16::from_be_bytes([rx[1], rx[2]]) >> 3, x, "full duplex: X behind the control byte");
@@ -382,5 +464,93 @@ mod tests {
         b.touch(0, 0, false);
         assert!(b.take_edges().iter().any(|e| e.pin == PIN_TOUCH_IRQ && e.level), "released: PENIRQ rises");
         assert!(b.report().contains("touch 3 conversions, 6 spi bytes, pen=None"), "{}", b.report());
+    }
+
+    fn variant(name: &str) -> GenericDisplay { GenericDisplay::from_profile(crate::board::profile::builtin(name).unwrap()) }
+
+    /// The two-USB board's 320x240 glass as ESPHome drives it (model ILI9341, 320x240, MADCTL
+    /// 0x48, LVGL rotation 180 drawing content (x, y) at (319 - x, 239 - y)): upright, and a tap
+    /// through ESPHome's xpt2046 (swap_xy, calibration x 208..3823 y 282..3835 inverted) and the
+    /// rotation lands where it was made.
+    #[test]
+    fn two_usb_esphome_rotation_180_is_upright_and_taps_land() {
+        let mut b = variant("cyd-2usb");
+        bring_up(&mut b, 0x48);
+        window(&mut b, 319 - 3, 319 - 3, 239 - 7, 239 - 7);
+        cmd(&mut b, 0x2c, &[0xf8, 0x00]);
+        let (w, h, px, _) = b.display().unwrap();
+        assert_eq!((w, h), (320, 240));
+        assert_eq!(px[7 * 320 + 3], 0xf800);
+        assert_eq!(px.iter().filter(|&&p| p != 0).count(), 1);
+        let norm = |v: i32, lo: i32, hi: i32| 0xfff - (0xfff * (v.clamp(lo, hi) - lo) / (hi - lo));    // inverted
+        for gy in [40u16, 120, 200] {
+            for gx in [53u16, 160, 266] {
+                let (x, y) = b.touch_raw(gx, gy);
+                let (tx, ty) = (norm(y.into(), 208, 3823) * 320 / 4096, norm(x.into(), 282, 3835) * 240 / 4096);
+                let (cx, cy) = (319 - tx, 239 - ty);
+                assert!((cx - i32::from(gx)).abs() <= 2 && (cy - i32::from(gy)).abs() <= 2, "glass ({gx}, {gy}) read as ({cx}, {cy})");
+            }
+        }
+    }
+
+    /// 2.4", 3.2" and 3.5" resistive boards: the XPT2046 shares SCLK 14 / MOSI 13 and its CS 33
+    /// picks it; the panel's transactions still reach the panel.
+    #[test]
+    fn shared_bus_touch_is_picked_by_its_cs() {
+        let mut b = variant("cyd-2432s024r");
+        b.touch(0, 0, true);
+        let touch = SpiPins { cs: 1 << 33, ..routes() };
+        let rx = b.spi_transfer_pins(2, touch, &[0xd0, 0, 0], 3);
+        assert_eq!(u16::from_be_bytes([rx[1], rx[2]]) >> 3, 3800);
+        bring_up(&mut b, 0x48);
+        window(&mut b, 0, 0, 0, 0);
+        cmd(&mut b, 0x2c, &[0xf8, 0x00]);
+        assert_eq!((b.display().unwrap().2[0], b.panel.pixels_written, b.touch_bytes), (0xf800, 1, 3));
+        assert!(b.report().starts_with("[emu] cyd-2432s024r:") && b.report().contains("off GPIO 14/13"));
+    }
+
+    /// The 3.2" ST7789 IPS glass is RGB and shows colours as sent only with INVON.
+    #[test]
+    fn ips_rgb_glass_wants_invon_and_no_bgr() {
+        let mut b = variant("cyd-2432s032r");
+        bring_up(&mut b, 0x00);
+        cmd(&mut b, 0x21, &[]);
+        window(&mut b, 0, 0, 0, 0);
+        cmd(&mut b, 0x2c, &[0xf8, 0x00]);
+        assert_eq!(b.display().unwrap().2[0], 0xf800);
+        cmd(&mut b, 0x20, &[]);
+        assert_eq!(b.display().unwrap().2[0], !0xf800);
+    }
+
+    /// GT911 on I2C (both buses, both addresses), reporting glass pixels; INT falls while pressed.
+    #[test]
+    fn capacitive_boards_report_glass_pixels_over_i2c() {
+        let mut b = variant("cyd-3248s035c");
+        let devs = b.i2c_devices();
+        assert_eq!(devs.iter().map(|d| (d.0, d.1)).collect::<Vec<_>>(), [(0, 0x5d), (0, 0x14), (1, 0x5d), (1, 0x14)]);
+        assert_eq!(b.input_levels(), vec![(0, true), (21, true)]);
+        b.touch_at(5, 300, 470, true);
+        assert_eq!(b.take_edges(), vec![BoardEdge { cycle: 5, pin: 21, level: false }]);
+        let t = *b.touch_state.lock().unwrap();
+        assert_eq!((t.down, t.x, t.y), (true, 300, 470));
+        assert_eq!(b.display().unwrap().0, 320);
+        assert_eq!(variant("cyd-2432s024c").i2c_devices().len(), 2, "CST816S at 0x15 on each bus");
+    }
+
+    /// LEDC duty on the backlight scales the picture; without PWM the level is not applied.
+    #[test]
+    fn backlight_pwm_dims_the_glass() {
+        let mut b = Cyd2432S028R::new();
+        assert_eq!(b.pwm_pins(), 1 << PIN_LCD_BL);
+        bring_up(&mut b, 0x48);
+        window(&mut b, 0, 0, 0, 0);
+        cmd(&mut b, 0x2c, &[0xff, 0xff]);
+        let v = b.display_version();
+        b.pwm_duty(PIN_LCD_BL, Some(32768));
+        assert_eq!(b.display().unwrap().2[0], (15 << 11) | (31 << 5) | 15);
+        assert_ne!(b.display_version(), v, "a duty change repaints");
+        assert!(b.report().contains("backlight=true (pwm duty 50%)"), "{}", b.report());
+        b.pwm_duty(PIN_LCD_BL, None);
+        assert_eq!(b.display().unwrap().2[0], 0xffff);
     }
 }

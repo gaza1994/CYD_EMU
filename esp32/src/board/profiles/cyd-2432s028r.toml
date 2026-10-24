@@ -1,0 +1,40 @@
+# Sunton ESP32-2432S028R, the original micro-USB "Cheap Yellow Display": 2.8-inch 240x320 TN glass.
+name = "cyd-2432s028r"
+aliases = ["cyd"]
+chip = "esp32"
+description = "Sunton ESP32-2432S028R (micro-USB): ILI9341 240x320 TN on HSPI, XPT2046 on its own pins"
+sources = ["https://github.com/witnessmenow/ESP32-Cheap-Yellow-Display/blob/main/PINS.md", "https://github.com/rzeldent/platformio-espressif32-sunton/blob/main/esp32-2432S028R.json"]
+
+[display]
+controller = "ili9341"
+width = 240
+height = 320
+mirror_x = true               # the drivers' upright portrait is MADCTL 0x48 (MX | BGR)
+scan_control = true           # B6h SS / GS reverse the scans (LovyanGFX's offset_rotation = 2)
+bgr = true
+sclk = 14
+mosi = 13
+miso = 12
+cs = 15
+dc = 2                        # RST is tied to EN
+backlight = 21
+
+[touch]
+controller = "xpt2046"
+sclk = 25
+mosi = 32
+miso = 39
+cs = 33
+irq = 36
+raw_x = [3800, 240]           # the common CYD sketches' calibration
+raw_y = [200, 3700]
+
+[led]
+pins = [4, 16, 17]            # red, green, blue: common anode
+active = "low"
+
+[board]
+boot = 0
+ldr = 34
+sd = [18, 23, 19, 5]
+speaker = 26
