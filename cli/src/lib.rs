@@ -27,6 +27,7 @@ fn help(chip: &str, code: i32) -> ! {
     eprintln!("  --console usb|uart0|both|none   which consoles to print (uart0 shows the ROM and bootloader)");
     eprintln!("  --wifi ssid=…,psk=…   a virtual access point with DHCP, DNS, NTP and NAT to the host network");
     eprintln!("  --hostfwd tcp:H:HP-G:GP  publish a guest TCP port on the host (repeatable; needs --wifi)");
+    eprintln!("  --mdns-relay IP|auto  publish the guest's mDNS on the host LAN as IP (with --hostfwd: Home Assistant discovery)");
     eprintln!("  --script F            host actions at emulated times (button presses, touches, serial input, stop)");
     eprintln!("  --tft-png F, --wav F  save the display / the audio at the end of the run");
     eprintln!("  --web PORT            serve the board UI at http://127.0.0.1:PORT/ in real time");
@@ -165,7 +166,7 @@ pub struct Opts {
     pub flash_octal: bool,
     pub boot: Option<String>, pub flash_mb: Option<usize>, pub psram_mb: Option<usize>,
     pub mac: Option<[u8; 6]>, pub strap: Option<u32>, pub reset_cause: Option<u32>, pub efuse_regs: Option<String>, pub regs_init: Option<String>,
-    pub board: String, pub wifi: Option<String>, pub wifi_nearby: Vec<String>, pub ble: bool, pub ble_full: bool, pub ble_observe: bool, pub ble_scan: bool, pub net: String, pub hostfwd: Vec<String>, pub cam_image: Option<String>, pub cam_stream: Option<String>, pub cam_size: Option<String>, pub cam_fps: f64,
+    pub board: String, pub wifi: Option<String>, pub wifi_nearby: Vec<String>, pub ble: bool, pub ble_full: bool, pub ble_observe: bool, pub ble_scan: bool, pub net: String, pub hostfwd: Vec<String>, pub mdns_relay: Option<String>, pub cam_image: Option<String>, pub cam_stream: Option<String>, pub cam_size: Option<String>, pub cam_fps: f64,
     pub spi2_timing: bool, pub measured_te: bool,
     pub max_insns: u64, pub max_seconds: Option<f64>, pub script: Option<String>, pub serial: Option<String>,
     pub console: Option<String>, pub console_prefix: bool, pub realtime: bool, pub web_port: Option<u16>, pub web_dir: Option<String>, pub no_reboot: bool, pub serial_tcp: Option<String>, pub quit_on_stdin_eof: bool,
@@ -215,6 +216,7 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--wifi" => o.wifi = Some(next()),
             "--wifi-nearby" => o.wifi_nearby.push(next()),
             "--hostfwd" => o.hostfwd.push(next()),
+            "--mdns-relay" => o.mdns_relay = Some(next()),
             "--ble-scan" => o.ble_scan = true,
             "--ble-observe" => o.ble_observe = true,
             "--ble" => {
@@ -289,6 +291,10 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
     if !o.hostfwd.is_empty() && o.net != "nat" && o.net != "user" { usage_error("--hostfwd requires --net nat"); }
     for spec in &o.hostfwd {
         if let Err(e) = esp_soc::nat::HostFwdSpec::parse(spec) { usage_error(&format!("--hostfwd: {e}")); }
+    }
+    if let Some(ip) = &o.mdns_relay {
+        if o.wifi.is_none() || (o.net != "nat" && o.net != "user") { usage_error("--mdns-relay requires --wifi and --net nat"); }
+        if ip != "auto" && ip.parse::<std::net::Ipv4Addr>().is_err() { usage_error("--mdns-relay takes a host IPv4 address or auto"); }
     }
     if (o.ble_observe || o.ble_scan) && !o.ble_full { usage_error("BLE central/observer use requires --ble full"); }
     if o.ble_full && o.ble { usage_error("--ble full and --ble are mutually exclusive"); }
@@ -383,7 +389,7 @@ fn setup_s3(o: &Opts) -> esp32s3::Machine {
     m.bus.attach_board_devices();
     if !o.debug.is_empty() { let mut f = esp_soc::DebugFlags::from_env(); for d in &o.debug { f.parse(d); } m.set_debug(&f); }
     if let Some(spec) = &o.wifi {
-        let (cfg, nat) = wifi_config(spec, o.net == "nat" || o.net == "user", m.bus.debug.has("net"), &o.hostfwd);
+        let (cfg, nat) = wifi_config(spec, o.net == "nat" || o.net == "user", m.bus.debug.has("net"), &o.hostfwd, o.mdns_relay.as_deref());
         m.bus.attach_wifi(cfg, nat).unwrap_or_else(|e| { eprintln!("--wifi: {e}"); std::process::exit(2) });
     }
     attach_nearby_networks(&mut m.bus.periph.wifi.link, o);
@@ -437,7 +443,7 @@ fn attach_nearby_networks(link: &mut esp_soc::wifi::StationLink, o: &Opts) {
 
 /// `--wifi SPEC` with `--net`: the virtual access point's configuration and, for `--net nat`,
 /// the NAT to the host, the same for every chip.
-fn wifi_config(spec: &str, nat: bool, net_log: bool, hostfwd: &[String]) -> (esp_soc::wifi::ApConfig, Option<esp_soc::nat::Nat>) {
+fn wifi_config(spec: &str, nat: bool, net_log: bool, hostfwd: &[String], mdns_relay: Option<&str>) -> (esp_soc::wifi::ApConfig, Option<esp_soc::nat::Nat>) {
     let cfg = esp_soc::wifi::ApConfig::parse(spec).unwrap_or_else(|e| { eprintln!("--wifi: {e}"); std::process::exit(2) });
     eprintln!("[emu] virtual AP '{}' bssid {} channel {} ({})", cfg.ssid, esp_soc::wifi::mac_str(&cfg.bssid), cfg.channel, if cfg.psk.is_some() { "WPA2-PSK" } else { "open" });
     let mut nat = nat.then(|| esp_soc::nat::Nat::new(net_log));
@@ -448,10 +454,24 @@ fn wifi_config(spec: &str, nat: bool, net_log: bool, hostfwd: &[String]) -> (esp
             let bound = nat.listen(&parsed).unwrap_or_else(|e| usage_error(&format!("--hostfwd {spec}: {e}")));
             eprintln!("[emu] hostfwd tcp {} -> {}.{}.{}.{}:{}", bound, parsed.guest_ip[0], parsed.guest_ip[1], parsed.guest_ip[2], parsed.guest_ip[3], parsed.guest_port);
         }
+        if let Some(ip) = mdns_relay { nat.mdns = Some(mdns_relay_open(ip, net_log, nat.forwarded_ports(), hostfwd)); }
     }
     let net = esp_soc::net::VirtualNet::new(false);   // its fixed addresses, for the line below
     eprintln!("[emu] virtual network: station {}.{}.{}.{}, gateway {}.{}.{}.{} (DHCP, ARP, ICMP, DNS, NTP)", net.sta_ip[0], net.sta_ip[1], net.sta_ip[2], net.sta_ip[3], net.gw_ip[0], net.gw_ip[1], net.gw_ip[2], net.gw_ip[3]);
     (cfg, nat)
+}
+
+/// `--mdns-relay IP|auto`: the relay on the host LAN, its SRV ports from the `--hostfwd` table.
+fn mdns_relay_open(ip: &str, log: bool, ports: Vec<(u16, u16)>, hostfwd: &[String]) -> esp_soc::mdns::MdnsRelay {
+    let host_ip = if ip == "auto" { esp_soc::mdns::primary_ipv4().unwrap_or_else(|e| usage_error(&format!("--mdns-relay auto: {e}; give the address"))) } else { ip.parse().unwrap() };
+    let mut relay = esp_soc::mdns::MdnsRelay::open(host_ip, log).unwrap_or_else(|e| usage_error(&format!("--mdns-relay {ip}: {e}")));
+    let map = ports.iter().map(|(g, h)| format!("{g}->{h}")).collect::<Vec<_>>().join(", ");
+    eprintln!("[emu] mDNS relay on {host_ip}: guest names answer with {host_ip}{}", if map.is_empty() { String::new() } else { format!(", SRV ports {map}") });
+    for spec in hostfwd.iter().filter_map(|s| esp_soc::nat::HostFwdSpec::parse(s).ok()) {
+        if spec.bind.ip().is_loopback() { eprintln!("[emu] --mdns-relay: --hostfwd on {} is not reachable from the LAN; bind 0.0.0.0", spec.bind); }
+    }
+    relay.set_ports(ports);
+    relay
 }
 
 fn setup_c3(o: &Opts) -> esp32c3::Machine {
@@ -463,7 +483,7 @@ fn setup_c3(o: &Opts) -> esp32c3::Machine {
         m.bus.periph.ble_lc.scan(o.ble_scan);
     }
     if let Some(spec) = &o.wifi {
-        let (cfg, nat) = wifi_config(spec, o.net == "nat" || o.net == "user", m.bus.debug.has("net"), &o.hostfwd);
+        let (cfg, nat) = wifi_config(spec, o.net == "nat" || o.net == "user", m.bus.debug.has("net"), &o.hostfwd, o.mdns_relay.as_deref());
         m.bus.attach_wifi(cfg, nat).unwrap_or_else(|e| { eprintln!("--wifi: {e}"); std::process::exit(2) });
     }
     attach_nearby_networks(&mut m.bus.periph.wifi.link, o);
@@ -481,7 +501,7 @@ fn setup_esp32(o: &Opts) -> esp32::Machine {
     m.bus.board = esp32::board::make_board(board).unwrap_or_else(|| usage_error(&format!("unknown classic ESP32 board '{board}' (none, bare, esp32dev, ttgo-tdisplay, cyd-2432s028r)")));
     m.bus.attach_board_devices();
     if let Some(spec) = &o.wifi {
-        let (cfg, nat) = wifi_config(spec, o.net == "nat" || o.net == "user", m.bus.debug.has("net"), &o.hostfwd);
+        let (cfg, nat) = wifi_config(spec, o.net == "nat" || o.net == "user", m.bus.debug.has("net"), &o.hostfwd, o.mdns_relay.as_deref());
         m.bus.attach_wifi(cfg, nat).unwrap_or_else(|e| { eprintln!("--wifi: {e}"); std::process::exit(2) });
     }
     attach_nearby_networks(&mut m.bus.periph.wifi.link, o);
@@ -499,7 +519,7 @@ fn setup_c6(o: &Opts) -> esp32c6::Machine {
     match esp32c6::board::make_board(name) { Some(b) => m.bus.board = b, None => { eprintln!("--board {}: none or waveshare-c6-lcd147 on the C6", name); std::process::exit(2) } }
     m.bus.attach_board_devices();
     if let Some(spec) = &o.wifi {
-        let (cfg, nat) = wifi_config(spec, o.net == "nat" || o.net == "user", m.bus.debug.has("net"), &o.hostfwd);
+        let (cfg, nat) = wifi_config(spec, o.net == "nat" || o.net == "user", m.bus.debug.has("net"), &o.hostfwd, o.mdns_relay.as_deref());
         m.bus.attach_wifi(cfg, nat).unwrap_or_else(|e| { eprintln!("--wifi: {e}"); std::process::exit(2) });
     }
     attach_nearby_networks(&mut m.bus.periph.wifi_mac.link, o);

@@ -661,6 +661,7 @@ impl StationLink {
             if let Some(t) = &n.nat {
                 let inbound = if t.hostfwd == 0 { String::new() } else { format!(", {} inbound, {} hostfwd", t.tcp_accepted, t.hostfwd) };
                 lines.push(format!("[emu] nat: {} TCP connections ({} failed{}), {} UDP flows ({} evicted, {} send errors), {} bytes out, {} bytes in", t.tcp_opened, t.tcp_refused, inbound, t.udp_flows, t.udp_evicted, t.udp_send_errors, t.bytes_to_host, t.bytes_to_guest));
+                if let Some(r) = &t.mdns { lines.push(format!("[emu] mdns relay: {} guest responses published as {}, {} LAN queries answered from {} cached records, {} passed to the guest, {} send errors", r.announced, r.host_ip, r.answered, r.cached(), r.forwarded, r.send_errors)); }
             } }
         lines.join("\n")
     }

@@ -237,6 +237,8 @@ pub struct Nat {
     isn: u32,
     pub resolver: [u8; 4],
     pub log: bool,
+    /// `--mdns-relay`: the guest's port-5353 traffic goes here instead of a UDP flow.
+    pub mdns: Option<crate::mdns::MdnsRelay>,
     pub tcp_opened: u64, pub tcp_refused: u64, pub tcp_accepted: u64, pub hostfwd: u64,
     pub udp_flows: u64,
     pub udp_evicted: u64, pub udp_send_errors: u64,
@@ -247,7 +249,7 @@ impl Nat {
     pub fn new(log: bool) -> Self {
         Self { tcp: Vec::new(), udp: Vec::new(), forwards: Vec::new(), pending: Vec::new(),
             sta_mac: [0; 6], next_eph: INBOUND_PORT_BASE, isn: 0x1000,
-            resolver: host_resolver(), log,
+            resolver: host_resolver(), log, mdns: None,
             tcp_opened: 0, tcp_refused: 0, tcp_accepted: 0, hostfwd: 0,
             udp_flows: 0, udp_evicted: 0, udp_send_errors: 0, bytes_to_host: 0, bytes_to_guest: 0 }
     }
@@ -273,10 +275,16 @@ impl Nat {
         Ok(bound)
     }
 
+    /// Each `--hostfwd` as guest port -> bound host port, what the mDNS relay puts in SRV records.
+    pub fn forwarded_ports(&self) -> Vec<(u16, u16)> {
+        self.forwards.iter().filter_map(|f| Some((f.guest_port, f.listener.local_addr().ok()?.port()))).collect()
+    }
+
     /// Forward a UDP datagram through a connected socket, which accepts replies only from its peer.
     #[allow(clippy::too_many_arguments, reason = "packet fields stay explicit at the protocol boundary")]
     pub fn udp_out(&mut self, gmac: &[u8; 6], gip: &[u8; 4], sport: u16, dip: &[u8; 4], reply_src: &[u8; 4],
                    dport: u16, payload: &[u8], now_us: u64) {
+        if let (crate::mdns::PORT, Some(relay)) = (dport, &mut self.mdns) { return relay.from_guest(gip, payload); }
         let idx = self.udp.iter().position(|f| f.guest_ip == *gip && f.guest_port == sport && f.dst_ip == *dip && f.dst_port == dport);
         let idx = match idx {
             Some(i) => i,
@@ -433,6 +441,7 @@ impl Nat {
     /// Pump a bounded amount of host traffic, then retransmit and expire flows.
     pub fn poll(&mut self, now_us: u64) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
+        if let Some(relay) = &mut self.mdns { out.extend(relay.poll(&self.sta_mac)); }
         self.accept_hostfwd();
         self.start_pending(now_us, &mut out);
         for c in &mut self.tcp {
