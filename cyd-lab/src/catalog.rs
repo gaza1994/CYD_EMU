@@ -872,6 +872,15 @@ mod tests {
     }
 
     #[test]
+    fn hotspot_passwords_from_the_catalogue() {
+        let c = Catalog::bundled();
+        assert_eq!(c.hotspot_setup("HASP-b1353e").map(|f| f.password.as_str()), Some("haspadmin"));
+        assert_eq!(c.hotspot_setup("NerdMinerAP").map(|f| f.password.as_str()), Some("MineYourCoins"));
+        assert_eq!(c.hotspot_setup("WLED-AP").and_then(|f| f.page_ip()).as_deref(), Some("4.3.2.1"));
+        assert!(c.hotspot_setup("SomeoneElse").is_none());
+    }
+
+    #[test]
     fn bundled_catalogue_parses() {
         let c = Catalog::bundled();
         assert_eq!(c.schema_version, 1);
