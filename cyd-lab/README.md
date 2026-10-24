@@ -18,10 +18,10 @@ target, and it also builds and runs on Linux.
 2. First run only: cyd-lab downloads Espressif's ESP32 mask ROM (esp-rom-elfs 20260528,
    about 5 MB, SHA-256 checked) with a progress bar. If it fails you get the error and
    **Retry**, or **I already have the ROM ELFs** to pick a folder.
-3. **+ New device** > ESP32-2432S028R > **Create**, then **Power on**. A new board has blank
+3. **+ New device** > ESP32-2432S028R original (micro-USB) > **Create**, then **Power on**. A new board has blank
    flash and loops on `invalid header`, the same as a real erased chip.
-4. Press **Install firmware...** and pick a firmware from the gallery (openHASP, NerdMiner,
-   Bruce, Marauder, CYD-Klipper, ...). One click downloads it, checks its SHA-256, writes it
+4. Press **Install firmware...** and pick a firmware from the gallery (ESPHome for Home
+   Assistant with screen, openHASP, NerdMiner, Bruce, Marauder, CYD-Klipper, ...). One click downloads it, checks its SHA-256, writes it
    at the right offsets and boots it. See [Install firmware gallery](#install-firmware-gallery).
    You can also drag your own firmware `.bin` onto the window, or use **Install from web**
    with a manifest URL.
@@ -60,7 +60,8 @@ fall back to OpenGL if that fails.
 | Live screen, touch (verified pixel-exact at 0° and 90°) and UART0 line input over `--web` | |
 | Engine feature detection (`--help`, binary scan as a fallback), shown in Settings and as badges | |
 | PNG fallback (`--tft-png`), console with a 5000-line ring buffer | |
-| [Install from web installer](#install-from-web-installer): ESP Web Tools manifests (URL or file), tested with openHASP | Improv Wi-Fi provisioning |
+| [Install from web installer](#install-from-web-installer): ESP Web Tools manifests (URL or file), tested with openHASP | |
+| [Wi-Fi setup](#wi-fi-setup-improv-and-device-hotspots): Improv over serial (**Send Wi-Fi details**), auto-detected after boot; tested with WLED and the bundled ESPHome HA image | **Device hotspot** (join a firmware's own setup AP): UI ready, greyed out until the engine has `--ap-client`/`--ap-fwd` |
 | [Install firmware gallery](#install-firmware-gallery): bundled, verified catalogue per board, SHA-256 checked one-click installs (openHASP and NerdMiner tested end to end), config templates | Catalogue refresh from the web is off by default; the gallery only lists boards in the catalogue |
 | First run: bundled engine, pinned ROM download with progress/error/retry, portable mode, drag-and-drop `.bin` with offset guessing, **Set up Arduino IDE**, **Use with...** | Exe not code-signed (SmartScreen) |
 | [Arduino IDE 2 / arduino-cli](#arduino-ide-2--arduino-cli-no-driver) over the network: discovery, upload, monitor (arduino-cli on Linux) | Arduino IDE 2 on Windows not yet run; the package index isn't hosted anywhere yet |
@@ -261,6 +262,32 @@ have not been run.
 
 ## Install firmware gallery
 
+The gallery is grouped: **Home Assistant** (ESPHome for Home Assistant with screen, openHASP,
+Tasmota), **Tools & fun** (Bruce, Marauder, NerdMiner, CYD-Klipper, weather dashboards, ...),
+**Programming** (MicroPython, the ESPHome CYD starter YAML, ESP32-Cheap-Yellow-Display examples) and
+**Other / advanced** (ESPHome Web, CircuitPython). Every card has a **First Wi-Fi setup**
+line: Improv over USB, the firmware's own hotspot (name, password, setup page), or none.
+
+**ESPHome for Home Assistant (with screen)** is pinned at the top. It's a factory image
+built by cyd-lab from `firmware/esphome-ha/cyd-2432s028r.yaml` (ESPHome 2026.10.0) and
+shipped inside the exe (`assets/firmware/`, SHA-256 checked like a download). It drives
+the ILI9341 screen with LVGL ("Ready to adopt in Home Assistant", device name, IP and
+status, an Identify button), the XPT2046 touch, backlight, RGB LED and light sensor. Wi-Fi
+setup is Improv over serial or its fallback hotspot `cyd-panel-xxxxxx` with a captive
+portal. It has the native API without an encryption key (so Home Assistant can adopt it)
+and ESPHome OTA, and no Bluetooth. After installing it the device panel shows a step card:
+Send Wi-Fi details, add it in Home Assistant (Discovered, or the ESPHome integration with
+this PC's IP and the port published for 6053), then **Copy config** to customise it in the
+ESPHome add-on and update it over the air. Checked in the emulator: the ready screen, touch,
+Improv (connected in about 4 s) and the API through a published port with aioesphomeapi.
+Rebuild it with `esphome compile firmware/esphome-ha/cyd-2432s028r.yaml`, copy
+`firmware.factory.bin` to `assets/firmware/` and update `sha256`/`size` in
+`assets/cyd-lab-catalog.toml`. (`dashboard_import` is not set yet.)
+
+**ESPHome Web** (the generic image from web.esphome.io) has no screen driver: the display
+stays dark and it's only for adopting a blank ESP32 into Home Assistant. In the emulator it
+crashes when it turns Bluetooth on, so its Improv setup never finishes.
+
 **Install firmware...** (first button on the Firmware row) opens a gallery of ready-made
 firmware for the selected device's board. The list comes from a curated catalogue,
 `assets/catalog/cyd-firmware.toml` (schema 1), built into the exe, so it works offline
@@ -317,6 +344,10 @@ folder. cyd-lab only uses that copy while the setting is on, and only if its `up
 isn't older than the built-in one. Hashes still come from the catalogue, so a refreshed
 catalogue is trusted as much as the server you point it at.
 
+cyd-lab's own additions (the HA image, groups, first-setup hints, step cards, the ESPHome
+Web relabel) live in `assets/cyd-lab-catalog.toml`, an overlay merged into whichever
+catalogue is loaded, so regenerating `assets/catalog/` doesn't lose them.
+
 Maintainers: `tools/catalog_assets.py` copies the TOML and templates from the catalogue
 workspace into `assets/catalog/`, makes 120x160 thumbnails (64 colours, blank screens
 skipped) and regenerates `src/catalog_assets.rs`.
@@ -339,8 +370,8 @@ same manifest itself instead:
 
 Erase rules follow ESP Web Tools: a new install always erases the flash first, unless the
 manifest says `new_install_prompt_erase: true`, in which case the **erase first** checkbox
-decides. `improv: true` (Wi-Fi setup over serial) is noted in the console, but cyd-lab
-doesn't run Improv. Configure Wi-Fi the firmware's own way. Downloads use ureq with
+decides. With `improv: true` cyd-lab offers **Send Wi-Fi details** once the firmware has
+booted (see [Wi-Fi setup](#wi-fi-setup-improv-and-device-hotspots)). Downloads use ureq with
 rustls, up to 16 MB per file, and `file://` and local paths work too.
 
 Tested with openHASP's CYD manifest
@@ -354,6 +385,31 @@ Known gap: openHASP's picture comes out **mirrored left to right**. Arduino sket
 (TFT_eSPI `ILI9341_2_DRIVER`) and the earlier test firmware draw the right way round, so
 this is about how the engine models MADCTL for the panel openHASP's build drives. It's an
 engine issue (esp32sim), not a cyd-lab one. Touch and serial work.
+
+## Wi-Fi setup: Improv and device hotspots
+
+Most CYD firmware needs Wi-Fi details the first time it boots. On a real board you'd use
+a web installer's "Connect to Wi-Fi" (Improv over USB serial) or join the board's own
+hotspot with a phone. In cyd-lab:
+
+- **Send Wi-Fi details** (Improv over serial). After power-on cyd-lab asks the firmware
+  over the device's serial port whether it speaks Improv (at about 6 s, and once more).
+  If it's waiting for Wi-Fi, a banner says **This firmware is waiting for Wi-Fi setup:
+  Send Wi-Fi details**. The button sends the device's emulated network name and password
+  (Network section) and shows the state (waiting, connecting, connected), the firmware's
+  name/version and its page address. A page address on the emulated network is shown as
+  a `127.0.0.1` link when you've published that port, otherwise as "publish port N".
+  **Check** asks again at any time. The probe is skipped while a Windows COM bridge is on
+  (it would kick the bridge's client); use the button then. Tested: WLED (connected in
+  about 30 s, reports `http://10.0.2.15`) and the bundled ESPHome HA image (about 4 s).
+  ESPHome Web can't finish (Bluetooth crash in the emulator).
+- **Device hotspot.** Firmware that starts its own setup AP (openHASP `HASP-xxxxxx`,
+  NerdMinerAP, WLED-AP, `cyd-panel-xxxxxx`, ...) is listed when its log names the AP. Pick
+  it, enter the password from the card, and **Connect & open setup page** restarts the
+  device with the engine joining that AP and the setup page forwarded to
+  `http://127.0.0.1:PORT/`, which opens in your browser. This needs the engine's
+  `--ap-client`/`--ap-fwd`, so until `esp32sim --help` lists them the section is greyed out
+  with "needs newer engine".
 
 ## Arduino IDE 2 / arduino-cli (no driver)
 
@@ -650,6 +706,12 @@ Ctrl-C/close), saving even when the log pipe is closed, `--serial-tcp` (RFC2217)
 4. **A save-on-Job-close story for Windows**: if cyd-lab crashes, the Job object kills the
    engine before it can save. A periodic or on-write flush of `--flash-file` would cover it.
 5. Optional: `--capabilities` with machine-readable output.
+6. **`--ap-client ssid=..,psk=..` and `--ap-fwd tcp:127.0.0.1:HP-IP:PORT`**: join the
+   firmware's own SoftAP as a client and forward its setup page (cyd-lab's Device hotspot
+   is waiting for these), and ideally a structured "AP started: SSID" event.
+7. **More board models** for the New device "Coming soon" list: the two-USB 2432S028R
+   (ST7789), 2432S024R/C, 2432S032R/C and 3248S035R/C (ST7796, capacitive GT911 touch).
+8. **Bluetooth** (ESPHome Web and Marauder crash or degrade without it).
 
 ## License
 

@@ -91,6 +91,8 @@ def main():
     crlf_copy(os.path.join(HERE, "LICENSE"), os.path.join(lic, "cyd-lab-LICENSE.txt"))
     crlf_copy(os.path.join(a.engine_src, "LICENSE"), os.path.join(lic, "esp32sim-LICENSE.txt"))
     crlf_copy(os.path.join(HERE, "packaging", "NOTICE.txt"), os.path.join(lic, "NOTICE.txt"))
+    os.makedirs(os.path.join(lic, "esphome-ha"))
+    crlf_copy(os.path.join(HERE, "firmware", "esphome-ha", "cyd-2432s028r.yaml"), os.path.join(lic, "esphome-ha", "cyd-2432s028r.yaml"))
     write_third_party(os.path.join(lic, "third-party-cyd-lab.txt"), "cyd-lab.exe and the Arduino tools",
                       third_party(os.path.join(HERE, "Cargo.toml"), a.target))
     write_third_party(os.path.join(lic, "third-party-esp32sim.txt"), "esp32sim.exe",

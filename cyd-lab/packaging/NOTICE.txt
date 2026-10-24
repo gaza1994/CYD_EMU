@@ -52,6 +52,14 @@ Firmware catalogue (built into cyd-lab.exe)
   own (MIT). The Tasmota display.ini and template notes follow the
   community template at templates.blakadder.com (sunton_ESP32-2432S028).
 
+ESPHome for Home Assistant (with screen): the one firmware image built in
+  cyd-lab.exe ("bundled" in the gallery). Built by cyd-lab with ESPHome
+  2026.10.0 from esphome-ha\cyd-2432s028r.yaml (included in this folder;
+  cyd-lab's own config, MIT). The image contains ESPHome's C++ runtime
+  (GPL-3.0, https://github.com/esphome/esphome, tag 2026.10.0), ESP-IDF
+  (Apache-2.0, Espressif), LVGL (MIT) and the components the config lists.
+  Rebuild it from that config with "esphome compile" and ESPHome 2026.10.0.
+
 Third-party Rust crates
   Listed with their licences in third-party-cyd-lab.txt and
   third-party-esp32sim.txt (all permissive: MIT, Apache-2.0, BSD, Zlib,
