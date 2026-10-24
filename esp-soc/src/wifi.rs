@@ -4,6 +4,7 @@
 
 #[cfg(test)]
 mod tests;
+pub mod phone;
 
 pub fn mac_str(m: &[u8]) -> String { m.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(":") }
 
@@ -342,26 +343,7 @@ impl VirtualAp {
     }
     /// Build an EAPOL-Key frame (802.1X over LLC/SNAP in an 802.11 data frame from the DS).
     fn eapol(&mut self, key_info: u16, nonce: [u8; 32], key_data: &[u8], mic_key: Option<&[u8]>) -> Vec<u8> {
-        let mut body = Vec::with_capacity(99 + key_data.len());
-        body.push(2);                                                    // 802.1X-2004
-        body.push(3);                                                    // EAPOL-Key
-        body.extend_from_slice(&((95 + key_data.len()) as u16).to_be_bytes());
-        body.push(2);                                                    // RSN key descriptor
-        body.extend_from_slice(&key_info.to_be_bytes());
-        body.extend_from_slice(&16u16.to_be_bytes());                    // key length (CCMP)
-        body.extend_from_slice(&self.wpa.replay.to_be_bytes());
-        body.extend_from_slice(&nonce);
-        body.extend_from_slice(&[0u8; 16]);                              // key IV
-        body.extend_from_slice(&[0u8; 8]);                               // key RSC
-        body.extend_from_slice(&[0u8; 8]);                               // key ID
-        let mic_at = body.len();
-        body.extend_from_slice(&[0u8; 16]);
-        body.extend_from_slice(&(key_data.len() as u16).to_be_bytes());
-        body.extend_from_slice(key_data);
-        if let Some(kck) = mic_key {
-            let m = esp_periph::crypto::hmac_sha1(kck, &body);
-            body[mic_at..mic_at + 16].copy_from_slice(&m[..16]);
-        }
+        let body = eapol_key(key_info, self.wpa.replay, nonce, key_data, mic_key);
         let sta = self.sta; let bssid = self.cfg.bssid;
         let mut f = self.hdr(0x0208, &sta, &bssid);                      // data, from-DS
         f[16..22].copy_from_slice(&bssid);
@@ -453,6 +435,32 @@ impl VirtualAp {
     }
 }
 
+/// An EAPOL-Key frame, the 802.1X body (RSN descriptor, CCMP), with its MIC when `mic_key` (the
+/// KCK) is given: what both ends of the four-way handshake send.
+pub fn eapol_key(key_info: u16, replay: u64, nonce: [u8; 32], key_data: &[u8], mic_key: Option<&[u8]>) -> Vec<u8> {
+    let mut body = Vec::with_capacity(99 + key_data.len());
+    body.push(2);                                                    // 802.1X-2004
+    body.push(3);                                                    // EAPOL-Key
+    body.extend_from_slice(&((95 + key_data.len()) as u16).to_be_bytes());
+    body.push(2);                                                    // RSN key descriptor
+    body.extend_from_slice(&key_info.to_be_bytes());
+    body.extend_from_slice(&16u16.to_be_bytes());                    // key length (CCMP)
+    body.extend_from_slice(&replay.to_be_bytes());
+    body.extend_from_slice(&nonce);
+    body.extend_from_slice(&[0u8; 16]);                              // key IV
+    body.extend_from_slice(&[0u8; 8]);                               // key RSC
+    body.extend_from_slice(&[0u8; 8]);                               // key ID
+    let mic_at = body.len();
+    body.extend_from_slice(&[0u8; 16]);
+    body.extend_from_slice(&(key_data.len() as u16).to_be_bytes());
+    body.extend_from_slice(key_data);
+    if let Some(kck) = mic_key {
+        let m = esp_periph::crypto::hmac_sha1(kck, &body);
+        body[mic_at..mic_at + 16].copy_from_slice(&m[..16]);
+    }
+    body
+}
+
 /// 802.11 data frame (to the DS) -> Ethernet frame.
 pub fn data_to_eth(f: &[u8]) -> Option<Vec<u8>> {
     if f.len() < 2 { return None; }
@@ -483,6 +491,8 @@ pub fn fcs(data: &[u8]) -> u32 {
 #[derive(Default)]
 pub struct StationLink {
     ap: Option<VirtualAp>,
+    /// `--ap-client`: the phone that joins the guest's own hotspot
+    phone: Option<phone::Phone>,
     net: Option<crate::net::VirtualNet>,
     /// the host relays raw Ethernet (`set_ethernet_relay`) instead of the virtual network answering
     relay: bool,
@@ -524,7 +534,7 @@ impl StationLink {
     /// Put an access point and the network behind it on the air, replacing any there were. The
     /// queues, pacing and counts start again; the relay mode stays.
     pub fn attach(&mut self, ap: Option<VirtualAp>, net: Option<crate::net::VirtualNet>) {
-        *self = StationLink { ap, net, relay: self.relay, ..Default::default() };
+        *self = StationLink { ap, net, relay: self.relay, phone: self.phone.take(), ..Default::default() };
     }
     /// `attach` with a fresh access point for `cfg` and network, logging as `debug` says.
     pub fn attach_new(&mut self, cfg: ApConfig, nat: Option<crate::nat::Nat>, debug: &crate::DebugFlags) {
@@ -534,7 +544,28 @@ impl StationLink {
     }
     /// What a guest reboot keeps: the host's access point, network and relay mode. The queues, the
     /// pacing and the counts start again.
-    pub fn surviving_reboot(self) -> Self { StationLink { ap: self.ap, net: self.net, relay: self.relay, ..Default::default() } }
+    pub fn surviving_reboot(mut self) -> Self {
+        if let Some(p) = &mut self.phone { p.rejoin(); }
+        StationLink { ap: self.ap, net: self.net, relay: self.relay, phone: self.phone, ..Default::default() }
+    }
+    /// Put the phone of `--ap-client` on the air, which joins the guest's hotspot when it hears one.
+    pub fn set_phone(&mut self, phone: Option<phone::Phone>) { self.phone = phone; }
+    pub fn phone(&self) -> Option<&phone::Phone> { self.phone.as_ref() }
+    pub fn phone_mut(&mut self) -> Option<&mut phone::Phone> { self.phone.as_mut() }
+    /// The channel and signal (dBm) `frame` arrives with: the phone's own for its frames, else
+    /// what the access point says (`VirtualAp::rx_meta`).
+    pub fn rx_meta(&self, frame: &[u8]) -> (u8, i8) {
+        match (&self.phone, &self.ap) {
+            (Some(p), _) if frame.get(10..16) == Some(&p.mac[..]) => p.rx_meta(),
+            (_, Some(ap)) => ap.rx_meta(frame),
+            (Some(p), None) => p.rx_meta(),
+            (None, None) => (1, -40),
+        }
+    }
+    /// Whether `frame` is the phone's, addressed to the guest's SoftAP interface rather than its station.
+    pub fn for_guest_ap(&self, frame: &[u8]) -> bool {
+        self.phone.as_ref().is_some_and(|p| frame.get(10..16) == Some(&p.mac[..]))
+    }
 
     pub fn ap(&self) -> Option<&VirtualAp> { self.ap.as_ref() }
     pub fn ap_mut(&mut self) -> Option<&mut VirtualAp> { self.ap.as_mut() }
@@ -567,6 +598,7 @@ impl StationLink {
     /// data goes to the network or the relay.
     pub fn station_tx(&mut self, frame: &[u8], now_us: u64) {
         self.tx_frames += 1;
+        if let Some(p) = &mut self.phone { p.on_guest_tx(frame, now_us); }
         let Some(ap) = &mut self.ap else { return };
         let Some(eth) = ap.on_station_tx(frame, now_us).and_then(|data| data_to_eth(&data)) else { return };
         if !self.relay || (eth.len() <= RELAY_FRAME_MAX && self.eth_tx.len() < RELAY_QUEUE) { self.eth_tx.push(eth); } else { self.tx_dropped += 1; }
@@ -581,7 +613,8 @@ impl StationLink {
     /// every scheduling round while WiFi is on, before it reads the ring.
     #[inline]
     pub fn nothing_due(&self, now_us: u64) -> bool {
-        self.in_rx_gap(now_us) || self.ap.as_ref().is_none_or(|ap| ap.idle_at(now_us) && self.eth_rx.is_empty())
+        self.in_rx_gap(now_us) || (self.ap.as_ref().is_none_or(|ap| ap.idle_at(now_us) && self.eth_rx.is_empty())
+            && self.phone.as_ref().is_none_or(|p| p.idle_at(now_us)))
     }
 
     /// The next frame for the station's receive ring, if one is due: the access point's beacons
@@ -598,16 +631,22 @@ impl StationLink {
     pub fn next_rx(&mut self, now_us: u64, ring_busy: bool) -> Option<Vec<u8>> {
         if self.in_rx_gap(now_us) { return None; }
         if ring_busy && now_us.wrapping_sub(self.last_rx_us) < RX_STALL_US { return None; }
-        let ap = self.ap.as_mut()?;
-        let mut due = ap.step(now_us);
-        let eth_in = if self.relay {
-            if due.is_empty() && !self.eth_rx.is_empty() { vec![self.eth_rx.remove(0)] } else { Vec::new() }
-        } else { std::mem::take(&mut self.eth_rx) };
-        for e in eth_in { if let Some(f) = ap.data_from_ds(&e) { due.push(AirFrame { at_us: now_us, frame: f }); } }
+        let mut due = self.phone.as_mut().map_or_else(Vec::new, |p| p.step(now_us));
+        if let Some(ap) = self.ap.as_mut() {
+            due.extend(ap.step(now_us));
+            let eth_in = if self.relay {
+                if due.is_empty() && !self.eth_rx.is_empty() { vec![self.eth_rx.remove(0)] } else { Vec::new() }
+            } else { std::mem::take(&mut self.eth_rx) };
+            for e in eth_in { if let Some(f) = ap.data_from_ds(&e) { due.push(AirFrame { at_us: now_us, frame: f }); } }
+        }
         if due.is_empty() { return None; }
         due.sort_by_key(|a| (is_beacon(&a.frame), a.at_us));
         let first = due.remove(0);
-        ap.queue.extend(due);
+        match (self.ap.as_mut(), self.phone.as_mut()) {
+            (Some(ap), _) => ap.queue.extend(due),
+            (None, Some(p)) => p.queue.extend(due),
+            (None, None) => {}
+        }
         self.last_rx_us = now_us;
         Some(first.frame)
     }
@@ -663,6 +702,12 @@ impl StationLink {
                 lines.push(format!("[emu] nat: {} TCP connections ({} failed{}), {} UDP flows ({} evicted, {} send errors), {} bytes out, {} bytes in", t.tcp_opened, t.tcp_refused, inbound, t.udp_flows, t.udp_evicted, t.udp_send_errors, t.bytes_to_host, t.bytes_to_guest));
                 if let Some(r) = &t.mdns { lines.push(format!("[emu] mdns relay: {} guest responses published as {}, {} LAN queries answered from {} cached records, {} passed to the guest, {} send errors", r.announced, r.host_ip, r.answered, r.cached(), r.forwarded, r.send_errors)); }
             } }
+        if let Some(p) = &self.phone {
+            let hs: Vec<String> = p.hotspots.iter().map(|h| format!("'{}'", h.ssid)).collect();
+            let lease = p.ip.map_or("no lease".to_string(), |ip| format!("lease {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]));
+            lines.push(format!("[emu] phone: state {:?}, {}, device hotspots heard: {}; nat: {} forwarded connections, {} bytes out, {} bytes in",
+                p.state, lease, if hs.is_empty() { "none".into() } else { hs.join(", ") }, p.nat.tcp_accepted, p.nat.bytes_to_host, p.nat.bytes_to_guest));
+        }
         lines.join("\n")
     }
 }
