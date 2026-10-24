@@ -611,6 +611,7 @@ fn run<S: Soc>(mut m: Machine<S>, o: &Opts) {
     let dt = t0.elapsed().as_secs_f64();
     let interrupted = signal_poll && (interrupt::pending() || m.quit_requested);
     save_flash(&m, o);
+    if let Some(web) = &m.web { web.close(); }
     let Ok(stop) = run else { std::process::exit(101) };
     if interrupted { log(format_args!("[emu] {}: stopped, flash image written", if m.quit_requested { "quit" } else { "signal" })); }
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report(&mut m, o, (!interrupted).then_some(stop), dt))).is_err() { std::process::exit(101) }

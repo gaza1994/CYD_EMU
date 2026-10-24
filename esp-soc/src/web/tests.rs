@@ -230,3 +230,40 @@ fn websocket_origin_accepts_matching_forwarded_loopback_host() {
     }
     assert!(!local_origin("GET /ws HTTP/1.1\r\nHost: localhost:9000\r\nOrigin: http://localhost:9001\r\n\r\n", 8080));
 }
+
+fn expect_eof(connection: &mut Connection) {
+    let mut rest = Vec::new();
+    connection.socket.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty(), "{rest:?}");
+}
+
+#[test]
+fn websocket_close_is_echoed_then_the_server_sends_fin() {
+    let web = socket_web();
+    let mut connection = Connection::new(&web);
+    connection.handshake(None);
+    assert!(connection.head().starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+    connection.socket.write_all(&masked_frame(8, &[0x03, 0xe8, b'b', b'y', b'e'])).unwrap();
+    connection.expect_frame(8, &[0x03, 0xe8]);
+    expect_eof(&mut connection);
+    assert_eq!(web.clients(), 0);
+}
+
+#[test]
+fn closing_the_server_sends_going_away_and_fin_to_every_client() {
+    let web = socket_web();
+    let mut connections: Vec<Connection> = (0..2).map(|_| Connection::new(&web)).collect();
+    for connection in &mut connections {
+        connection.handshake(None);
+        assert!(connection.head().starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+    }
+    while web.clients() != 2 { std::thread::sleep(Duration::from_millis(1)); }
+    web.send_text("last");
+    web.close();
+    assert_eq!(web.clients(), 0);
+    for connection in &mut connections {
+        connection.expect_frame(1, b"last");
+        connection.expect_frame(8, &1001u16.to_be_bytes());
+        expect_eof(connection);
+    }
+}

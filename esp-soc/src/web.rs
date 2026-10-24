@@ -2,11 +2,13 @@
 //! Text frames carry JSON; binary frames carry TFT frames (type 1) and audio (type 2).
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// One connected browser: frames are queued and written by a dedicated thread so a slow or
 /// frozen tab can never block the emulator. When the queue is full, new frames are dropped.
+/// The list holds the only sender: removing a client lets its writer flush, send FIN and exit.
 pub struct Client { tx: std::sync::mpsc::SyncSender<Vec<u8>>, pub peer: Option<std::net::SocketAddr> }
 impl Client {
     fn send(&self, f: Vec<u8>) -> bool {
@@ -27,6 +29,7 @@ pub struct Shared {
     pub incoming_bin: VecDeque<Vec<u8>>,
     pub web_dir: String,
     pub hello: Vec<Vec<u8>>,     // frames sent to every new client (board description etc.)
+    pub writers: Arc<AtomicUsize>, // writer threads still flushing
 }
 
 #[derive(Clone)]
@@ -78,7 +81,7 @@ impl WebServer {
     pub fn start(port: u16, web_dir: String) -> std::io::Result<WebServer> {
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         let port = listener.local_addr()?.port();
-        let shared = Arc::new(Mutex::new(Shared { queue: false, outbox: VecDeque::new(), clients: Vec::new(), incoming: VecDeque::new(), incoming_bin: VecDeque::new(), web_dir, hello: Vec::new() }));
+        let shared = Arc::new(Mutex::new(Shared { queue: false, outbox: VecDeque::new(), clients: Vec::new(), incoming: VecDeque::new(), incoming_bin: VecDeque::new(), web_dir, hello: Vec::new(), writers: Arc::default() }));
         let s2 = shared.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -91,7 +94,7 @@ impl WebServer {
     /// A server with no sockets: everything sent is queued for whoever drains `take_outbox`
     /// (the wasm glue), and input arrives through `push_incoming*`. Same protocol, no transport.
     pub fn queued() -> WebServer {
-        WebServer { shared: Arc::new(Mutex::new(Shared { queue: true, outbox: VecDeque::new(), clients: Vec::new(), incoming: VecDeque::new(), incoming_bin: VecDeque::new(), web_dir: String::new(), hello: Vec::new() })), port: 0 }
+        WebServer { shared: Arc::new(Mutex::new(Shared { queue: true, outbox: VecDeque::new(), clients: Vec::new(), incoming: VecDeque::new(), incoming_bin: VecDeque::new(), web_dir: String::new(), hello: Vec::new(), writers: Arc::default() })), port: 0 }
     }
     pub fn send_text(&self, s: &str) { self.emit(1, s.as_bytes()); }
     pub fn send_binary(&self, d: &[u8]) { self.emit(2, d); }
@@ -118,6 +121,18 @@ impl WebServer {
     pub fn poll_incoming(&self) -> Vec<String> { let mut sh = self.shared.lock().unwrap(); sh.incoming.drain(..).collect() }
     pub fn poll_incoming_bin(&self) -> Vec<Vec<u8>> { let mut sh = self.shared.lock().unwrap(); sh.incoming_bin.drain(..).collect() }
     pub fn clients(&self) -> usize { self.shared.lock().unwrap().clients.len() }
+    /// End every connection cleanly before the process exits: a Close frame (1001, going away) and
+    /// a FIN after the queued frames, waiting up to half a second for the writers. Without it a
+    /// client sees a reset (Windows: 10054) or a socket that simply stops, not a closed link.
+    pub fn close(&self) {
+        let writers = {
+            let mut sh = self.shared.lock().unwrap();
+            for c in sh.clients.drain(..) { let _ = c.tx.try_send(frame(8, &1001u16.to_be_bytes())); }
+            sh.writers.clone()
+        };
+        let t = std::time::Instant::now();
+        while writers.load(Ordering::SeqCst) != 0 && t.elapsed() < std::time::Duration::from_millis(500) { std::thread::sleep(std::time::Duration::from_millis(5)); }
+    }
 }
 
 /// The value of HTTP header `name` in a request head. Header names are case-insensitive
@@ -201,17 +216,22 @@ fn handle_client(mut stream: TcpStream, shared: Arc<Mutex<Shared>>) {
     if write!(stream, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").is_err() { return; }
     let _ = stream.set_nodelay(true);
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(256);
-    let hello = {
+    let me = stream.peer_addr().ok();
+    let (hello, writers) = {
         let mut sh = shared.lock().unwrap();
-        let hello = sh.hello.clone();
-        sh.clients.push(Client { tx: tx.clone(), peer: stream.peer_addr().ok() });
-        hello
+        sh.clients.push(Client { tx, peer: me });
+        sh.writers.fetch_add(1, Ordering::SeqCst);
+        (sh.hello.clone(), sh.writers.clone())
     };
     // Register and snapshot atomically, then write without the emulator's mutex.
     // Live frames can queue immediately but always follow the complete snapshot.
     std::thread::spawn(move || {
         for f in hello.into_iter().chain(rx) { if out.write_all(&f).is_err() { break; } }
+        let _ = out.shutdown(Shutdown::Write);
+        writers.fetch_sub(1, Ordering::SeqCst);
     });
+    // Replies go through the list, so a client already dropped (or closed) is not written again.
+    let reply = |f: Vec<u8>| shared.lock().unwrap().clients.iter().find(|c| c.peer == me).is_some_and(|c| c.send(f));
     // read loop
     // A TCP read may have included the first frame after the HTTP head.
     let mut input = req[head_end..].chain(&mut stream);
@@ -226,16 +246,15 @@ fn handle_client(mut stream: TcpStream, shared: Arc<Mutex<Shared>>) {
         let Some(mut data) = read_exact(len as usize) else { break };
         if masked { for (i, b) in data.iter_mut().enumerate() { *b ^= mask[i & 3]; } }
         match op {
-            8 => break,
-            9 => { if tx.send(frame(10, &data)).is_err() { break; } }
+            // Echo the status code: the closing handshake the client waits for (RFC 6455 5.5.1).
+            8 => { reply(frame(8, &data[..data.len().min(2)])); break; }
+            9 => { if !reply(frame(10, &data)) { break; } }
             1 => { shared.lock().unwrap().incoming.push_back(String::from_utf8_lossy(&data).to_string()); }
             2 => { let mut sh = shared.lock().unwrap(); if sh.incoming_bin.len() < 4 { sh.incoming_bin.push_back(data); } }
             _ => {}
         }
     }
-    let mut sh = shared.lock().unwrap();
-    let me = stream.peer_addr().ok();
-    sh.clients.retain(|c| c.peer != me);
+    shared.lock().unwrap().clients.retain(|c| c.peer != me);
 }
 
 /// Tiny JSON helpers for the few message shapes the UI sends.

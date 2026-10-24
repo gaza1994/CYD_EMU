@@ -20,6 +20,9 @@ The native server accepts browser WebSocket connections only from pages at
 the browser's `Origin` header, which identifies the page's scheme, host and port.
 Local native clients may omit `Origin`; the server treats those tools as trusted.
 See the [Origin check](../esp-soc/src/web.rs) for the implementation.
+A client Close is echoed with its status code before the server half-closes (FIN). On exit
+(`quit`, `--max-seconds`, Ctrl-C) every client gets Close 1001 (going away) and FIN after its
+queued frames, so tools see a clean end of stream instead of a reset.
 
 The header shows emulated time, instructions, frames, and `real time` / `⚠ N% of real time` /
 resync count. The percentage is emulated seconds per wall second over the last second: a
