@@ -27,8 +27,8 @@ accelerator, SHA over GDMA (including SHA-384) and AES-CTR — see docs/peripher
 ## Not there yet
 
 - **UDP inbound**: not forwarded; `--hostfwd` is TCP only.
-- **Multicast/mDNS**: not carried, so `esp-web.local` and Home Assistant discovery do not resolve;
-  use IP addresses.
+- **Multicast/mDNS**: not carried, except the guest's own mDNS names with `--mdns-relay` (they
+  resolve to the host, which forwards the ports); the guest cannot resolve LAN names.
 - **Real LAN presence**: a `--net tap`/vmnet backend would give the guest an address on the real
   network (and mDNS with it), at the cost of root or the macOS vmnet entitlement.
 

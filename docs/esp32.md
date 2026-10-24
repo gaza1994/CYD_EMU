@@ -162,4 +162,5 @@ tcp:0.0.0.0:3232-:3232` answers the encrypted native API (`aioesphomeapi`, `esph
 980 KB in 16 s, a reboot into `ota_1`, and with `--flash-file` the new image kept across runs.
 The bootloader rolls the update back if the run ends before ESPHome's `safe_mode` marks the boot
 good (60 s), as on the board. The run kept to real time with `--realtime` and at 5.6 Minsn/s.
-mDNS does not cross the NAT, so give tools the address rather than `cyd-emu.local`.
+With `--mdns-relay auto` the device is also discovered as `cyd-emu` (`_esphomelib._tcp`, the host's
+address, port 6053), and `esphome logs` and `esphome upload` work with `--device cyd-emu.local`.

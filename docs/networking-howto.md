@@ -43,6 +43,34 @@ explicitly: `--hostfwd tcp:0.0.0.0:6053-:6053` listens on every interface, so an
 the host can reach the guest port; there is no filtering, so only do this on a network you trust.
 Each connection appears to the guest as coming from 10.0.2.2.
 
+`--mdns-relay HOSTIP` (or `auto`, the address the host's default route uses) makes the guest's
+mDNS names work on the LAN, so Home Assistant discovers an ESPHome device and `cyd-emu.local`
+resolves. The guest's mDNS responses (UDP to port 5353) are rewritten and multicast on the LAN
+from a `0.0.0.0:5353` socket that joins 224.0.0.251 on HOSTIP's interface: A 10.0.2.15 becomes
+HOSTIP, an SRV port with a `--hostfwd` becomes its host port (guest 3232 forwarded from host
+13232 is published as 13232), and AAAA, other 10.0.2.x and 169.254.x addresses are dropped (and
+AAAA cleared from NSEC). LAN queries for names and types the guest has announced are answered
+from a cache of those records with their TTLs counting down; once a record is past half its TTL
+(or gone), the query is passed into the guest instead, and its answer renews the cache. A
+one-shot querier on another port (`dig -p 5353 @224.0.0.251`) gets a unicast answer with TTLs
+capped at 10 s. The socket sets SO_REUSEADDR (and SO_REUSEPORT on Linux and macOS), so it shares
+the port with Avahi, systemd-resolved or python-zeroconf. Publish the ports on `0.0.0.0`; a
+`127.0.0.1` `--hostfwd` is advertised but warned about, since the LAN cannot reach it.
+
+```sh
+esp32sim --board cyd --flash-file flash.bin --wifi ssid=esp32sim,psk=esp32sim-pass --net nat \
+  --hostfwd tcp:0.0.0.0:6053-:6053 --hostfwd tcp:0.0.0.0:3232-:3232 --mdns-relay auto --realtime
+esphome logs cyd.yaml --device cyd-emu.local     # resolves to the host, port 6053
+```
+
+On **Windows** the same code uses Winsock's SO_REUSEADDR (there is no SO_REUSEPORT). The DNS
+Client service's own mDNS responder, and Bonjour if installed, also hold UDP 5353; sharing works
+as long as neither bound it with SO_EXCLUSIVEADDRUSE, otherwise the run stops with the bind
+error. Every sharer gets each multicast datagram, but a unicast datagram to port 5353 reaches only
+one of them, which is why the relay answers multicast. Windows Firewall asks to allow
+`esp32sim.exe` on first use; allow private networks, or inbound UDP 5353 is dropped and only
+announcements leave. This path compiles for Windows but has only been run on Linux.
+
 The same `--wifi` and `--net` work on the **ESP32-C6** (`esp32sim-c6`): the access point and the
 network are the same code, the MAC model is the C6's own ([wifi-c6-plan.md](wifi-c6-plan.md)). What
 has been tried is one station on one open or WPA2 network; `examples/c6-wifi-station` has the full command. The C3 also supports `--wifi` with open/WPA2 station mode and the same network backend.
@@ -85,9 +113,11 @@ has been tried is one station on one open or WPA2 network; `examples/c6-wifi-sta
 
 ## Known limits
 
-- **UDP inbound** is not forwarded. `--hostfwd` is TCP only; multicast and mDNS still do not cross.
-- **Multicast and mDNS** do not cross the NAT: `something.local` will not resolve, and Home
-  Assistant / ESP-IDF discovery protocols will not see anything. Use IP addresses.
+- **UDP inbound** is not forwarded. `--hostfwd` is TCP only.
+- **Multicast** does not cross the NAT, and mDNS only as `--mdns-relay` carries it: the guest's
+  own responses go out and LAN queries for its names come in, but the guest's queries stay
+  inside (it cannot resolve other `.local` names, and does not see a name conflict on the LAN:
+  give each emulator its own name). IPv4 only, one guest, one interface.
 - **UDP reply peers** must match the destination IP and port of the outgoing datagram. The
   [connected UDP relay](../esp-soc/src/nat.rs) does not support TFTP's server-selected transfer
   port or replies from a different address on a multi-homed server. Failed host sends drop
