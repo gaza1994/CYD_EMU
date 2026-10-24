@@ -1,0 +1,45 @@
+# LilyGO TTGO T-Display (ESP32, 1.14" ST7789 135x240). Supported by esp32sim today,
+# so it is the profile to test cyd-lab end to end while the CYD board model is written.
+
+id = "ttgo-tdisplay"
+name = "TTGO T-Display (test)"
+description = "LilyGO TTGO T-Display: ESP32-D0WDQ6, 4 MB flash, 1.14in ST7789 135x240, two buttons. Used to test cyd-lab against an existing esp32sim board model."
+vendor = "LilyGO"
+chip = "esp32"
+psram_mb = 0
+
+[engine]
+board = "tdisplay"
+rom = "esp32_rev300_rom.elf"
+console = "uart0"
+extra_args = []
+
+[flash]
+size_mb = 4
+mode = "dio"
+freq_mhz = 40
+
+[display]
+controller = "ST7789"
+width = 135
+height = 240
+default_rotation = 0
+bus = "VSPI"
+[display.pins]
+sck = 18
+mosi = 19
+cs = 5
+dc = 16
+rst = 23
+backlight = 4
+
+[usb_serial]
+chip = "CH9102"
+auto_reset = true
+
+[[buttons]]
+name = "BOOT / IO0"
+pin = 0
+[[buttons]]
+name = "IO35"
+pin = 35

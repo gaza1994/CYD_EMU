@@ -1,0 +1,29 @@
+[package]
+name = "cyd-lab"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Gareth Johnstone"]
+description = "Desktop manager for emulated ESP32 'Cheap Yellow Display' boards (esp32sim front end)"
+publish = false
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.37"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+directories = "6"
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+rfd = "0.17"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
