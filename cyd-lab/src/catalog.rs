@@ -35,6 +35,9 @@ pub const BUNDLED_FIRMWARE: &[(&str, &[u8])] = &[("esphome-ha-cyd-2432s028r.fact
 /// Configs behind cyd-lab's bundled firmware (an entry's `config`).
 pub const OVERLAY_TEMPLATES: &[(&str, &str)] = &[("esphome/cyd-panel-2432s028r.yaml", include_str!("../firmware/esphome-ha/cyd-2432s028r.yaml"))];
 
+/// Screen pictures for overlay entries (the emulator's `--tft-png`, landscape).
+pub const OVERLAY_THUMBS: &[(&str, &[u8])] = &[("esphome-ha-cyd", include_bytes!("../assets/cyd-lab-thumbs/esphome-ha-cyd.png"))];
+
 /// Gallery headings, in order: (group id, heading).
 pub const GROUPS: &[(&str, &str)] = &[("home-assistant", "Home Assistant"), ("tools", "Tools & fun"), ("programming", "Programming"), ("other", "Other / advanced")];
 
@@ -140,6 +143,9 @@ pub struct Entry {
     /// A bundled config behind this firmware (offered as "Copy config").
     #[serde(default)]
     pub config: String,
+    /// Screen view rotation to switch the device to on install (the firmware draws landscape).
+    #[serde(default)]
+    pub view_rotation: Option<u16>,
 }
 
 /// First Wi-Fi setup of a firmware: Improv over serial, its own hotspot, or something else.
@@ -375,7 +381,7 @@ impl Entry {
     }
 
     pub fn thumbnail(&self) -> Option<&'static [u8]> {
-        THUMBS.iter().find(|(id, _)| *id == self.id).map(|(_, b)| *b)
+        THUMBS.iter().chain(OVERLAY_THUMBS).find(|(id, _)| *id == self.id).map(|(_, b)| *b)
     }
 
     /// Bundled text of a config template file (`templates/…`).

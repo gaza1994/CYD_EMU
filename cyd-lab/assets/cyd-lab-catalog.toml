@@ -11,6 +11,7 @@
 #                   note = "..." }  how the firmware gets onto Wi-Fi the first time
 #   steps       = ["...", ...]    a step card shown after installing it
 #   config      = "file"          a bundled config the gallery offers to copy (Copy config)
+#   view_rotation = 0|90|180|270  screen view rotation set on install (firmware draws landscape)
 # Extra source type: "bundled" (file = name under assets/firmware/, offset, sha256, size).
 
 [[entries]]
@@ -29,6 +30,7 @@ TODO: a one-click "Take control" (dashboard_import) needs a public copy of the c
 group = "home-assistant"
 pinned = true
 config = "esphome/cyd-panel-2432s028r.yaml"
+view_rotation = 270
 first_setup = { improv = true, hotspot = "cyd-panel-xxxxxx", password = "", page = "http://192.168.4.1", note = "" }
 steps = [
   "Send Wi-Fi details: once it has booted (a few seconds), press \"Send Wi-Fi details\" on the device panel. The screen then shows its IP.",

@@ -1497,7 +1497,9 @@ impl CydLabApp {
                                 Some(t) => {
                                     let sz = t.size_vec2();
                                     let scale = (size.x / sz.x).min(size.y / sz.y);
-                                    ui.add(egui::Image::new((t.id(), sz * scale))).on_hover_ui(|ui| {
+                                    let (r, resp) = ui.allocate_exact_size(size, Sense::hover());
+                                    egui::Image::new((t.id(), sz * scale)).paint_at(ui, Rect::from_center_size(r.center(), sz * scale));
+                                    resp.on_hover_ui(|ui| {
                                         ui.add(egui::Image::new((t.id(), sz)));
                                         ui.label("In the emulator");
                                     });
@@ -1642,6 +1644,10 @@ impl CydLabApp {
                 if !f.hotspot.is_empty() {
                     d.hotspot_form = (String::new(), f.password.clone(), f.page_ip().unwrap_or_else(|| crate::hotspot::GUEST_AP_IP.to_string()));
                 }
+            }
+            if let Some(r) = e.view_rotation.filter(|r| *r != d.dev.meta.view_rotation) {
+                d.dev.meta.view_rotation = r;
+                let _ = self.store.update_meta(&d.dev);
             }
             d.start_catalog_install(e, cache, w);
         }
@@ -2094,7 +2100,7 @@ impl CydLabApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("Next steps for {name}")).strong().color(Color32::WHITE));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        close = ui.small_button("✕").on_hover_text("Hide these steps").clicked();
+                        close = ui.small_button("Hide").on_hover_text("Hide these steps").clicked();
                     });
                 });
                 for (k, st) in steps.iter().enumerate() {
@@ -2158,7 +2164,12 @@ impl CydLabApp {
             Some(Ok(m)) => {
                 let forwards: Vec<(u16, u16)> = d.dev.meta.network.active_forwards().iter().map(|f| (f.host, f.guest)).collect();
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(format!("  ✔ {m}")).small().color(Color32::LIGHT_GREEN));
+                    ui.label(RichText::new(format!("  Done: {m}")).small().color(Color32::LIGHT_GREEN));
+                    if d.improv.url.is_none() {
+                        if let Some((hp, _)) = forwards.iter().find(|(_, g)| *g == 6053) {
+                            ui.label(RichText::new(format!("Home Assistant: add the ESPHome integration with this PC's IP and port {hp}")).small());
+                        }
+                    }
                     if let Some(url) = d.improv.url.clone() {
                         match crate::improv::local_url(&url, &forwards) {
                             Some(local) => {
@@ -2172,7 +2183,7 @@ impl CydLabApp {
                 });
             }
             Some(Err(e)) => {
-                ui.label(RichText::new(format!("  ✖ {e}")).small().color(Color32::from_rgb(240, 120, 100)));
+                ui.label(RichText::new(format!("  Failed: {e}")).small().color(Color32::from_rgb(240, 120, 100)));
             }
             None => {}
         }
@@ -2511,7 +2522,8 @@ impl CydLabApp {
             if rot != d.dev.meta.view_rotation {
                 d.dev.meta.view_rotation = rot;
                 let _ = self.store.update_meta(&d.dev);
-            }            if d.flash_blank && d.pending_flash.is_none() {
+            }
+            if d.flash_blank && d.pending_flash.is_none() {
                 ui.label(RichText::new("Blank flash: press Install firmware..., or drop a .bin here").color(Color32::from_rgb(240, 190, 40)));
             }
         });
