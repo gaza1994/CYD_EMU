@@ -91,7 +91,7 @@ pub fn use_with_lines(url: &str, name: &str) -> Vec<(&'static str, String, Strin
         ("esptool", "flash a merged/factory image".into(), format!("esptool --port {url} --baud 921600 write-flash 0x0 firmware.factory.bin")),
         ("esptool", "or an app image (Arduino *.ino.bin, PlatformIO firmware.bin)".into(), format!("esptool --port {url} --baud 921600 write-flash 0x10000 firmware.bin")),
         ("PlatformIO", "platformio.ini, then Upload / Monitor as usual".into(), format!("upload_port = {url}\nmonitor_port = {url}")),
-        ("Arduino IDE 2", format!("after \"Set up Arduino IDE\": Tools → Port → \"{name} (cyd-lab)\""), format!("arduino-cli compile -u -b {} -p {url} MySketch", crate::arduino_setup::FQBN)),
+        ("Arduino IDE 2", format!("after \"Set up Arduino IDE\": Tools > Port > \"{name} (cyd-lab)\""), format!("arduino-cli compile -u -b {} -p {url} MySketch", crate::arduino_setup::FQBN)),
         ("ESPHome", "build, then drop the factory .bin onto this window (esphome run would try OTA)".into(), "esphome compile cyd.yaml   →   .esphome/build/<name>/.pioenvs/<name>/firmware.factory.bin".into()),
         ("Serial terminal", "pyserial's miniterm (or any rfc2217 client)".into(), format!("python -m serial.tools.miniterm {url} 115200")),
     ]
@@ -389,7 +389,7 @@ impl DeviceView {
         };
         match crate::firmware::place(&data, &flash_head(&self.dev.flash_path())) {
             crate::firmware::Placement::At(off, kind) => {
-                self.lab(format!("{name}: {kind} → 0x{off:x}"));
+                self.lab(format!("{name}: {kind} at 0x{off:x}"));
                 self.queue_flash(false, vec![(off, data, name.clone())], name, true);
             }
             crate::firmware::Placement::Ask(off, why) => self.drop_ask = Some(DropAsk { name, data, offset: format!("0x{off:x}"), why }),
@@ -925,7 +925,7 @@ impl CydLabApp {
         let mut open = true;
         let mut create = false;
         egui::Window::new("New device").collapsible(false).resizable(false).open(&mut open).show(ctx, |ui| {
-            ui.label("A new device is a factory-fresh board: blank flash (all 0xFF), its own folder, COM port name and MAC.");
+            ui.label("A new device is a factory-fresh board: blank flash (all 0xFF), its own folder, network serial port and MAC.");
             ui.add_space(6.0);
             egui::Grid::new("newdev").num_columns(2).show(ui, |ui| {
                 ui.label("Name");

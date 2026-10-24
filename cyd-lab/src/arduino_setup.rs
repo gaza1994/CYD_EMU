@@ -170,7 +170,7 @@ pub fn install(dirs: &ArduinoDirs, tools: &Path, running_json: &Path) -> Result<
             ok: false,
             lines: vec![
                 format!("The ESP32 core for Arduino is not installed (looked in {}).", dirs.data.join("packages").join("esp32").display()),
-                "One step: open Arduino IDE 2 → Tools → Board → Boards Manager…, search \"esp32\", install \"esp32 by Espressif Systems\". Then press \"Set up Arduino IDE\" again.".into(),
+                "One step: open Arduino IDE 2 > Tools > Board > Boards Manager…, search \"esp32\", install \"esp32 by Espressif Systems\". Then press \"Set up Arduino IDE\" again.".into(),
             ],
         });
     };
@@ -201,7 +201,7 @@ pub fn install(dirs: &ArduinoDirs, tools: &Path, running_json: &Path) -> Result<
             format!("  Tools → Board → cyd-lab (emulated CYD boards) → {BOARD_NAME}"),
             "  Tools → Port → network ports → \"<device name> (cyd-lab)\"  (the device must be powered on)".into(),
             "  Upload as usual; the Serial Monitor works too.".into(),
-            format!("arduino-cli: arduino-cli compile -u -b {FQBN} -p rfc2217://127.0.0.1:<port> <sketch>"),
+            format!("arduino-cli compile -u -b {FQBN} -p rfc2217://127.0.0.1:<port> <sketch>"),
         ],
     })
 }
