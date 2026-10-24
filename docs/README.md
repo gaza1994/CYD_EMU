@@ -15,6 +15,7 @@ New here? [quick-start.md](quick-start.md) runs your own firmware from a release
 | [architecture.md](architecture.md) | How the emulator is built: crates, CPU core, SoC bus, scheduling, boards, UI |
 | [peripherals.md](peripherals.md) | Every modelled block, what part of it is modelled, what is missing |
 | [boards.md](boards.md) | The `BoardModel` trait, the boards, pin maps, how to add one |
+| [board-profiles.md](board-profiles.md) | Classic ESP32 SPI-display boards (the CYD family) as TOML profiles: built-ins, keys, `--board-config`, `--list-boards` |
 | [cli.md](cli.md) | Command-line flags, environment variables, action scripts, output files |
 | [web-ui.md](web-ui.md) | The browser UI and its WebSocket protocol |
 | [decisions.md](decisions.md) | Design decisions and hard-won gotchas (the "why" behind the code) |
