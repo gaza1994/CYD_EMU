@@ -118,7 +118,9 @@ impl Device for WifiMac {
                 }
             }
             0x084 => {
-                if v & 1 != 0 && self.rx_next == 0 {
+                // A reload restarts an unstarted list from the base; one the DMA ran off the
+                // end of resumes at the last filled descriptor's link (`SocBus::wifi_rx_reload`).
+                if v & 1 != 0 && self.rx_next == 0 && self.rx_last == 0 {
                     self.rx_next = self.rx_base;
                 }
                 self.write_reg(off, v & !1);
@@ -204,6 +206,15 @@ impl SocBus {
             }
         }
         self.periph.wifi.link.net_step(now_us);
+    }
+    /// RX reload after the DMA stopped at a null link: the guest recycles descriptors by
+    /// appending them behind the last one filled, so the hardware re-reads that link. Restarting
+    /// at the base instead lets the hardware overtake the guest's ring pointer, which then skips
+    /// the frame (openHASP's auth response after a full ring of beacons).
+    pub(crate) fn wifi_rx_reload(&mut self) {
+        let last = self.periph.wifi.rx_last;
+        if self.periph.wifi.rx_next != 0 || last == 0 { return; }
+        if let Ok((_, d)) = self.read_dma_descriptor(last) { self.periph.wifi.rx_next = d.next; }
     }
     fn wifi_rx_deliver(&mut self, frame: &[u8], now_us: u64, trace: bool) {
         if self.wifi_rx_fill(frame, now_us, trace).is_none() { self.periph.wifi.link.drop_rx(); }
@@ -535,6 +546,9 @@ mod tests {
         w.rx_next = 0;
         assert_eq!(w.read(0x08c), DMA_BASE);
         w.write(0x084, 1);
+        assert_eq!(w.read(0x08c), DMA_BASE);
+        w.rx_last = 0;
+        w.write(0x084, 1);
         assert_eq!(w.read(0x08c), 0x3ffb_0100);
         assert_eq!(w.read(0x084) & 1, 0);
         w.now_cycles = CPU_HZ;
@@ -578,6 +592,48 @@ mod tests {
         assert!(b.periph.wifi.link.ap().is_some() && b.periph.wifi.link.net().is_some());
         // The MAC reset leaves the host-side link and its counts alone, as on S3/C3/C6.
         assert_eq!(b.periph.wifi.link.tx_frames(), 1);
+    }
+
+    #[test]
+    fn receive_reload_after_a_full_list_resumes_behind_the_last_filled_descriptor() {
+        // libpp's recycle: a drained descriptor is re-armed with a null link and appended behind
+        // the tail, then 0x084 bit 0 reloads. A full list leaves the DMA at a null link; the
+        // reload must follow the tail, not restart at the base the guest's ring has moved past.
+        use emu_core::Bus as _;
+        let mut b = SocBus::new(0, [2, 0, 0, 0, 0, 1]);
+        b.periph.wifi.link.attach(Some(VirtualAp::new(wifi::ApConfig::parse("").unwrap(), false)), Some(esp_soc::net::VirtualNet::new(false)));
+        let [d0, d1, d2] = [0x3ffb_0000u32, 0x3ffb_000c, 0x3ffb_0018];
+        let control = (1 << 31) | 1600;
+        let arm = |b: &mut SocBus, d: u32, next: u32| { b.dma_write_word(d, control); b.dma_write_word(d + 4, 0x3ffb_1000 + (d - d0) * 0x80); b.dma_write_word(d + 8, next); };
+        arm(&mut b, d0, d1); arm(&mut b, d1, d2); arm(&mut b, d2, 0);
+        b.write32(0x3ff7_3088, d0).unwrap();
+        b.write32(0x3ff7_3084, 1 << 31).unwrap();
+        let mut frame = [0u8; 24];
+        frame[0] = 0x80;
+        frame[4..10].fill(0xff);
+        let eof = |b: &mut SocBus, d: u32| b.dma_read_word(d).unwrap() & (1 << 30) != 0;
+        b.wifi_rx_deliver(&frame, 1, false);
+        b.wifi_rx_deliver(&frame, 2, false);
+        arm(&mut b, d0, 0); b.dma_write_word(d2 + 8, d0);
+        b.write32(0x3ff7_3084, (1 << 31) | 1).unwrap();
+        b.wifi_rx_deliver(&frame, 3, false);
+        b.wifi_rx_deliver(&frame, 4, false);
+        assert_eq!((b.periph.wifi.read(0x090), b.periph.wifi.rx_next), (d0, 0));
+        arm(&mut b, d1, 0); b.dma_write_word(d0 + 8, d1);
+        b.write32(0x3ff7_3084, (1 << 31) | 1).unwrap();
+        assert_eq!(b.periph.wifi.read(0x08c), d1);
+        b.wifi_rx_deliver(&frame, 5, false);
+        assert_eq!(b.periph.wifi.read(0x090), d1);
+        assert!(eof(&mut b, d1));
+        assert_eq!(b.dma_read_word(d0 + 0x1000 + 12), Some(4));
+        assert_eq!(b.periph.wifi.link.rx_dropped(), 0);
+        // A reload before anything was filled still starts at the base.
+        b.periph.wifi.reset();
+        arm(&mut b, d0, d1);
+        b.write32(0x3ff7_3088, d0).unwrap();
+        b.periph.wifi.rx_next = 0;
+        b.write32(0x3ff7_3084, (1 << 31) | 1).unwrap();
+        assert_eq!(b.periph.wifi.read(0x08c), d0);
     }
 
     #[test]

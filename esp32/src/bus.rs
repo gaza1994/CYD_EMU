@@ -267,6 +267,7 @@ impl SocBus {
         if (0x3ff4_8800..=0x3ff4_88ff).contains(&a) { self.periph.adc.now_cycles = self.cycles; }
         if a & !0xfff == 0x3ff7_1000 { self.periph.bt.advance_to(self.cycles); }
         self.periph.write32(a, v);
+        if a == 0x3ff7_3084 && v & 1 != 0 { self.wifi_rx_reload(); }
         // IDF v5.5.4 esp32/rtc_cntl_reg.h:2017-2039. Only a CRC START write
         // touches RTC memory; no new state or work in reads, ticks or instruction execution.
         if a == 0x3ff4_8100 && v & (1 << 8) != 0 {
