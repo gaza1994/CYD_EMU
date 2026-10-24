@@ -38,10 +38,7 @@ pub struct Paths {
 
 impl Paths {
     pub fn discover() -> Result<Paths> {
-        let root = match std::env::var_os("CYD_LAB_HOME") {
-            Some(p) => PathBuf::from(p),
-            None => directories::BaseDirs::new().context("no home directory")?.data_dir().join("cyd-lab"),
-        };
+        let root = crate::running::data_dir().context("no home directory")?;
         let p = Paths { devices: root.join("devices"), profiles: root.join("profiles"), settings: root.join("settings.toml"), root };
         std::fs::create_dir_all(&p.devices)?;
         std::fs::create_dir_all(&p.profiles)?;
@@ -87,6 +84,37 @@ fn port_is_free(port: u16) -> bool {
 
 // ---------------------------------------------------------------------------
 // Pure helpers (unit tested)
+
+/// One-liners for the "Use with…" popover: (tool, what to do, the line to copy).
+pub fn use_with_lines(url: &str, name: &str) -> Vec<(&'static str, String, String)> {
+    vec![
+        ("esptool", "flash a merged/factory image".into(), format!("esptool --port {url} --baud 921600 write-flash 0x0 firmware.factory.bin")),
+        ("esptool", "or an app image (Arduino *.ino.bin, PlatformIO firmware.bin)".into(), format!("esptool --port {url} --baud 921600 write-flash 0x10000 firmware.bin")),
+        ("PlatformIO", "platformio.ini, then Upload / Monitor as usual".into(), format!("upload_port = {url}\nmonitor_port = {url}")),
+        ("Arduino IDE 2", format!("after \"Set up Arduino IDE\": Tools → Port → \"{name} (cyd-lab)\""), format!("arduino-cli compile -u -b {} -p {url} MySketch", crate::arduino_setup::FQBN)),
+        ("ESPHome", "build, then drop the factory .bin onto this window (esphome run would try OTA)".into(), "esphome compile cyd.yaml   →   .esphome/build/<name>/.pioenvs/<name>/firmware.factory.bin".into()),
+        ("Serial terminal", "pyserial's miniterm (or any rfc2217 client)".into(), format!("python -m serial.tools.miniterm {url} 115200")),
+    ]
+}
+
+fn use_with_ui(ui: &mut egui::Ui, url: &str, name: &str) {
+    ui.set_max_width(620.0);
+    ui.label(RichText::new("This device's serial port is a network URL: no COM driver needed.").weak());
+    ui.label(RichText::new("DTR/RTS auto-reset works, so tools reset into the bootloader by themselves. One client at a time.").weak().small());
+    for (tool, what, line) in use_with_lines(url, name) {
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(tool).strong());
+            ui.label(RichText::new(what).small());
+        });
+        ui.horizontal(|ui| {
+            if ui.small_button("Copy").clicked() {
+                ui.ctx().copy_text(line.clone());
+            }
+            ui.label(RichText::new(&line).monospace());
+        });
+    }
+}
 
 /// The URL tools use to reach a device's `--serial-tcp` port (pyserial / esptool syntax).
 pub fn rfc2217_url(port: u16) -> String {
@@ -179,6 +207,49 @@ struct DeviceView {
     web_erase: bool,
     /// A download in progress (manifest + parts), run on a thread.
     web_job: Option<std::sync::mpsc::Receiver<WebMsg>>,
+    /// Firmware waiting to be written: the device is powered off first if needed.
+    pending_flash: Option<PendingFlash>,
+    /// A dropped/picked .bin whose offset the user must confirm.
+    drop_ask: Option<DropAsk>,
+    /// No bootloader in flash.bin (0xE9 at 0x1000), refreshed after writes and power-off.
+    flash_blank: bool,
+}
+
+/// Firmware queued for flash.bin. Applied once the engine is stopped (it owns the file
+/// while running and rewrites it at power-off), then the device is powered on.
+struct PendingFlash {
+    erase: bool,
+    parts: Vec<(u64, Vec<u8>, String)>,
+    what: String,
+    power_on_after: bool,
+    stop_sent: bool,
+}
+
+struct DropAsk {
+    name: String,
+    data: Vec<u8>,
+    offset: String,
+    why: String,
+}
+
+/// Does flash.bin hold a bootloader? (Reads 0x1001 bytes.)
+fn flash_is_blank(path: &Path) -> bool {
+    use std::io::Read;
+    let mut b = vec![0u8; 0x1001];
+    match std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut b)) {
+        Ok(()) => b[0x1000] != crate::firmware::IMAGE_MAGIC && b[0] != crate::firmware::IMAGE_MAGIC,
+        Err(_) => true,
+    }
+}
+
+/// The first 0x9000 bytes of flash.bin (bootloader + partition table) for the heuristics.
+fn flash_head(path: &Path) -> Vec<u8> {
+    use std::io::Read;
+    let mut b = Vec::new();
+    if let Ok(f) = std::fs::File::open(path) {
+        let _ = f.take(0x9000).read_to_end(&mut b);
+    }
+    b
 }
 
 enum WebMsg {
@@ -188,6 +259,7 @@ enum WebMsg {
 
 impl DeviceView {
     fn new(dev: Device, waker: Waker) -> DeviceView {
+        let flash_blank = flash_is_blank(&dev.flash_path());
         DeviceView {
             rename_buf: dev.meta.name.clone(),
             dev,
@@ -213,6 +285,9 @@ impl DeviceView {
             web_manifest: String::new(),
             web_erase: true,
             web_job: None,
+            pending_flash: None,
+            drop_ask: None,
+            flash_blank,
         }
     }
 
@@ -238,28 +313,86 @@ impl DeviceView {
         });
     }
 
-    /// Write downloaded parts into flash.bin (device must be powered off).
-    fn finish_web_install(&mut self, store: &DeviceStore, p: crate::webinstall::Prepared) {
-        if !matches!(self.backend.state(), RunState::Stopped | RunState::Exited(_)) {
-            return self.lab("web install: device was powered on meanwhile, nothing written. Power off and install again.");
-        }
+    /// Queue downloaded parts for flash.bin (written once the device is off, then it boots).
+    fn finish_web_install(&mut self, p: crate::webinstall::Prepared) {
         if p.erase {
-            if let Err(e) = store.erase_flash(&self.dev) {
-                return self.lab(format!("web install: erase failed: {e:#}"));
-            }
-            self.lab(if p.prompt_erase { "web install: flash erased (\"erase first\" ticked)" } else { "web install: flash erased (a new install always erases)" });
+            self.lab(if p.prompt_erase { "web install: will erase flash first (\"erase first\" ticked)" } else { "web install: will erase flash first (a new install always erases)" });
         } else {
             self.lab("web install: not erasing (manifest leaves it to you, \"erase first\" unticked)");
         }
-        for (off, data, src) in &p.parts {
-            if let Err(e) = store.import_firmware(&self.dev, *off, data) {
-                return self.lab(format!("web install: writing {src}: {e:#}"));
-            }
-        }
         let what = format!("{} {}", if p.name.is_empty() { "firmware" } else { &p.name }, p.version);
-        self.lab(format!("web install: wrote {what} ({} part(s), {} bytes) to flash.bin. Power on to boot it.", p.parts.len(), p.total_bytes()));
         if p.improv {
             self.lab("web install: this firmware offers Improv Wi-Fi setup over serial; cyd-lab doesn't do that step, use the firmware's own setup (e.g. its access point or web UI).");
+        }
+        self.queue_flash(p.erase, p.parts, what.trim().to_string(), true);
+    }
+
+    fn queue_flash(&mut self, erase: bool, parts: Vec<(u64, Vec<u8>, String)>, what: String, power_on_after: bool) {
+        if matches!(self.backend.state(), RunState::Running(_) | RunState::Stopping) {
+            self.lab(format!("{what}: powering off to write flash.bin (the engine saves it first)…"));
+        }
+        self.pending_flash = Some(PendingFlash { erase, parts, what, power_on_after, stop_sent: false });
+    }
+
+    /// Write the pending firmware if the engine is stopped. Returns true when the device
+    /// should now be powered on.
+    fn apply_pending(&mut self, store: &DeviceStore) -> bool {
+        let state = self.backend.state();
+        let Some(p) = self.pending_flash.as_mut() else { return false };
+        match state {
+            RunState::Running(_) => {
+                if !p.stop_sent {
+                    p.stop_sent = true;
+                    p.power_on_after = true;
+                    self.backend.request_stop();
+                }
+                return false;
+            }
+            RunState::Stopping => return false,
+            RunState::Stopped | RunState::Exited(_) => {}
+        }
+        let p = self.pending_flash.take().unwrap();
+        if p.erase {
+            if let Err(e) = store.erase_flash(&self.dev) {
+                self.lab(format!("{}: erase failed: {e:#}", p.what));
+                return false;
+            }
+        }
+        let mut bytes = 0;
+        for (off, data, src) in &p.parts {
+            if let Err(e) = store.import_firmware(&self.dev, *off, data) {
+                self.lab(format!("{}: writing {src} at 0x{off:x}: {e:#}", p.what));
+                self.flash_blank = flash_is_blank(&self.dev.flash_path());
+                return false;
+            }
+            bytes += data.len();
+        }
+        let at: Vec<String> = p.parts.iter().map(|(o, _, _)| format!("0x{o:x}")).collect();
+        self.lab(match (p.erase, p.parts.is_empty()) {
+            (true, true) => "flash erased to 0xFF".to_string(),
+            (e, _) => format!("{}: wrote {bytes} bytes at {}{}", p.what, at.join(", "), if e { " (after erasing)" } else { "" }),
+        });
+        self.flash_blank = flash_is_blank(&self.dev.flash_path());
+        p.power_on_after
+    }
+
+    /// A .bin (or manifest.json) dropped onto the window or picked with "Flash a .bin…".
+    fn flash_file(&mut self, path: &Path, waker: Waker) {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if name.to_ascii_lowercase().ends_with(".json") {
+            self.web_manifest = path.to_string_lossy().into_owned();
+            return self.start_web_install(waker);
+        }
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) => return self.lab(format!("{name}: {e}")),
+        };
+        match crate::firmware::place(&data, &flash_head(&self.dev.flash_path())) {
+            crate::firmware::Placement::At(off, kind) => {
+                self.lab(format!("{name}: {kind} → 0x{off:x}"));
+                self.queue_flash(false, vec![(off, data, name.clone())], name, true);
+            }
+            crate::firmware::Placement::Ask(off, why) => self.drop_ask = Some(DropAsk { name, data, offset: format!("0x{off:x}"), why }),
         }
     }
 
@@ -297,6 +430,12 @@ pub struct CydLabApp {
     waker: Waker,
     /// What `running.json` last said (rewritten only when this changes).
     running_written: Option<Vec<crate::running::RunningDevice>>,
+    /// The mask ROM is available (settings' ROM dir or the downloaded copy).
+    rom_ready: bool,
+    rom_job: Option<std::sync::mpsc::Receiver<crate::setup::RomMsg>>,
+    rom_progress: (u64, Option<u64>),
+    rom_error: Option<String>,
+    arduino_report: Option<crate::arduino_setup::Report>,
 }
 
 impl CydLabApp {
@@ -324,7 +463,239 @@ impl CydLabApp {
             status = format!("Profile errors: {}", profiles.errors.join("; "));
         }
         let selected = if devices.is_empty() { None } else { Some(0) };
-        CydLabApp { paths, settings, settings_draft: None, profiles, store, devices, selected, new_device: None, confirm_delete: None, status, waker, running_written: None }
+        let mut app = CydLabApp {
+            paths,
+            settings,
+            settings_draft: None,
+            profiles,
+            store,
+            devices,
+            selected,
+            new_device: None,
+            confirm_delete: None,
+            status,
+            waker,
+            running_written: None,
+            rom_ready: false,
+            rom_job: None,
+            rom_progress: (0, None),
+            rom_error: None,
+            arduino_report: None,
+        };
+        app.rom_ready = app.check_rom();
+        if !app.rom_ready {
+            app.start_rom_download();
+        }
+        app
+    }
+
+    /// Where the downloaded mask ROMs live.
+    fn rom_cache(&self) -> PathBuf {
+        self.paths.root.join("roms")
+    }
+
+    fn check_rom(&self) -> bool {
+        match self.settings.engine.rom_dir.as_ref().filter(|d| !d.as_os_str().is_empty()) {
+            Some(d) => crate::setup::ROMS.iter().all(|(n, _)| d.join(n).is_file()),
+            None => crate::setup::roms_ok(&self.rom_cache()),
+        }
+    }
+
+    fn start_rom_download(&mut self) {
+        let dir = self.rom_cache();
+        let waker = self.waker.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.rom_job = Some(rx);
+        self.rom_error = None;
+        self.rom_progress = (0, None);
+        std::thread::spawn(move || {
+            let t = tx.clone();
+            let w = waker.clone();
+            let mut last = 0u64;
+            let r = crate::setup::fetch_roms(&dir, &mut |n, total| {
+                if n - last >= 256 * 1024 || Some(n) == total {
+                    last = n;
+                    let _ = t.send(crate::setup::RomMsg::Progress(n, total));
+                    w();
+                }
+            });
+            let _ = tx.send(crate::setup::RomMsg::Done(r.map_err(|e| format!("{e:#}"))));
+            waker();
+        });
+    }
+
+    fn poll_rom(&mut self) {
+        let Some(rx) = &self.rom_job else { return };
+        for m in rx.try_iter().collect::<Vec<_>>() {
+            match m {
+                crate::setup::RomMsg::Progress(n, t) => self.rom_progress = (n, t),
+                crate::setup::RomMsg::Done(r) => {
+                    self.rom_job = None;
+                    match r {
+                        Ok(()) => self.rom_ready = self.check_rom(),
+                        Err(e) => self.rom_error = Some(e),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Settings with the release defaults filled in: the engine next to cyd-lab when the
+    /// configured one is the plain default name and not on PATH, and the downloaded ROMs.
+    fn effective_engine(&self) -> EngineSettings {
+        let mut e = self.settings.engine.clone();
+        if e.engine_exe.components().count() <= 1 {
+            if let Some(b) = crate::setup::bundled_engine() {
+                e.engine_exe = b;
+            }
+        }
+        if e.rom_dir.as_ref().is_none_or(|d| d.as_os_str().is_empty()) && crate::setup::roms_ok(&self.rom_cache()) {
+            e.rom_dir = Some(self.rom_cache());
+        }
+        e
+    }
+
+    fn setup_arduino(&self) -> crate::arduino_setup::Report {
+        use crate::arduino_setup::*;
+        let fail = |m: String| Report { ok: false, lines: vec![m] };
+        let Some(dirs) = ArduinoDirs::discover() else { return fail("No home folder found.".into()) };
+        let Some(tools) = crate::setup::exe_dir().and_then(|d| find_tools(&d)) else {
+            return fail("cyd-lab-discovery / cyd-lab-monitor are missing: they belong in the arduino\\tools folder next to cyd-lab (re-extract the zip).".into());
+        };
+        let running = self.paths.root.join(crate::running::FILE_NAME);
+        install(&dirs, &tools, &running).unwrap_or_else(|e| fail(format!("Setup failed: {e:#}")))
+    }
+
+    fn arduino_window(&mut self, ctx: &egui::Context) {
+        let Some(r) = &self.arduino_report else { return };
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new(if r.ok { "Arduino IDE: ready" } else { "Arduino IDE: one more step" }).open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
+            for l in &r.lines {
+                if l.starts_with("  ") || l.starts_with("arduino-cli") {
+                    ui.label(RichText::new(l).monospace());
+                } else {
+                    ui.label(l);
+                }
+            }
+            ui.add_space(6.0);
+            if ui.button("OK").clicked() {
+                close = true;
+            }
+        });
+        if !open || close {
+            self.arduino_report = None;
+        }
+    }
+
+    fn handle_drops(&mut self, ctx: &egui::Context) {
+        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if hovering {
+            let text = match self.selected.and_then(|i| self.devices.get(i)) {
+                Some(d) => format!("Drop to flash {}", d.dev.meta.name),
+                None => "Create a device first (+ New device)".to_string(),
+            };
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop")));
+            let rect = ctx.content_rect();
+            painter.rect_filled(rect, 0.0, Color32::from_black_alpha(170));
+            painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(28.0), Color32::WHITE);
+        }
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        let Some(path) = dropped.first() else { return };
+        match self.selected.filter(|i| *i < self.devices.len()) {
+            Some(i) if self.devices[i].pending_flash.is_none() && self.devices[i].web_job.is_none() => {
+                let w = self.waker.clone();
+                self.devices[i].flash_file(path, w);
+            }
+            Some(_) => self.status = "Busy writing firmware; drop again when it is done.".into(),
+            None => self.status = "Create a device first (+ New device), then drop the .bin onto it.".into(),
+        }
+    }
+
+    fn drop_ask_window(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.devices.iter().position(|d| d.drop_ask.is_some()) else { return };
+        let mut go = false;
+        let mut cancel = false;
+        let d = &mut self.devices[i];
+        let ask = d.drop_ask.as_mut().unwrap();
+        egui::Modal::new(egui::Id::unique("drop_ask")).show(ctx, |ui| {
+            ui.set_max_width(460.0);
+            ui.heading(format!("Where should {} go?", ask.name));
+            ui.label(&ask.why);
+            ui.horizontal(|ui| {
+                ui.label("Write at offset");
+                ui.add(egui::TextEdit::singleline(&mut ask.offset).desired_width(90.0));
+                ui.label(RichText::new("0x0 merged/factory · 0x1000 bootloader · 0x8000 partitions · 0x10000 app").small().weak());
+            });
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new("Write").strong()).clicked() {
+                    go = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if go {
+            match parse_offset(&ask.offset) {
+                Ok(off) => {
+                    let a = d.drop_ask.take().unwrap();
+                    d.queue_flash(false, vec![(off, a.data, a.name.clone())], a.name, true);
+                }
+                Err(e) => self.status = format!("offset: {e:#}"),
+            }
+        } else if cancel {
+            d.drop_ask = None;
+        }
+    }
+
+    fn first_run_ui(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(60.0);
+            ui.heading("Welcome to cyd-lab");
+            ui.add_space(8.0);
+            ui.label("One-time setup: cyd-lab needs Espressif's ESP32 mask ROM to boot the emulated chip.");
+            ui.label(RichText::new(format!("esp-rom-elfs {} from github.com/espressif (Apache-2.0), checked by SHA-256, kept in {}", crate::setup::ROM_RELEASE, self.rom_cache().display())).small().weak());
+            ui.add_space(14.0);
+            if self.rom_job.is_some() {
+                let (n, t) = self.rom_progress;
+                let frac = t.map(|t| n as f32 / t.max(1) as f32);
+                let text = match t {
+                    Some(t) => format!("Downloading… {:.1} / {:.1} MB", n as f64 / 1e6, t as f64 / 1e6),
+                    None => format!("Downloading… {:.1} MB", n as f64 / 1e6),
+                };
+                ui.add(egui::ProgressBar::new(frac.unwrap_or(0.0)).desired_width(360.0).text(text).animate(frac.is_none()));
+            } else if let Some(e) = &self.rom_error {
+                ui.label(RichText::new("The download did not work:").color(Color32::LIGHT_RED).strong());
+                ui.label(RichText::new(e).color(Color32::LIGHT_RED));
+                ui.label(RichText::new("Check the internet connection (or a proxy/firewall blocking github.com) and retry.").small());
+                ui.add_space(6.0);
+                if ui.button(RichText::new("Retry").strong().size(16.0)).clicked() {
+                    self.start_rom_download();
+                }
+            }
+            ui.add_space(20.0);
+            let engine = self.effective_engine().engine_exe;
+            match resolve_exe(&engine) {
+                Some(p) => ui.label(RichText::new(format!("Engine: {}", p.display())).small().weak()),
+                None => ui.label(RichText::new(format!("Engine not found: put {} next to cyd-lab (it ships in the zip), or set it in Settings.", crate::setup::engine_file_name())).color(Color32::LIGHT_RED)),
+            };
+            ui.add_space(6.0);
+            if ui.small_button("I already have the ROM ELFs: choose their folder…").clicked() {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    let mut s = self.settings.clone();
+                    s.engine.rom_dir = Some(dir);
+                    self.settings = s;
+                    if let Err(e) = self.settings.save(&self.paths.settings) {
+                        self.status = format!("could not save settings: {e:#}");
+                    }
+                    self.rom_ready = self.check_rom();
+                    if !self.rom_ready {
+                        self.rom_error = Some(format!("{} is not in that folder", crate::setup::ROMS[0].0));
+                    }
+                }
+            }
+        });
     }
 
     fn profile_for(&self, i: usize) -> Option<Profile> {
@@ -333,7 +704,7 @@ impl CydLabApp {
 
     /// What the configured engine build supports (cached per exe path/size/mtime).
     fn engine_features(&self) -> EngineFeatures {
-        resolve_exe(&self.settings.engine.engine_exe).map(|p| EngineFeatures::probe(&p)).unwrap_or_default()
+        resolve_exe(&self.effective_engine().engine_exe).map(|p| EngineFeatures::probe(&p)).unwrap_or_default()
     }
 
     /// The TCP port for this device's `--serial-tcp`: its configured port if free,
@@ -361,7 +732,7 @@ impl CydLabApp {
             None
         };
         #[allow(unused_mut)]
-        let mut spec = LaunchSpec::build(&profile, &self.devices[i].dev, &self.settings.engine, &features, boot, port, serial);
+        let mut spec = LaunchSpec::build(&profile, &self.devices[i].dev, &self.effective_engine(), &features, boot, port, serial);
         #[cfg(windows)]
         if let Some(com) = self.devices[i].dev.meta.com_port.as_ref().filter(|_| self.settings.engine.com_bridge) {
             match serial {
@@ -442,7 +813,7 @@ impl CydLabApp {
                         WebMsg::Done(r) => {
                             d.web_job = None;
                             match r {
-                                Ok(p) => d.finish_web_install(&self.store, p),
+                                Ok(p) => d.finish_web_install(p),
                                 Err(e) => d.lab(format!("web install failed: {e}")),
                             }
                         }
@@ -453,6 +824,7 @@ impl CydLabApp {
                 match ev {
                     EngineEvent::Console(s, l) => d.log(s, l),
                     EngineEvent::Exited(_) => {
+                        d.flash_blank = flash_is_blank(&d.dev.flash_path());
                         d.link_up = false;
                         d.touch_down = None;
                         d.touch_since = None;
@@ -892,88 +1264,98 @@ impl CydLabApp {
             self.press_en(i, boot_held);
         }
 
-        // --- flash tools
+        // --- firmware
         let mut erase = false;
         let mut import = false;
         let mut delete = false;
         let mut rename = false;
-        ui.horizontal_wrapped(|ui| {
-            let d = &mut self.devices[i];
-            let size = d.dev.flash_size().map(|s| format!("{} MB", s / (1024 * 1024))).unwrap_or_else(|_| "missing".into());
-            ui.label(format!("Flash ({size}):"));
-            ui.add_enabled_ui(!alive, |ui| {
-            if ui.button("Erase flash").on_hover_text("Reset flash.bin to all 0xFF").on_disabled_hover_text("Power off first: the running engine owns flash.bin and rewrites it at power-off").clicked() {
-                erase = true;
-            }
-            ui.separator();
-            ui.label("Import .bin at");
-            ui.add(egui::TextEdit::singleline(&mut d.import_offset).desired_width(70.0));
-            ui.add(egui::TextEdit::singleline(&mut d.import_path).desired_width(220.0).hint_text("firmware.bin (merged @0x0, app @0x10000)"));
-            if ui.button("…").clicked() {
-                if let Some(f) = rfd::FileDialog::new().add_filter("firmware", &["bin"]).pick_file() {
-                    d.import_path = f.to_string_lossy().into_owned();
-                }
-            }
-            if ui.button("Import").on_disabled_hover_text("Power off first: the running engine owns flash.bin and rewrites it at power-off").clicked() {
-                import = true;
-            }
-            });
-        });
+        let mut pick_bin = false;
         let mut web_install = false;
+        let busy = self.devices[i].pending_flash.is_some() || self.devices[i].web_job.is_some();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Firmware:").strong());
+            ui.add_enabled_ui(!busy, |ui| {
+                if ui.button(RichText::new("Flash a .bin…").strong()).on_hover_text("Pick a firmware .bin. Merged/factory images go to 0x0, app images into the app partition; you are asked only when it is unclear. A running device is powered off, written and powered on again.").clicked() {
+                    pick_bin = true;
+                }
+                if ui.button("Erase flash").on_hover_text("Reset flash.bin to all 0xFF (a running device is powered off first)").clicked() {
+                    erase = true;
+                }
+            });
+            if busy {
+                ui.spinner();
+            }
+            ui.label(RichText::new("…or drop a .bin / manifest.json onto this window").weak());
+        });
         ui.horizontal_wrapped(|ui| {
             let d = &mut self.devices[i];
-            ui.label("Web installer").on_hover_text("ESP Web Tools manifest: the JSON behind an \"Install\" button on a web flasher page (openHASP, WLED, ESPHome, ...). cyd-lab downloads the ESP32 build's parts and writes them into flash.bin, like the browser would over Web Serial.");
-            ui.add_enabled_ui(!alive && d.web_job.is_none(), |ui| {
-                ui.add(egui::TextEdit::singleline(&mut d.web_manifest).desired_width(330.0).hint_text("https://…/manifest.json"));
+            ui.label(RichText::new("Install from web:").strong()).on_hover_text("ESP Web Tools manifest: the JSON behind an \"Install\" / \"Connect\" button on a web flasher page (openHASP, WLED, ESPHome projects, ...). cyd-lab downloads the ESP32 build's parts and writes them into flash.bin, as the browser would over Web Serial. On the flasher page, look for manifest.json in the page source or the browser's network tab.");
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut d.web_manifest).desired_width(330.0).hint_text("paste the web flasher's manifest URL: https://…/manifest.json"));
                 if ui.button("…").on_hover_text("Pick a local manifest.json (parts are read next to it)").clicked() {
                     if let Some(f) = rfd::FileDialog::new().add_filter("manifest", &["json"]).pick_file() {
                         d.web_manifest = f.to_string_lossy().into_owned();
                     }
                 }
                 ui.checkbox(&mut d.web_erase, "erase first").on_hover_text("Used when the manifest leaves erasing to the user (new_install_prompt_erase). Otherwise a new install always erases, as ESP Web Tools does.");
-                if ui.button("Install").on_disabled_hover_text("Power off first: the running engine owns flash.bin").clicked() {
+                if ui.add_enabled(!d.web_manifest.trim().is_empty(), egui::Button::new("Install")).clicked() {
                     web_install = true;
                 }
             });
-            if d.web_job.is_some() {
-                ui.spinner();
-            }
         });
+        egui::CollapsingHeader::new(RichText::new("More: write at an offset, rename, delete").small()).id_salt(("more", i)).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let d = &mut self.devices[i];
+                let size = d.dev.flash_size().map(|s| format!("{} MB", s / (1024 * 1024))).unwrap_or_else(|_| "missing".into());
+                ui.label(format!("Flash ({size}): write .bin at"));
+                ui.add(egui::TextEdit::singleline(&mut d.import_offset).desired_width(70.0));
+                ui.add(egui::TextEdit::singleline(&mut d.import_path).desired_width(220.0).hint_text("firmware.bin (merged @0x0, app @0x10000)"));
+                if ui.button("…").clicked() {
+                    if let Some(f) = rfd::FileDialog::new().add_filter("firmware", &["bin"]).pick_file() {
+                        d.import_path = f.to_string_lossy().into_owned();
+                    }
+                }
+                if ui.add_enabled(!busy, egui::Button::new("Write")).clicked() {
+                    import = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                let d = &mut self.devices[i];
+                ui.add(egui::TextEdit::singleline(&mut d.rename_buf).desired_width(160.0));
+                if ui.button("Rename").clicked() {
+                    rename = true;
+                }
+                ui.separator();
+                if ui.button(RichText::new("Delete device…").color(Color32::LIGHT_RED)).clicked() {
+                    delete = true;
+                }
+            });
+        });
+        if pick_bin {
+            if let Some(f) = rfd::FileDialog::new().add_filter("firmware", &["bin", "json"]).pick_file() {
+                let w = self.waker.clone();
+                self.devices[i].flash_file(&f, w);
+            }
+        }
         if web_install {
             let w = self.waker.clone();
             self.devices[i].start_web_install(w);
         }
-        ui.horizontal(|ui| {
-            let d = &mut self.devices[i];
-            ui.add(egui::TextEdit::singleline(&mut d.rename_buf).desired_width(160.0));
-            if ui.button("Rename").clicked() {
-                rename = true;
-            }
-            ui.separator();
-            if ui.button(RichText::new("Delete device…").color(Color32::LIGHT_RED)).clicked() {
-                delete = true;
-            }
-        });
         if erase {
-            let r = self.store.erase_flash(&self.devices[i].dev);
-            let d = &mut self.devices[i];
-            match r {
-                Ok(()) => d.lab("flash erased to 0xFF"),
-                Err(e) => d.lab(format!("erase failed: {e:#}")),
-            }
+            let was_on = alive;
+            self.devices[i].queue_flash(true, Vec::new(), "erase".into(), was_on);
         }
         if import && self.devices[i].import_path.trim().is_empty() {
-            self.devices[i].lab("import: choose a .bin first (type a path or use …)");
+            self.devices[i].lab("write: choose a .bin first (type a path or use …)");
         } else if import {
-            let d = &self.devices[i];
-            let r = parse_offset(&d.import_offset).and_then(|off| self.store.import_firmware_file(&d.dev, off, Path::new(d.import_path.trim())).map(|_| off));
             let d = &mut self.devices[i];
-            match r {
-                Ok(off) => {
-                    let msg = format!("imported {} at 0x{off:x}", d.import_path.trim());
-                    d.lab(msg);
+            let path = PathBuf::from(d.import_path.trim());
+            match parse_offset(&d.import_offset).and_then(|off| Ok((off, std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?))) {
+                Ok((off, data)) => {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    d.queue_flash(false, vec![(off, data, name.clone())], name, true);
                 }
-                Err(e) => d.lab(format!("import failed: {e:#}")),
+                Err(e) => d.lab(format!("write failed: {e:#}")),
             }
         }
         if rename {
@@ -1036,9 +1418,11 @@ impl CydLabApp {
                 ui.label(RichText::new(&url).monospace().color(color)).on_hover_text(format!(
                     "esptool --chip esp32 --port {url} --baud 921600 write-flash 0x1000 firmware.bin\nPlatformIO: upload_port = {url}\nThe engine maps DTR/RTS through the auto-reset circuit, so esptool resets into the bootloader and back by itself.\nOne client at a time: a new connection (also cyd-lab's EN with a changed BOOT) replaces the old one."
                 ));
-                if ui.small_button("Copy").clicked() {
-                    ui.ctx().copy_text(url);
+                if ui.small_button("Copy").on_hover_text("Copy the rfc2217:// URL").clicked() {
+                    ui.ctx().copy_text(url.clone());
                 }
+                let name = d.dev.meta.name.clone();
+                ui.menu_button("Use with…", |ui| use_with_ui(ui, &url, &name));
             }
             let note = match (alive, live_port.is_some(), features.serial_tcp) {
                 (true, true, _) => "live".to_string(),
@@ -1075,6 +1459,8 @@ impl CydLabApp {
             if rot != d.dev.meta.view_rotation {
                 d.dev.meta.view_rotation = rot;
                 let _ = self.store.update_meta(&d.dev);
+            }            if d.flash_blank && d.pending_flash.is_none() {
+                ui.label(RichText::new("Blank flash: drop a .bin here or Install from web").color(Color32::from_rgb(240, 190, 40)));
             }
         });
         let rot = d.dev.meta.view_rotation;
@@ -1282,6 +1668,13 @@ impl eframe::App for CydLabApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_backends(&ctx);
+        self.poll_rom();
+        for i in 0..self.devices.len() {
+            if self.devices[i].apply_pending(&self.store) {
+                self.power_on(i, false);
+            }
+        }
+        self.handle_drops(&ctx);
 
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1290,6 +1683,9 @@ impl eframe::App for CydLabApp {
                 ui.separator();
                 if ui.button("+ New device").clicked() {
                     self.open_new_device();
+                }
+                if ui.button("Set up Arduino IDE").on_hover_text("Add the \"CYD (cyd-lab, emulated)\" board and its network ports to Arduino IDE 2: no Boards Manager URL, no COM driver. Needs the esp32 core installed in the IDE.").clicked() {
+                    self.arduino_report = Some(self.setup_arduino());
                 }
                 if ui.button("Settings").clicked() {
                     self.settings_draft = Some(self.settings.clone());
@@ -1305,17 +1701,24 @@ impl eframe::App for CydLabApp {
         });
         egui::Panel::left("devices").default_size(230.0).show(ui, |ui| self.device_list(ui));
         egui::CentralPanel::default_margins().show(ui, |ui| match self.selected {
+            _ if !self.rom_ready => self.first_run_ui(ui),
             Some(i) if i < self.devices.len() => self.device_panel(ui, i),
             _ => {
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);
-                    ui.heading("No device selected");
-                    ui.label("Create one with + New device. Each device is a blank board with its own flash image, console and screen.");
+                    ui.heading("No device yet");
+                    ui.label("Each device is a blank board with its own flash, console and screen.");
+                    ui.add_space(8.0);
+                    if ui.button(RichText::new("+ New device").size(18.0).strong()).clicked() {
+                        self.open_new_device();
+                    }
                 });
             }
         });
 
         self.new_device_window(&ctx);
+        self.drop_ask_window(&ctx);
+        self.arduino_window(&ctx);
         self.settings_window(&ctx);
         self.delete_modal(&ctx);
     }

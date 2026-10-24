@@ -156,6 +156,7 @@ pub struct Prepared {
 }
 
 impl Prepared {
+    #[allow(dead_code)]
     pub fn total_bytes(&self) -> usize {
         self.parts.iter().map(|p| p.1.len()).sum()
     }

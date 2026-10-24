@@ -201,6 +201,7 @@ impl DeviceStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn import_firmware_file(&self, dev: &Device, offset: u64, file: &Path) -> Result<()> {
         let data = fs::read(file).with_context(|| format!("reading {}", file.display()))?;
         self.import_firmware(dev, offset, &data)
