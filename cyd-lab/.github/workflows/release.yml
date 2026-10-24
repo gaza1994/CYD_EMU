@@ -1,0 +1,118 @@
+# Builds the Windows release zip (cyd-lab-windows-x64.zip) on a real Windows
+# runner: cyd-lab from this repository, the esp32sim engine from the CYD_EMU
+# fork at a chosen branch/tag/commit. Fully static CRT (see .cargo/config.toml),
+# so the zip needs no VC++ redistributable.
+#
+# Run it from the Actions tab ("Run workflow"), or push a tag like v0.1.0 to
+# also attach the zip to a draft GitHub release.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      engine_repo:
+        description: "Engine repository (owner/name)"
+        default: "gaza1994/CYD_EMU"
+        required: true
+      engine_ref:
+        description: "Engine branch, tag or commit"
+        default: "cyd-2432s028r"
+        required: true
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # only used by the draft-release step on tag pushes
+
+env:
+  ENGINE_REPO: ${{ inputs.engine_repo || 'gaza1994/CYD_EMU' }}
+  ENGINE_REF: ${{ inputs.engine_ref || 'cyd-2432s028r' }}
+  TARGET: x86_64-pc-windows-msvc
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out cyd-lab
+        uses: actions/checkout@v4
+        with:
+          path: cyd-lab
+
+      - name: Check out engine (${{ env.ENGINE_REPO }} @ ${{ env.ENGINE_REF }})
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ENGINE_REPO }}
+          ref: ${{ env.ENGINE_REF }}
+          path: esp32sim
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            cyd-lab
+            esp32sim
+
+      - name: Build engine (esp32sim.exe, static CRT)
+        working-directory: esp32sim
+        env:
+          # The engine repo has no crt-static config of its own.
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --release --locked -p esp32sim --bin esp32sim --target $TARGET
+
+      - name: Test cyd-lab
+        working-directory: cyd-lab
+        run: cargo test --locked --target $TARGET
+
+      - name: Build cyd-lab (cyd-lab.exe, discovery, monitor)
+        working-directory: cyd-lab
+        run: cargo build --release --locked --bins --target $TARGET
+
+      - name: Check DLL imports (system DLLs only)
+        shell: pwsh
+        run: |
+          $dumpbin = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -find "VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $exes = @("esp32sim\target\$env:TARGET\release\esp32sim.exe") + (Get-ChildItem "cyd-lab\target\$env:TARGET\release\cyd-lab*.exe" | ForEach-Object FullName)
+          $bad = $false
+          foreach ($exe in $exes) {
+            $dlls = & $dumpbin /nologo /dependents $exe | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim().ToLower() }
+            Write-Host "$exe -> $($dlls -join ', ')"
+            foreach ($d in $dlls) { if ($d -match '^(vcruntime|msvcp|ucrtbase|libgcc|libwinpthread|libstdc)') { Write-Host "::error::$exe imports $d"; $bad = $true } }
+          }
+          if ($bad) { exit 1 }
+
+      - name: Package zip
+        run: |
+          python cyd-lab/tools/package_windows.py \
+            --bin-dir cyd-lab/target/$TARGET/release \
+            --engine esp32sim/target/$TARGET/release/esp32sim.exe \
+            --engine-src esp32sim \
+            --target $TARGET \
+            --out release/cyd-lab-windows-x64.zip
+          ls -l release
+
+      - name: Smoke test (exes start)
+        run: |
+          cd release && unzip -q cyd-lab-windows-x64.zip
+          ./cyd-lab/esp32sim.exe --help > /dev/null
+          printf 'HELLO 1 "ci"\nQUIT\n' | ./cyd-lab/arduino/tools/cyd-lab-discovery.exe | grep -q '"hello"'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cyd-lab-windows-x64
+          path: release/cyd-lab-windows-x64.zip
+          if-no-files-found: error
+
+      - name: Draft release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/cyd-lab-windows-x64.zip --draft --title "cyd-lab $GITHUB_REF_NAME" --notes "Engine: $ENGINE_REPO @ $ENGINE_REF" --repo "$GITHUB_REPOSITORY"
