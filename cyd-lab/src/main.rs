@@ -16,6 +16,7 @@ mod device;
 mod engine;
 mod profile;
 mod rfc2217;
+mod webinstall;
 mod weblink;
 
 fn main() -> eframe::Result {

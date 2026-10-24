@@ -173,6 +173,17 @@ struct DeviceView {
     rename_buf: String,
     import_offset: String,
     import_path: String,
+    /// "Install from web installer": manifest URL or local manifest.json.
+    web_manifest: String,
+    /// Erase first when the manifest leaves it to the user (new_install_prompt_erase).
+    web_erase: bool,
+    /// A download in progress (manifest + parts), run on a thread.
+    web_job: Option<std::sync::mpsc::Receiver<WebMsg>>,
+}
+
+enum WebMsg {
+    Line(String),
+    Done(Result<crate::webinstall::Prepared, String>),
 }
 
 impl DeviceView {
@@ -199,6 +210,56 @@ impl DeviceView {
             serial_input: String::new(),
             import_offset: "0x10000".into(),
             import_path: String::new(),
+            web_manifest: String::new(),
+            web_erase: true,
+            web_job: None,
+        }
+    }
+
+    /// Start downloading a web installer's firmware on a thread.
+    fn start_web_install(&mut self, waker: Waker) {
+        let src = self.web_manifest.trim().to_string();
+        let erase = self.web_erase;
+        let size = match self.dev.flash_size() {
+            Ok(s) => s,
+            Err(e) => return self.lab(format!("web install: {e:#}")),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.web_job = Some(rx);
+        std::thread::spawn(move || {
+            let w = waker.clone();
+            let t = tx.clone();
+            let r = crate::webinstall::prepare(&src, erase, size, &mut |l| {
+                let _ = t.send(WebMsg::Line(l));
+                w();
+            });
+            let _ = tx.send(WebMsg::Done(r.map_err(|e| format!("{e:#}"))));
+            waker();
+        });
+    }
+
+    /// Write downloaded parts into flash.bin (device must be powered off).
+    fn finish_web_install(&mut self, store: &DeviceStore, p: crate::webinstall::Prepared) {
+        if !matches!(self.backend.state(), RunState::Stopped | RunState::Exited(_)) {
+            return self.lab("web install: device was powered on meanwhile, nothing written. Power off and install again.");
+        }
+        if p.erase {
+            if let Err(e) = store.erase_flash(&self.dev) {
+                return self.lab(format!("web install: erase failed: {e:#}"));
+            }
+            self.lab(if p.prompt_erase { "web install: flash erased (\"erase first\" ticked)" } else { "web install: flash erased (a new install always erases)" });
+        } else {
+            self.lab("web install: not erasing (manifest leaves it to you, \"erase first\" unticked)");
+        }
+        for (off, data, src) in &p.parts {
+            if let Err(e) = store.import_firmware(&self.dev, *off, data) {
+                return self.lab(format!("web install: writing {src}: {e:#}"));
+            }
+        }
+        let what = format!("{} {}", if p.name.is_empty() { "firmware" } else { &p.name }, p.version);
+        self.lab(format!("web install: wrote {what} ({} part(s), {} bytes) to flash.bin. Power on to boot it.", p.parts.len(), p.total_bytes()));
+        if p.improv {
+            self.lab("web install: this firmware offers Improv Wi-Fi setup over serial; cyd-lab doesn't do that step, use the firmware's own setup (e.g. its access point or web UI).");
         }
     }
 
@@ -371,6 +432,21 @@ impl CydLabApp {
     fn poll_backends(&mut self, ctx: &egui::Context) {
         let mut any_running = false;
         for d in &mut self.devices {
+            if let Some(rx) = &d.web_job {
+                let msgs: Vec<WebMsg> = rx.try_iter().collect();
+                for m in msgs {
+                    match m {
+                        WebMsg::Line(l) => d.lab(format!("web install: {l}")),
+                        WebMsg::Done(r) => {
+                            d.web_job = None;
+                            match r {
+                                Ok(p) => d.finish_web_install(&self.store, p),
+                                Err(e) => d.lab(format!("web install failed: {e}")),
+                            }
+                        }
+                    }
+                }
+            }
             for ev in d.backend.poll() {
                 match ev {
                     EngineEvent::Console(s, l) => d.log(s, l),
@@ -814,6 +890,30 @@ impl CydLabApp {
             }
             });
         });
+        let mut web_install = false;
+        ui.horizontal_wrapped(|ui| {
+            let d = &mut self.devices[i];
+            ui.label("Web installer").on_hover_text("ESP Web Tools manifest: the JSON behind an \"Install\" button on a web flasher page (openHASP, WLED, ESPHome, ...). cyd-lab downloads the ESP32 build's parts and writes them into flash.bin, like the browser would over Web Serial.");
+            ui.add_enabled_ui(!alive && d.web_job.is_none(), |ui| {
+                ui.add(egui::TextEdit::singleline(&mut d.web_manifest).desired_width(330.0).hint_text("https://…/manifest.json"));
+                if ui.button("…").on_hover_text("Pick a local manifest.json (parts are read next to it)").clicked() {
+                    if let Some(f) = rfd::FileDialog::new().add_filter("manifest", &["json"]).pick_file() {
+                        d.web_manifest = f.to_string_lossy().into_owned();
+                    }
+                }
+                ui.checkbox(&mut d.web_erase, "erase first").on_hover_text("Used when the manifest leaves erasing to the user (new_install_prompt_erase). Otherwise a new install always erases, as ESP Web Tools does.");
+                if ui.button("Install").on_disabled_hover_text("Power off first: the running engine owns flash.bin").clicked() {
+                    web_install = true;
+                }
+            });
+            if d.web_job.is_some() {
+                ui.spinner();
+            }
+        });
+        if web_install {
+            let w = self.waker.clone();
+            self.devices[i].start_web_install(w);
+        }
         ui.horizontal(|ui| {
             let d = &mut self.devices[i];
             ui.add(egui::TextEdit::singleline(&mut d.rename_buf).desired_width(160.0));

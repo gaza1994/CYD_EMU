@@ -17,6 +17,9 @@ anyhow = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 rfd = "0.17"
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+url = "2"
+serde_json = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
