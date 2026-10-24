@@ -1,0 +1,88 @@
+{
+  "packages": [
+    {
+      "name": "cydlab",
+      "maintainer": "Gareth Johnstone",
+      "websiteURL": "https://github.com/espressif/arduino-esp32",
+      "email": "",
+      "help": {
+        "online": "https://github.com/espressif/arduino-esp32"
+      },
+      "platforms": [
+        {
+          "name": "cyd-lab (emulated CYD boards)",
+          "architecture": "esp32",
+          "version": "0.1.0",
+          "category": "ESP32",
+          "help": {
+            "online": "https://github.com/espressif/arduino-esp32"
+          },
+          "url": "http://127.0.0.1:8765/cydlab-esp32-0.1.0.tar.gz",
+          "archiveFileName": "cydlab-esp32-0.1.0.tar.gz",
+          "checksum": "SHA-256:55489d1c4c9aedf4e35bb50f9eec9337a0cbc34e6006b5a27feeb8f2c48230b2",
+          "size": "3115",
+          "boards": [
+            {
+              "name": "ESP32-2432S028R CYD (cyd-lab, emulated)"
+            }
+          ],
+          "toolsDependencies": [],
+          "discoveryDependencies": [
+            {
+              "packager": "cydlab",
+              "name": "cyd-lab-discovery"
+            }
+          ],
+          "monitorDependencies": [
+            {
+              "packager": "cydlab",
+              "name": "cyd-lab-monitor"
+            }
+          ]
+        }
+      ],
+      "tools": [
+        {
+          "name": "cyd-lab-discovery",
+          "version": "0.1.0",
+          "systems": [
+            {
+              "host": "x86_64-linux-gnu",
+              "url": "http://127.0.0.1:8765/cyd-lab-discovery-0.1.0-x86_64-linux-gnu.tar.gz",
+              "archiveFileName": "cyd-lab-discovery-0.1.0-x86_64-linux-gnu.tar.gz",
+              "checksum": "SHA-256:447c9222d2a4bfec29b8993b4be372f547cb3530fc8a7eb2ef85937c2e7c79e8",
+              "size": "280385"
+            },
+            {
+              "host": "x86_64-mingw32",
+              "url": "http://127.0.0.1:8765/cyd-lab-discovery-0.1.0-x86_64-mingw32.tar.gz",
+              "archiveFileName": "cyd-lab-discovery-0.1.0-x86_64-mingw32.tar.gz",
+              "checksum": "SHA-256:40843f1b1529225e5bd4caeecfacebdbd800f71d5f45b7169e5fb3b66dc7f868",
+              "size": "276955"
+            }
+          ]
+        },
+        {
+          "name": "cyd-lab-monitor",
+          "version": "0.1.0",
+          "systems": [
+            {
+              "host": "x86_64-linux-gnu",
+              "url": "http://127.0.0.1:8765/cyd-lab-monitor-0.1.0-x86_64-linux-gnu.tar.gz",
+              "archiveFileName": "cyd-lab-monitor-0.1.0-x86_64-linux-gnu.tar.gz",
+              "checksum": "SHA-256:315e7a5dcd4bb9d1c6631b955234c19cd2ed711b3fc0cda87df80c05fcae7943",
+              "size": "239616"
+            },
+            {
+              "host": "x86_64-mingw32",
+              "url": "http://127.0.0.1:8765/cyd-lab-monitor-0.1.0-x86_64-mingw32.tar.gz",
+              "archiveFileName": "cyd-lab-monitor-0.1.0-x86_64-mingw32.tar.gz",
+              "checksum": "SHA-256:314f2e9ecd8165f0d60e0610445a1b6201099c1441ef4274e1fd85723d4eab2a",
+              "size": "227622"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

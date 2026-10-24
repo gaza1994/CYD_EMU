@@ -11,7 +11,7 @@ target, and it also builds and runs on Linux.
 
 ![screenshot](../cyd-lab-screenshot-3.png)
 
-## Status (v0.3)
+## Status (v0.4)
 
 | Works | Stubbed / not yet |
 | --- | --- |
@@ -25,6 +25,8 @@ target, and it also builds and runs on Linux.
 | Live screen, touch (verified pixel-exact at 0° and 90°) and UART0 line input over `--web` | |
 | Engine feature detection (`--help`, binary scan as a fallback), shown in Settings and as badges | |
 | PNG fallback (`--tft-png`), console with a 5000-line ring buffer | |
+| [Install from web installer](#install-from-web-installer): ESP Web Tools manifests (URL or file), tested with openHASP | Improv Wi-Fi provisioning |
+| [Arduino IDE 2 / arduino-cli](#arduino-ide-2--arduino-cli-no-driver) over the network: discovery, upload, monitor (arduino-cli on Linux) | Arduino IDE 2 on Windows not yet run; the package index isn't hosted anywhere yet |
 
 ## Architecture
 
@@ -41,7 +43,12 @@ src/
   combridge.rs com0com/hub4com: detection, setupc/hub4com command lines, COM relay plan
               (Windows-only parts are UNTESTED at runtime)
   weblink.rs  WebSocket client for esp32sim --web: frames in, touch/serial/btn/reset/quit out
+  webinstall.rs ESP Web Tools manifests: parse, pick the ESP32 build, fetch parts (ureq + rustls)
+  running.rs  running.json (powered-on devices), shared with the helper binaries
+  bin/cyd-lab-discovery.rs  Arduino pluggable discovery (reads running.json)
+  bin/cyd-lab-monitor.rs    Arduino pluggable monitor (RFC2217 / raw TCP bridge)
 profiles/     built-in profiles, compiled in with include_str!
+arduino/      the cydlab Arduino board package (boards.txt, platform.txt, index builder, example)
 ```
 
 **Why it is built this way**
@@ -215,11 +222,156 @@ Unit tests cover the command lines, detection in a fake folder tree, `setupc lis
 and the missing-component messages. The UAC prompt, `setupc` and hub4com themselves
 have not been run.
 
+## Install from web installer
+
+Many firmware projects ship an [ESP Web Tools](https://esphome.github.io/esp-web-tools/)
+"Install" button (openHASP, WLED, ESPHome projects, ...). That button uses Chrome's Web
+Serial picker, which only lists the computer's own serial/USB ports, so **an emulated
+board never shows up there** (it would need a virtual COM driver). cyd-lab reads the
+same manifest itself instead:
+
+1. Power the device **off**.
+2. Paste the manifest URL into **Web installer** (or press **…** to pick a local
+   `manifest.json`) and press **Install**.
+3. cyd-lab downloads the manifest, picks the build whose `chipFamily` is `ESP32`,
+   downloads each part (paths are relative to the manifest URL) and writes it into the
+   device's `flash.bin` at its `offset`. The console logs every step.
+4. Power on.
+
+Erase rules follow ESP Web Tools: a new install always erases the flash first, unless the
+manifest says `new_install_prompt_erase: true`, in which case the **erase first** checkbox
+decides. `improv: true` (Wi-Fi setup over serial) is noted in the console, but cyd-lab
+doesn't run Improv. Configure Wi-Fi the firmware's own way. Downloads use ureq with
+rustls, up to 16 MB per file, and `file://` and local paths work too.
+
+Tested with openHASP's CYD manifest
+`https://nightly.openhasp.com/firmware/esp32-2432s028r_full_4MB.json` (v0.7.0, one 1.7 MB
+part at 0x0, `new_install_prompt_erase: true`). It boots to openHASP's Wi-Fi setup screen
+(AP `HASP-xxxxxx`, QR code) with a full boot log on the console:
+
+![openHASP installed from its web manifest](../cyd-lab-screenshot-webinstall.png)
+
+Known gap: openHASP's picture comes out **mirrored left to right**. Arduino sketches
+(TFT_eSPI `ILI9341_2_DRIVER`) and the earlier test firmware draw the right way round, so
+this is about how the engine models MADCTL for the panel openHASP's build drives. It's an
+engine issue (esp32sim), not a cyd-lab one. Touch and serial work.
+
+## Arduino IDE 2 / arduino-cli (no driver)
+
+The folder [`arduino/`](arduino/) is an Arduino board package, **cydlab**, that makes
+cyd-lab devices appear in Arduino IDE 2 / arduino-cli as **network ports**. Board list,
+upload and Serial Monitor all go over `rfc2217://127.0.0.1:PORT`, with no COM driver.
+
+| Piece | What it does |
+| --- | --- |
+| `running.json` | cyd-lab rewrites `<data dir>/running.json` whenever a device powers on or off: name, id, profile, serial TCP port, plus cyd-lab's pid so a crashed cyd-lab doesn't leave ghosts. |
+| `cyd-lab-discovery` (bin) | [Pluggable discovery](https://arduino.github.io/arduino-cli/dev/pluggable-discovery-specification/) v1: HELLO/START/STOP/LIST/START_SYNC/QUIT. Each running device is a port with protocol `cydlab`, address `rfc2217://127.0.0.1:PORT` and label `Kitchen CYD (cyd-lab)`. Sync mode sends add/remove as devices power on and off. |
+| `cyd-lab-monitor` (bin) | [Pluggable monitor](https://arduino.github.io/arduino-cli/dev/pluggable-monitor-specification/) v1: bridges the IDE's data channel to the RFC 2217 port (Telnet stripped/escaped) or to `socket://` raw TCP. It never touches DTR/RTS, so opening the monitor doesn't reset the board. |
+| `arduino/cydlab/esp32/boards.txt` | Board `cydlab:esp32:cyd2432s028r`, "ESP32-2432S028R CYD (cyd-lab, emulated)". Its settings are copied from esp32 3.3.12's `jczn_2432s028r`, with `build.core=esp32:esp32`, `build.variant=esp32:jczn_2432s028r` and `upload.tool.cydlab=esp32:esptool_py`. |
+| `arduino/cydlab/esp32/platform.txt` | Declares the discovery and monitor. It is generated by `gen_platform.py` (see below). |
+| `arduino/make_package.py` | Builds `arduino/dist/` (platform and tool archives for Linux x86_64 and Windows x86_64, plus `package_cydlab_index.json` with SHA-256 checksums) for a given `--base-url`. |
+| `arduino/examples/CydHello` | A CYD sketch: TFT_eSPI text, XPT2046_Touchscreen touch dots, and Serial echo. |
+
+**Does referencing Espressif's core work with esp32 3.x?** Mostly. `build.core=esp32:esp32`,
+the variant reference and `esp32:esptool_py` all resolve. But arduino-cli then sets
+`{runtime.platform.path}` to the *cydlab* platform, and esp32's `platform.txt` uses that
+to find `tools/gen_esp32part.py`, `partitions/boot_app0.bin`, `espota` and `flasher`. The
+first build failed with `can't open file …/cydlab/esp32/tools/gen_esp32part.py`, and
+overriding `runtime.platform.path` is ignored. The simplest fix that works:
+`gen_platform.py` copies the 21 esp32 properties that mention `{runtime.platform.path}`
+into cydlab's `platform.txt`, pointing them at `{build.core.path}/../..` (the esp32
+platform folder). Re-run it if a later esp32 core changes those lines. The package does
+**not** install the esp32 core for you. Install `esp32:esp32` 3.x first.
+
+**Even simpler:** the cydlab package also works with Espressif's own board. Once cydlab is
+installed, the discovery and monitor are global, and for any other protocol esp32's
+boards fall back to `upload.tool.default=esptool_py`. So
+`--fqbn esp32:esp32:jczn_2432s028r -p rfc2217://127.0.0.1:PORT` uploads and monitors
+too (tested).
+
+### arduino-cli (tested on Linux, arduino-cli 1.5.1, esp32 3.3.12, esptool 5.3.1)
+
+```sh
+# build the helper binaries and the package, then serve it
+cargo build --release                       # + --target x86_64-pc-windows-gnu for the .exe tools
+python3 arduino/make_package.py --base-url http://127.0.0.1:8765/
+python3 -m http.server -d arduino/dist 8765 &
+
+arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+arduino-cli config add board_manager.additional_urls http://127.0.0.1:8765/package_cydlab_index.json
+arduino-cli core update-index
+arduino-cli core install esp32:esp32 cydlab:esp32
+arduino-cli lib install TFT_eSPI XPT2046_Touchscreen
+
+# power a device on in cyd-lab, then:
+arduino-cli board list
+# Port                      Protocol Type                        Board Name                              FQBN                      Core
+# rfc2217://127.0.0.1:22172 cydlab   cyd-lab (emulated, network) ESP32-2432S028R CYD (cyd-lab, emulated) cydlab:esp32:cyd2432s028r cydlab:esp32
+
+cd arduino/examples/CydHello
+TFT="-DUSER_SETUP_LOADED=1 -DILI9341_2_DRIVER=1 -DTFT_WIDTH=240 -DTFT_HEIGHT=320 -DUSE_HSPI_PORT=1 \
+ -DTFT_MISO=12 -DTFT_MOSI=13 -DTFT_SCLK=14 -DTFT_CS=15 -DTFT_DC=2 -DTFT_RST=-1 -DTFT_BL=21 \
+ -DTFT_BACKLIGHT_ON=HIGH -DLOAD_GLCD=1 -DLOAD_FONT2=1 -DLOAD_FONT4=1 \
+ -DSPI_FREQUENCY=55000000 -DSPI_READ_FREQUENCY=20000000 -DSPI_TOUCH_FREQUENCY=2500000"
+arduino-cli compile --fqbn cydlab:esp32:cyd2432s028r --build-property "compiler.cpp.extra_flags=$TFT" .
+arduino-cli upload  --fqbn cydlab:esp32:cyd2432s028r -p rfc2217://127.0.0.1:22172 .
+arduino-cli monitor --fqbn cydlab:esp32:cyd2432s028r -p rfc2217://127.0.0.1:22172
+```
+
+Results: `board list` (and `board list --watch`: add/remove as the device powers on and
+off) shows the device. The upload took about 3 s of writing (829 kbit/s, hashes verified),
+then "Hard resetting via RTS pin", and the board boots and draws. In the Serial Monitor,
+taps print `touch 1: x=41 y=80 …` and typed lines come back as `echo: …`. Set the
+device's Screen view to 270° for this landscape sketch.
+
+![CydHello uploaded with arduino-cli](../cyd-lab-screenshot-arduino.png)
+
+### Arduino IDE 2 on Windows (same steps; not yet run on Windows)
+
+1. Run cyd-lab and power a device on.
+2. Serve the package (`py -m http.server -d arduino\dist 8765`, or wherever it is hosted).
+3. **File → Preferences… → Additional boards manager URLs** → the button next to the box →
+   one URL per line:
+   `https://espressif.github.io/arduino-esp32/package_esp32_index.json`
+   `http://127.0.0.1:8765/package_cydlab_index.json`
+   → OK.
+4. **Tools → Board → Boards Manager…**: install **esp32** by Espressif Systems (3.x), then
+   **cyd-lab (emulated CYD boards)**.
+5. **Library Manager**: install **TFT_eSPI** and **XPT2046_Touchscreen**. In
+   `Documents\Arduino\libraries\TFT_eSPI\User_Setup.h`, replace the contents with the
+   `#define`s from the `TFT=` line above (`#define ILI9341_2_DRIVER`, `#define TFT_MISO 12`,
+   …). This is the usual CYD setup. The IDE can't pass per-sketch flags to TFT_eSPI.
+6. **Tools → Board → cyd-lab → ESP32-2432S028R CYD (cyd-lab, emulated)**. **Tools → Port**
+   lists **CYD 3 (cyd-lab)** under the network/cydlab ports. The board selector at the top
+   picks it automatically.
+7. **Upload**, then **Serial Monitor** (any baud, it's ignored).
+
+The discovery reads `%APPDATA%\cyd-lab\running.json`. If you start cyd-lab with a custom
+`CYD_LAB_HOME`, the IDE has to inherit the same variable.
+
+### Do I need a COM driver? (ESPHome, OpenHASP, Arduino)
+
+* **Arduino IDE 2 / arduino-cli:** no. See above. A COM driver would only reproduce what
+  the network port already does, with more to install and nothing gained.
+* **Web installers (openHASP's "Install" button, WLED, ESPHome Web):** the browser's Web
+  Serial picker only lists real serial ports, so it won't show the emulated board without
+  a COM driver. Use **Install from web installer** with the same manifest URL. That's the
+  same install, without the browser.
+* **ESPHome in Home Assistant:** HA's "Install" options are Web Serial (as above), a serial
+  port on the HA host, or **Manual download**. Use Manual download → "Factory format",
+  then cyd-lab's **Import .bin at 0x0** (or esptool to the `rfc2217://` URL). The
+  `esphome run --device` CLI treats anything that isn't `/dev/…` or `COMx` as an OTA
+  host, so it can't take the URL directly. Untested here.
+* **PlatformIO:** `upload_port = rfc2217://127.0.0.1:PORT` and `monitor_port` the same
+  (pyserial URL handlers). Untested here.
+* **esptool:** `--port rfc2217://127.0.0.1:PORT`, tested.
+
 ## Data layout
 
 ```
 %APPDATA%\cyd-lab\            (Linux: ~/.local/share/cyd-lab; override with CYD_LAB_HOME)
   settings.toml               engine exe, ROM dir, live link, ports, ...
+  running.json                powered-on devices + serial ports (read by cyd-lab-discovery)
   profiles\*.toml             user profiles (a matching id replaces a built-in)
   devices\<id>\device.toml    name, profile, com_port, serial_tcp_port, mac, notes, view_rotation, created
   devices\<id>\flash.bin      raw flash image (size from the profile)
@@ -264,7 +416,11 @@ bounds checks, command-line construction (strap selection, PSRAM rule, `--flash-
 auto-reset truth table and the RFC2217 EN sequences, chip status from console lines,
 com0com/hub4com command lines, detection and messages, rotation mapping, and process
 lifecycles against fake engine scripts (graceful stop, kill after the grace period, restart,
-relay started and stopped with the engine). The esptool flow was tested by hand under Xvfb.
+relay started and stopped with the engine), web-installer manifests (real openHASP/ESPHome-style
+manifests, erase rules, relative part URLs, a local manifest end to end), `running.json`
+(round trip, stale writer), the discovery's port JSON and sync diff, and the monitor's address
+parsing, Telnet framing and a two-way bridge. The esptool, web-installer and Arduino flows were
+tested by hand under Xvfb.
 
 ## What the engine needs next
 
