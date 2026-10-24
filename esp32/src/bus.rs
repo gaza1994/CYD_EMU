@@ -290,7 +290,7 @@ impl SocBus {
         while pins != 0 {
             let pin = pins.trailing_zeros() as u8;
             pins &= pins - 1;
-            let duty = self.periph.pwm_output(u32::from(pin)).map(|(_, duty)| duty);
+            let duty = self.periph.pwm_output(u32::from(pin)).map(|(_, duty)| duty).or_else(|| self.periph.ledc_idle_duty(u32::from(pin)));
             self.board.pwm_duty(pin, duty);
         }
     }
@@ -558,6 +558,7 @@ impl Bus for SocBus {
         }
         let irq_changed = self.periph.tick(elapsed);
         self.irq_dirty |= irq_changed;
+        if self.periph.ledc.take_duty_latches() != 0 && self.board.pwm_pins() != 0 { self.sync_board_pwm(); }   // a new duty, same pad level
         self.i2s_step(elapsed);
         self.flush_rmt();
         self.flush_gpio();
@@ -652,7 +653,8 @@ mod tests {
     }
 
     /// LEDC channel 0 at 25% routed to GPIO 4 (periph's `classic_ledc_routes_pwm_...` sequence):
-    /// the board hears the duty once the timer latches it, and `None` when the route goes.
+    /// the board hears the duty once the timer latches it, the idle level as 0 or 100% when the
+    /// channel stops (ESPHome at off and at full), and `None` when the route goes.
     #[test]
     fn board_pwm_pins_hear_the_ledc_duty() {
         let mut b = SocBus::new(4 << 20, [0; 6]);
@@ -667,6 +669,19 @@ mod tests {
         }
         for _ in 0..2000 { b.tick(240); }
         assert_eq!(duty.lock().unwrap().last(), Some(&Some(16384)), "{:?}", duty.lock().unwrap());
+        b.write32(0x3ff5_9008, 128 << 4).unwrap();                                    // 50%, latched at the next wrap
+        b.write32(0x3ff5_900c, (1 << 31) | (1 << 30) | (1 << 20) | (1 << 10)).unwrap();
+        assert_eq!(duty.lock().unwrap().last(), Some(&Some(16384)), "not before the wrap");
+        for _ in 0..2000 { b.tick(240); }
+        assert_eq!(duty.lock().unwrap().last(), Some(&Some(32768)));
+        b.write32(0x3ff5_9008, 64 << 4).unwrap();
+        b.write32(0x3ff5_900c, (1 << 31) | (1 << 30) | (1 << 20) | (1 << 10)).unwrap();
+        for _ in 0..2000 { b.tick(240); }
+        for (conf, idle) in [(0, 0), (8, 65535), (4, 16384)] {                         // stopped (idle low, high), running
+            b.write32(0x3ff5_9000, conf).unwrap();
+            b.tick(240);
+            assert_eq!(duty.lock().unwrap().last(), Some(&Some(idle)), "conf {conf}");
+        }
         b.write32(0x3ff4_4540, 256).unwrap();                                           // back to a plain GPIO
         assert_eq!(duty.lock().unwrap().last(), Some(&None));
     }

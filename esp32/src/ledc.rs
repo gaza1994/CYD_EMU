@@ -8,6 +8,8 @@ pub struct ClassicLedc {
     groups: [Ledc<true>; 2],
     regs: RegRam,
     dirty: u16,
+    /// Channels whose new duty took effect at a timer wrap since the last `take_duty_latches`.
+    latched: u16,
     pub clock_enabled: bool,
     #[cfg(test)]
     pub(crate) tick_calls: u64,
@@ -15,7 +17,7 @@ pub struct ClassicLedc {
 impl Default for ClassicLedc { fn default() -> Self { Self::new() } }
 impl ClassicLedc {
     pub fn new() -> Self {
-        Self { groups: std::array::from_fn(|_| Ledc::new_classic()), regs: RegRam::new(), dirty: u16::MAX, clock_enabled: false,
+        Self { groups: std::array::from_fn(|_| Ledc::new_classic()), regs: RegRam::new(), dirty: u16::MAX, latched: 0, clock_enabled: false,
             #[cfg(test)] tick_calls: 0 }
     }
     fn source(apb: bool, conf: u32) -> u64 {
@@ -29,6 +31,7 @@ impl ClassicLedc {
         (hs & 15) | ((ls & 15) << 4) | ((hs & 0xff0) << 4) | ((ls & 0xff0) << 12)
     }
     pub fn take_signal_updates(&mut self) -> u16 { std::mem::take(&mut self.dirty) }
+    pub fn take_duty_latches(&mut self) -> u16 { std::mem::take(&mut self.latched) }
     pub fn signal_level(&self, channel: usize) -> (bool, bool) { self.groups[channel / 8].signal_level(channel % 8) }
     pub fn pwm(&self, signal: usize) -> Option<(f64, u32)> {
         let ch = signal.checked_sub(71)?;
@@ -94,6 +97,7 @@ impl Device for ClassicLedc {
                 if before[ch as usize] & (1 << 31) != 0 && group.read(ch * 0x14 + 12) & (1 << 31) == 0 {
                     self.regs.write(base + 12, self.regs.read(base + 12) & !(1 << 31));
                     self.dirty |= 1 << (g * 8 + ch as usize);
+                    self.latched |= 1 << (g * 8 + ch as usize);
                 }
             }
         }

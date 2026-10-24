@@ -1039,6 +1039,16 @@ impl Peripherals {
         }
         Some(pwm)
     }
+    /// A pin on a stopped LEDC channel sits at the channel's idle level (`ledc_stop`): as a duty,
+    /// 0 or 65535. The signal's output enable is not consulted; the pad stays on the matrix.
+    pub fn ledc_idle_duty(&self, pin: u32) -> Option<u32> {
+        let pin = pin as usize;
+        if pin >= 40 || !self.gpio.matrix_pad(pin) { return None; }
+        let sel = self.gpio.gpio.func_out_sel[pin];
+        let channel = ((sel & 0x1ff) as usize).checked_sub(71).filter(|&ch| ch < 16)?;
+        let level = self.ledc.signal_level(channel).0 != (sel & (1 << 9) != 0);
+        Some(if level { 65535 } else { 0 })
+    }
 }
 
 #[cfg(test)]
