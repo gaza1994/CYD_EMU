@@ -27,6 +27,17 @@ use std::path::{Path, PathBuf};
 
 pub use crate::catalog_assets::{CATALOG_TOML, TEMPLATES, THUMBS};
 
+/// cyd-lab's own additions: extra entries, gallery groups and first-setup hints
+/// (merged into every catalogue it reads, see `assets/cyd-lab-catalog.toml`).
+pub const OVERLAY_TOML: &str = include_str!("../assets/cyd-lab-catalog.toml");
+/// Firmware images built by cyd-lab and shipped inside the app (`type = "bundled"`).
+pub const BUNDLED_FIRMWARE: &[(&str, &[u8])] = &[("esphome-ha-cyd-2432s028r.factory.bin", include_bytes!("../assets/firmware/esphome-ha-cyd-2432s028r.factory.bin"))];
+/// Configs behind cyd-lab's bundled firmware (an entry's `config`).
+pub const OVERLAY_TEMPLATES: &[(&str, &str)] = &[("esphome/cyd-panel-2432s028r.yaml", include_str!("../firmware/esphome-ha/cyd-2432s028r.yaml"))];
+
+/// Gallery headings, in order: (group id, heading).
+pub const GROUPS: &[(&str, &str)] = &[("home-assistant", "Home Assistant"), ("tools", "Tools & fun"), ("programming", "Programming"), ("other", "Other / advanced")];
+
 /// The catalogue format this build understands.
 pub const SCHEMA_VERSION: u32 = 1;
 const MAX_DOWNLOAD: u64 = 32 * 1024 * 1024;
@@ -114,6 +125,64 @@ pub struct Entry {
     #[serde(default)]
     pub needs: Option<Vec<String>>,
     pub source: toml::Table,
+    /// Gallery heading (see [`GROUPS`]); unknown or empty = "other".
+    #[serde(default)]
+    pub group: String,
+    /// Listed first in its group.
+    #[serde(default)]
+    pub pinned: bool,
+    /// How the firmware gets onto Wi-Fi the first time.
+    #[serde(default)]
+    pub first_setup: Option<FirstSetup>,
+    /// Step card shown after installing it.
+    #[serde(default)]
+    pub steps: Vec<String>,
+    /// A bundled config behind this firmware (offered as "Copy config").
+    #[serde(default)]
+    pub config: String,
+}
+
+/// First Wi-Fi setup of a firmware: Improv over serial, its own hotspot, or something else.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct FirstSetup {
+    pub improv: bool,
+    /// The hotspot's name (`xxxxxx` = part of the MAC).
+    pub hotspot: String,
+    pub password: String,
+    /// Its setup page.
+    pub page: String,
+    pub note: String,
+}
+
+impl FirstSetup {
+    /// One line for the gallery.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if self.improv {
+            parts.push("Send Wi-Fi details (Improv over USB)".to_string());
+        }
+        if !self.hotspot.is_empty() {
+            let pw = if self.password.is_empty() { "open".to_string() } else { format!("password {}", self.password) };
+            let page = if self.page.is_empty() { String::new() } else { format!(", setup page {}", self.page) };
+            parts.push(format!("its hotspot \"{}\" ({pw}{page})", self.hotspot));
+        }
+        let mut out = parts.join(" or ");
+        if !self.note.is_empty() {
+            if out.is_empty() {
+                out = self.note.clone();
+            } else {
+                out = format!("{out}; {}", self.note);
+            }
+        }
+        out
+    }
+    /// The page's address on the hotspot network (for the "Device hotspot" form).
+    pub fn page_ip(&self) -> Option<String> {
+        let rest = self.page.split_once("://").map(|(_, r)| r).unwrap_or(&self.page);
+        let host = rest.split(['/', ':']).next().unwrap_or("");
+        (!host.is_empty()).then(|| host.to_string())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -130,6 +199,8 @@ pub enum From {
     Url { url: String, mirror: Option<String> },
     /// A member of a zip file at `zip` (exact name, or a pattern with `*`).
     Zip { zip: String, member: String },
+    /// Shipped inside cyd-lab ([`BUNDLED_FIRMWARE`]).
+    Bundled { file: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -163,6 +234,8 @@ impl Catalog {
         if schema != SCHEMA_VERSION as i64 {
             bail!("catalogue schema_version {schema}; this cyd-lab reads version {SCHEMA_VERSION}");
         }
+        let mut v = v;
+        apply_overlay(&mut v, OVERLAY_TOML)?;
         let c: Catalog = v.try_into().context("catalogue entries")?;
         for e in &c.entries {
             e.spec().with_context(|| format!("entry {}", e.id))?;
@@ -189,6 +262,19 @@ impl Catalog {
             .iter()
             .filter(|e| e.profiles.iter().any(|p| p == profile))
             .filter(|e| show_broken || e.emulator_status != Status::Broken)
+            .collect()
+    }
+
+    /// The gallery's sections: headings in [`GROUPS`] order, pinned entries first.
+    pub fn grouped(&self, profile: &str, show_broken: bool) -> Vec<(&'static str, Vec<&Entry>)> {
+        let all = self.entries_for(profile, show_broken);
+        GROUPS
+            .iter()
+            .filter_map(|(g, heading)| {
+                let mut v: Vec<&Entry> = all.iter().copied().filter(|e| e.group_id() == *g).collect();
+                v.sort_by_key(|e| !e.pinned);
+                (!v.is_empty()).then_some((*heading, v))
+            })
             .collect()
     }
 
@@ -231,7 +317,39 @@ pub fn glob(pattern: &str, name: &str) -> bool {
     true
 }
 
+/// Merge cyd-lab's overlay into a catalogue: add/replace `[[entries]]`, set fields from
+/// `[[overrides]]` (by id; ids the catalogue lacks are skipped).
+fn apply_overlay(v: &mut toml::Value, overlay: &str) -> Result<()> {
+    let o: toml::Table = toml::from_str(overlay).context("cyd-lab-catalog.toml")?;
+    let Some(entries) = v.as_table_mut().map(|t| t.entry("entries").or_insert_with(|| toml::Value::Array(Vec::new()))).and_then(|e| e.as_array_mut()) else {
+        bail!("catalogue entries is not a list");
+    };
+    let id_of = |e: &toml::Value| e.get("id").and_then(|i| i.as_str()).map(str::to_string);
+    for add in o.get("entries").and_then(|e| e.as_array()).into_iter().flatten() {
+        let id = id_of(add);
+        entries.retain(|e| id.is_none() || id_of(e) != id);
+        entries.push(add.clone());
+    }
+    for ov in o.get("overrides").and_then(|e| e.as_array()).into_iter().flatten() {
+        let Some(t) = ov.as_table() else { continue };
+        let id = id_of(ov);
+        if let Some(e) = entries.iter_mut().find(|e| id.is_some() && id_of(e) == id).and_then(|e| e.as_table_mut()) {
+            for (k, val) in t {
+                if k != "id" {
+                    e.insert(k.clone(), val.clone());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Entry {
+    /// Gallery group id (one of [`GROUPS`]).
+    pub fn group_id(&self) -> &str {
+        GROUPS.iter().map(|(g, _)| *g).find(|g| *g == self.group).unwrap_or("other")
+    }
+
     pub fn kind(&self) -> &str {
         self.source.get("type").and_then(|v| v.as_str()).unwrap_or("")
     }
@@ -262,7 +380,7 @@ impl Entry {
 
     /// Bundled text of a config template file (`templates/…`).
     pub fn template_text(file: &str) -> Option<&'static str> {
-        TEMPLATES.iter().find(|(f, _)| *f == file).map(|(_, t)| *t)
+        TEMPLATES.iter().chain(OVERLAY_TEMPLATES).find(|(f, _)| *f == file).map(|(_, t)| *t)
     }
 
     pub fn spec(&self) -> Result<Spec> {
@@ -329,6 +447,13 @@ impl Entry {
                 }
                 Ok(Spec::Manifest { url: s(t, "url").ok_or_else(|| anyhow!("manifest source without url"))?, pinned, sha256_bin: sha(t, "sha256_bin")?, size_bin: n(t, "size_bin") })
             }
+            "bundled" => Ok(Spec::Parts(vec![PartSpec {
+                from: From::Bundled { file: s(t, "file").ok_or_else(|| anyhow!("bundled source without file"))? },
+                offset: n(t, "offset").unwrap_or(0),
+                sha256: sha(t, "sha256")?,
+                size: n(t, "size"),
+                patch_flash_size_mb: None,
+            }])),
             "config-template" => {
                 let mut files: Vec<String> = t.get("files").and_then(|f| f.as_array()).into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect();
                 files.extend(s(t, "file"));
@@ -456,7 +581,18 @@ impl Fetcher {
         let label = match &p.from {
             From::Url { url, .. } => url.clone(),
             From::Zip { zip, member } => format!("{member} from {}", zip.rsplit('/').next().unwrap_or(zip)),
+            From::Bundled { file } => format!("{file} (built into cyd-lab)"),
         };
+        if let From::Bundled { file } = &p.from {
+            let d = BUNDLED_FIRMWARE.iter().find(|(f, _)| f == file).map(|(_, d)| d.to_vec()).ok_or_else(|| anyhow!("{label}: not in this build of cyd-lab"))?;
+            if let Some(h) = &p.sha256 {
+                if &sha256_hex(&d) != h {
+                    bail!("{label}: SHA-256 does not match the catalogue's {h}; nothing was written.");
+                }
+                progress(format!("{label}: SHA-256 OK"));
+            }
+            return Ok((d, label));
+        }
         let mut data = match p.sha256.as_deref().and_then(|h| self.cached(h)) {
             Some(d) => {
                 progress(format!("{label}: using the verified copy in the download cache"));
@@ -476,6 +612,7 @@ impl Fetcher {
                         }
                     }
                     From::Zip { zip, member } => self.zip_member(zip, member, progress)?.1,
+                    From::Bundled { .. } => unreachable!("handled above"),
                 };
                 if let Some(sz) = p.size {
                     if d.len() as u64 != sz {
@@ -542,7 +679,8 @@ pub fn prepare(e: &Entry, flash_size: u64, cache: Option<PathBuf>, progress: &mu
             bail!("{l} ({} bytes at 0x{o:x}) doesn't fit in the device's {} MB flash", d.len(), flash_size >> 20);
         }
     }
-    Ok(crate::webinstall::Prepared { name: e.name.clone(), version: e.version.clone(), erase: true, prompt_erase: false, improv: false, parts })
+    let improv = e.first_setup.as_ref().is_some_and(|f| f.improv);
+    Ok(crate::webinstall::Prepared { name: e.name.clone(), version: e.version.clone(), erase: true, prompt_erase: false, improv, parts })
 }
 
 /// settings.toml `[catalog]`.
@@ -598,6 +736,43 @@ pub fn refresh(url: &str, data_root: &Path) -> Result<Catalog> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_adds_the_home_assistant_entry_first() {
+        let c = Catalog::bundled();
+        let g = c.grouped("cyd-2432s028r", false);
+        assert_eq!(g[0].0, "Home Assistant");
+        assert_eq!(g[0].1[0].id, "esphome-ha-cyd");
+        let names: Vec<&str> = g.iter().map(|(h, _)| *h).collect();
+        assert_eq!(names, ["Home Assistant", "Tools & fun", "Programming", "Other / advanced"]);
+        let ha = g[0].1[0];
+        assert!(ha.pinned() && ha.first_setup.as_ref().unwrap().improv && !ha.steps.is_empty());
+        assert!(Entry::template_text(&ha.config).unwrap().contains("improv_serial"));
+        let ehw = c.entries.iter().find(|e| e.id == "esphome-web").unwrap();
+        assert!(ehw.name.contains("no screen") && ehw.group_id() == "other");
+        // Every flashable entry says how it gets onto Wi-Fi.
+        for e in c.entries.iter().filter(|e| !e.is_template() && e.profiles.iter().any(|p| p == "cyd-2432s028r")) {
+            assert!(e.first_setup.as_ref().is_some_and(|f| !f.summary().is_empty()), "{} has no first_setup", e.id);
+        }
+    }
+
+    #[test]
+    fn bundled_image_matches_its_pin() {
+        let c = Catalog::bundled();
+        let ha = c.entries.iter().find(|e| e.id == "esphome-ha-cyd").unwrap();
+        let p = prepare(ha, 4 << 20, None, &mut |_| {}).unwrap();
+        assert!(p.improv);
+        assert_eq!(p.parts.len(), 1);
+        assert_eq!(p.parts[0].0, 0);
+        assert_eq!(p.parts[0].1[0x1000], 0xE9, "factory image: bootloader at 0x1000");
+    }
+
+    #[test]
+    fn first_setup_summary() {
+        let f = FirstSetup { improv: true, hotspot: "WLED-AP".into(), password: "wled1234".into(), page: "http://4.3.2.1".into(), note: String::new() };
+        assert_eq!(f.summary(), "Send Wi-Fi details (Improv over USB) or its hotspot \"WLED-AP\" (password wled1234, setup page http://4.3.2.1)");
+        assert_eq!(f.page_ip().as_deref(), Some("4.3.2.1"));
+    }
 
     #[test]
     fn bundled_catalogue_parses() {

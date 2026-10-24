@@ -1,0 +1,141 @@
+# cyd-lab's own additions to the firmware catalogue (cyd-firmware.toml, which is copied in
+# from ../catalog by tools/catalog_assets.py and not edited here).
+#
+# * [[entries]] are added (or replace an entry with the same id).
+# * [[overrides]] set fields on an existing entry by id.
+#
+# Extra entry fields cyd-lab reads:
+#   group       = "home-assistant" | "tools" | "programming" | "other"  (gallery heading)
+#   pinned      = true            listed first in its group
+#   first_setup = { improv = bool, hotspot = "SSID pattern", password = "...", page = "http://...",
+#                   note = "..." }  how the firmware gets onto Wi-Fi the first time
+#   steps       = ["...", ...]    a step card shown after installing it
+#   config      = "file"          a bundled config the gallery offers to copy (Copy config)
+# Extra source type: "bundled" (file = name under assets/firmware/, offset, sha256, size).
+
+[[entries]]
+id = "esphome-ha-cyd"
+name = "ESPHome for Home Assistant (with screen)"
+description = "Ready to adopt in Home Assistant: the screen shows the device name, IP and status, touch works, and the backlight, RGB LED and light sensor appear in Home Assistant. Wi-Fi setup over USB (Improv) or its own hotspot. Built by cyd-lab from its ESPHome config (no Bluetooth)."
+homepage = "https://esphome.io/"
+licence = "ESPHome: MIT (Python) + GPL-3.0 (C++)"
+profiles = ["cyd-2432s028r"]
+version = "1.0.0 (ESPHome 2026.10.0)"
+emulator_status = "works"
+emulator_notes = "Checked in the emulator: ready screen, touch (Identify button), Wi-Fi details over Improv in about 4 s, Home Assistant API reached through a published port."
+notes = """For the original micro-USB ESP32-2432S028R (ILI9341). A two-USB (ST7789) build will follow once the emulator has that board.
+Name: cyd-panel plus the last 6 digits of the MAC, e.g. cyd-panel-1a2b3c. No API encryption key, so Home Assistant adopts it without secrets; take control of it in the ESPHome add-on to add one.
+TODO: a one-click "Take control" (dashboard_import) needs a public copy of the config; not published yet."""
+group = "home-assistant"
+pinned = true
+config = "esphome/cyd-panel-2432s028r.yaml"
+first_setup = { improv = true, hotspot = "cyd-panel-xxxxxx", password = "", page = "http://192.168.4.1", note = "" }
+steps = [
+  "Send Wi-Fi details: once it has booted (a few seconds), press \"Send Wi-Fi details\" on the device panel. The screen then shows its IP.",
+  "Home Assistant: it appears under Settings > Devices & services > Discovered (needs the network's mDNS relay). Otherwise add the ESPHome integration with this PC's IP and the port published for the ESPHome API (Network > Use with… > ESPHome).",
+  "To customise it: \"Copy config\", paste it as a new device in the ESPHome add-on (Device Builder), edit, then install over the air to this PC's IP and the published OTA port.",
+]
+[entries.source]
+type = "bundled"
+file = "esphome-ha-cyd-2432s028r.factory.bin"
+offset = 0
+sha256 = "682ba746beb71f900ab032ec15adae1eee12268479d6652dcd06500b08a731a2"
+size = 1135504
+
+# ---- groups and first-setup hints for the shared catalogue
+
+[[overrides]]
+id = "openhasp"
+group = "home-assistant"
+first_setup = { hotspot = "HASP-xxxxxx", password = "haspadmin", page = "http://192.168.4.1", note = "or scan the QR code on its screen" }
+
+[[overrides]]
+id = "openhasp-nightly"
+group = "home-assistant"
+first_setup = { hotspot = "HASP-xxxxxx", password = "haspadmin", page = "http://192.168.4.1", note = "or scan the QR code on its screen" }
+
+[[overrides]]
+id = "tasmota32-lvgl"
+group = "home-assistant"
+first_setup = { hotspot = "tasmota-xxxxxx-nnnn", password = "", page = "http://192.168.4.1" }
+
+[[overrides]]
+id = "tasmota-cyd-template"
+group = "home-assistant"
+
+[[overrides]]
+id = "bruce"
+group = "tools"
+first_setup = { note = "Wi-Fi is set from its own on-screen menu" }
+
+[[overrides]]
+id = "marauder"
+group = "tools"
+first_setup = { note = "no Wi-Fi setup: it scans and attacks from its own menu" }
+
+[[overrides]]
+id = "nerdminer"
+group = "tools"
+first_setup = { hotspot = "NerdMinerAP", password = "MineYourCoins", page = "http://192.168.4.1", note = "the QR code on its screen joins it" }
+
+[[overrides]]
+id = "cyd-klipper"
+group = "tools"
+first_setup = { note = "Wi-Fi is set on its own touch screen (network list + keyboard) after calibration" }
+
+[[overrides]]
+id = "wled"
+group = "tools"
+first_setup = { improv = true, hotspot = "WLED-AP", password = "wled1234", page = "http://4.3.2.1" }
+
+[[overrides]]
+id = "cyd-weather-dashboard"
+group = "tools"
+first_setup = { hotspot = "CYD-xxxx", password = "cyd-setup", page = "http://192.168.4.1" }
+
+[[overrides]]
+id = "pranavek-weather"
+group = "tools"
+first_setup = { hotspot = "cyd-weather-setup", password = "", page = "http://192.168.4.1" }
+
+[[overrides]]
+id = "cyd-diagnostic"
+group = "tools"
+first_setup = { note = "no Wi-Fi setup: tap the screen to start the checks" }
+
+[[overrides]]
+id = "micropython"
+group = "programming"
+first_setup = { note = "no Wi-Fi setup: connect from your code (network.WLAN) over the REPL" }
+
+[[overrides]]
+id = "esphome-cyd-starter"
+group = "programming"
+first_setup = { note = "put your Wi-Fi in the YAML (secrets) before you compile it" }
+
+[[overrides]]
+id = "wm-hello-world"
+group = "programming"
+first_setup = { note = "no Wi-Fi" }
+
+[[overrides]]
+id = "wm-touch-test"
+group = "programming"
+first_setup = { note = "no Wi-Fi" }
+
+[[overrides]]
+id = "wm-lvgl9"
+group = "programming"
+first_setup = { note = "no Wi-Fi" }
+
+[[overrides]]
+id = "esphome-web"
+name = "ESPHome Web (generic ESP32, no screen)"
+group = "other"
+description = "The generic image from web.esphome.io: no screen driver, so the display stays dark. Only for adopting a blank ESP32 into Home Assistant and then flashing your own config. For a CYD with a working screen use \"ESPHome for Home Assistant (with screen)\" above, or the \"ESPHome CYD starter YAML\" (Copy config)."
+first_setup = { improv = true, hotspot = "esphome-web-xxxxxx", password = "", page = "http://192.168.4.1", note = "in the emulator it crashes when it turns Bluetooth on, before Wi-Fi setup can finish" }
+
+[[overrides]]
+id = "circuitpython"
+group = "other"
+first_setup = { note = "Wi-Fi goes in settings.toml on its USB drive" }
