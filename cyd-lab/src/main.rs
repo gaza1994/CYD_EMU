@@ -11,9 +11,11 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod combridge;
 mod device;
 mod engine;
 mod profile;
+mod rfc2217;
 mod weblink;
 
 fn main() -> eframe::Result {

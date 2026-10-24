@@ -15,7 +15,7 @@ use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureO
 use serde::{Deserialize, Serialize};
 
 use crate::device::{self, parse_offset, Device, DeviceStore};
-use crate::engine::{self, Backend, BootMode, EngineEvent, EngineFeatures, EngineSettings, LaunchSpec, ProcessBackend, RunState, Stream, Waker};
+use crate::engine::{self, Backend, BootMode, ChipStatus, EngineEvent, EngineFeatures, EngineSettings, LaunchSpec, ProcessBackend, RunState, Stream, Waker};
 use crate::profile::{Profile, ProfileLibrary};
 
 const CONSOLE_LINES: usize = 5000;
@@ -154,6 +154,8 @@ struct DeviceView {
     autoscroll: bool,
     /// BOOT checkbox (latched). The momentary BOOT button ORs into this.
     boot_latched: bool,
+    /// GPIO0 level last sent over the live link (BOOT pressed).
+    boot_pin_low: bool,
     screen: Option<TextureHandle>,
     screen_size: (usize, usize),
     screen_from_png: bool,
@@ -182,6 +184,7 @@ impl DeviceView {
             console: VecDeque::new(),
             autoscroll: true,
             boot_latched: false,
+            boot_pin_low: false,
             screen: None,
             screen_size: (0, 0),
             screen_from_png: false,
@@ -294,7 +297,19 @@ impl CydLabApp {
         } else {
             None
         };
-        Ok(LaunchSpec::build(&profile, &self.devices[i].dev, &self.settings.engine, &features, boot, port, serial))
+        #[allow(unused_mut)]
+        let mut spec = LaunchSpec::build(&profile, &self.devices[i].dev, &self.settings.engine, &features, boot, port, serial);
+        #[cfg(windows)]
+        if let Some(com) = &self.devices[i].dev.meta.com_port {
+            match serial {
+                Some(p) => match crate::combridge::plan_for(com, p) {
+                    Ok(relay) => spec.relay = Some(relay),
+                    Err(why) => spec.relay_note = Some(format!("COM port not bridged: {why}")),
+                },
+                None => spec.relay_note = Some(format!("{com}: not bridged, the engine has no --serial-tcp")),
+            }
+        }
+        Ok(spec)
     }
 
     fn power_on(&mut self, i: usize, boot_held: bool) {
@@ -320,11 +335,21 @@ impl CydLabApp {
 
     fn press_en(&mut self, i: usize, boot_held: bool) {
         let boot = BootMode::from_boot_held(boot_held);
-        // Same strap: the engine's own in-process reset (keeps RAM-less state, loses nothing).
-        if self.devices[i].backend.state() == RunState::Running(boot) && self.devices[i].backend.soft_reset().is_ok() {
+        let state = self.devices[i].backend.state();
+        // The chip already runs in that mode (as the ROM last reported it, so also after
+        // esptool): the engine's own in-process reset, which keeps the strap.
+        if state == RunState::Running(boot) && self.devices[i].backend.soft_reset().is_ok() {
             return;
         }
-        // Strap changed (or no live link): power-cycle so the new BOOT strap is sampled.
+        // Strap changed: still in-process, by pulsing DTR/RTS on the engine's serial port.
+        if matches!(state, RunState::Running(_)) {
+            match self.devices[i].backend.strap_reset(boot) {
+                Ok(()) => return,
+                Err(e) if self.devices[i].backend.capabilities().serial_tcp.is_some() => self.devices[i].lab(format!("in-process strap reset failed ({e}); power-cycling instead")),
+                Err(_) => {}
+            }
+        }
+        // No live link / no serial port: power-cycle so the new BOOT strap is sampled.
         // With --flash-file this waits for the engine to save flash.bin first.
         let r = self.launch_spec(i, boot).and_then(|spec| {
             let port = spec.web_port;
@@ -639,7 +664,7 @@ impl CydLabApp {
         }
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (i, d) in self.devices.iter().enumerate() {
-                let (color, state) = status_of(d.backend.state());
+                let (color, state) = status_of(d.backend.state(), d.backend.chip_status());
                 let selected = self.selected == Some(i);
                 let resp = ui
                     .horizontal(|ui| {
@@ -673,7 +698,7 @@ impl CydLabApp {
         // --- header
         ui.horizontal(|ui| {
             let d = &mut self.devices[i];
-            let (color, s) = status_of(state);
+            let (color, s) = status_of(state, d.backend.chip_status());
             let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
             ui.painter().circle_filled(r.center(), 7.0, color);
             ui.heading(&d.dev.meta.name);
@@ -730,15 +755,24 @@ impl CydLabApp {
             if ui.add_enabled(state != RunState::Stopping, power_btn).clicked() {
                 power_toggle = true;
             }
-            if ui.add_enabled(running, egui::Button::new("EN (reset)")).on_hover_text("Pulse EN: reset the chip. BOOT is sampled on release (a changed BOOT power-cycles the engine).").clicked() {
+            if ui.add_enabled(running, egui::Button::new("EN (reset)")).on_hover_text("Pulse EN: reset the chip in-process. BOOT is sampled on release. Same mode as now: the engine's reset. Changed BOOT: DTR/RTS on the engine's serial port (this disconnects a tool connected to it). Without --serial-tcp a changed BOOT power-cycles the engine.").clicked() {
                 en = true;
             }
             ui.separator();
-            let boot = ui.add(egui::Button::new("BOOT").sense(Sense::click_and_drag())).on_hover_text("Hold BOOT and click EN... or just tick \"BOOT held\" and press EN / Power.");
+            let boot = ui.add(egui::Button::new("BOOT").sense(Sense::click_and_drag())).on_hover_text("GPIO0 low while held (firmware sees the button). Hold BOOT and click EN, or tick \"BOOT held\" and press EN / Power, for download mode.");
             boot_button_down = boot.is_pointer_button_down_on();
             ui.checkbox(&mut d.boot_latched, "BOOT held (download mode, strap 0x0f)");
         });
         let boot_held = self.devices[i].boot_latched || boot_button_down;
+        // BOOT is also a live button (GPIO0) for the firmware, like on the board.
+        {
+            let d = &mut self.devices[i];
+            if !running || !d.link_up {
+                d.boot_pin_low = false;
+            } else if boot_held != d.boot_pin_low && d.backend.set_boot_pin(boot_held).is_ok() {
+                d.boot_pin_low = boot_held;
+            }
+        }
         if power_toggle {
             if running {
                 self.devices[i].backend.request_stop();
@@ -796,7 +830,9 @@ impl CydLabApp {
                 Err(e) => d.lab(format!("erase failed: {e:#}")),
             }
         }
-        if import {
+        if import && self.devices[i].import_path.trim().is_empty() {
+            self.devices[i].lab("import: choose a .bin first (type a path or use …)");
+        } else if import {
             let d = &self.devices[i];
             let r = parse_offset(&d.import_offset).and_then(|off| self.store.import_firmware_file(&d.dev, off, Path::new(d.import_path.trim())).map(|_| off));
             let d = &mut self.devices[i];
@@ -853,7 +889,7 @@ impl CydLabApp {
                 }
                 ui.label("COM name");
                 let mut com = d.dev.meta.com_port.clone().unwrap_or_default();
-                if ui.add(egui::TextEdit::singleline(&mut com).desired_width(60.0)).on_hover_text("Windows COM port for this board once the com0com bridge exists (planned, see README)").changed() {
+                if ui.add(egui::TextEdit::singleline(&mut com).desired_width(60.0)).on_hover_text("Windows only: expose the board as this COM port (com0com pair COMn <-> CNCBn plus a hub4com relay started at power-on). Empty = no COM port. While the relay is connected, the chip's serial output goes to the COM port instead of this console.").changed() {
                     d.dev.meta.com_port = if com.trim().is_empty() { None } else { Some(com.trim().to_uppercase()) };
                     save = true;
                 }
@@ -863,7 +899,7 @@ impl CydLabApp {
                 let url = rfc2217_url(p);
                 let color = if live_port.is_some() { Color32::LIGHT_GREEN } else { Color32::GRAY };
                 ui.label(RichText::new(&url).monospace().color(color)).on_hover_text(format!(
-                    "esptool --port \"{url}?ign_set_control\" ...\nPlatformIO / Arduino: upload_port = {url}\nThe engine maps DTR/RTS through the auto-reset circuit, so esptool can reset into the bootloader."
+                    "esptool --chip esp32 --port {url} --baud 921600 write-flash 0x1000 firmware.bin\nPlatformIO: upload_port = {url}\nThe engine maps DTR/RTS through the auto-reset circuit, so esptool resets into the bootloader and back by itself.\nOne client at a time: a new connection (also cyd-lab's EN with a changed BOOT) replaces the old one."
                 ));
                 if ui.small_button("Copy").clicked() {
                     ui.ctx().copy_text(url);
@@ -876,9 +912,8 @@ impl CydLabApp {
                 (false, _, true) => "served at power-on".to_string(),
             };
             ui.label(RichText::new(note).small().weak());
-            if let Some(com) = &d.dev.meta.com_port {
-                ui.label(RichText::new(format!("· {com} via com0com: planned")).small().color(Color32::from_rgb(230, 180, 60)))
-                    .on_hover_text("A real COM port needs a com0com pair plus hub4com relaying it to the TCP port. Not automated yet; see README \"COM ports on Windows\".");
+            if let Some(com) = d.dev.meta.com_port.clone() {
+                com_port_ui(ui, d, &com);
             }
         });
         if save {
@@ -1067,8 +1102,38 @@ impl CydLabApp {
     }
 }
 
-fn status_of(s: RunState) -> (Color32, &'static str) {
+/// The COM-port line of the serial row. Windows: what com0com/hub4com detection found,
+/// and a button to create the pair (UAC prompt). Untested on a real Windows box so far.
+#[cfg(windows)]
+fn com_port_ui(ui: &mut egui::Ui, d: &mut DeviceView, com: &str) {
+    use crate::combridge;
+    let found = combridge::detect_in(&combridge::search_dirs());
+    let (text, color, tip) = match (&found.setupc, &found.hub4com) {
+        (None, _) => (format!("· {com}: com0com not installed"), Color32::from_rgb(230, 180, 60), combridge::plan(com, 0, &found, None).unwrap_err()),
+        (Some(_), None) => (format!("· {com}: hub4com.exe missing"), Color32::from_rgb(230, 180, 60), combridge::plan(com, 0, &found, None).unwrap_err()),
+        (Some(_), Some(_)) => (format!("· {com} via com0com (untested)"), Color32::LIGHT_GREEN, format!("At power-on cyd-lab checks the pair with setupc list and starts hub4com relaying {} to the serial port. Watch the console for its status.", combridge::peer(com))),
+    };
+    ui.label(RichText::new(text).small().color(color)).on_hover_text(tip);
+    if let Some(setupc) = found.setupc.clone() {
+        if ui.small_button(format!("Create {com} pair")).on_hover_text(format!("Runs as administrator (UAC prompt): {}", combridge::setupc_command(com))).clicked() {
+            match combridge::create_pair_elevated(&setupc, com) {
+                Ok(()) => d.lab(format!("created com0com pair {com} <-> {}", combridge::peer(com))),
+                Err(e) => d.lab(format!("could not create the {com} pair: {e}")),
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn com_port_ui(ui: &mut egui::Ui, _d: &mut DeviceView, com: &str) {
+    ui.label(RichText::new(format!("· {com}: COM ports are Windows-only (com0com)")).small().weak())
+        .on_hover_text("On Linux/macOS use the rfc2217:// URL directly, or a pty: socat pty,link=/tmp/ttyCYD,raw tcp:127.0.0.1:PORT (no DTR/RTS).");
+}
+
+fn status_of(s: RunState, chip: ChipStatus) -> (Color32, &'static str) {
     match s {
+        RunState::Running(_) if chip.halted => (Color32::from_rgb(220, 70, 60), "halted: waiting for EN"),
+        RunState::Running(BootMode::Download) if chip.by_serial => (Color32::from_rgb(80, 150, 240), "download mode (serial)"),
         RunState::Stopped => (Color32::from_gray(110), "stopped"),
         RunState::Running(BootMode::Normal) => (Color32::from_rgb(70, 200, 90), "running"),
         RunState::Running(BootMode::Download) => (Color32::from_rgb(240, 190, 40), "download mode"),

@@ -9,20 +9,21 @@ cyd-lab runs as an external program, one process per powered-on device.
 Written in Rust with [egui/eframe](https://github.com/emilk/egui). Windows is the main
 target, and it also builds and runs on Linux.
 
-![screenshot](../cyd-lab-screenshot-2.png)
+![screenshot](../cyd-lab-screenshot-3.png)
 
-## Status (v0.2)
+## Status (v0.3)
 
 | Works | Stubbed / not yet |
 | --- | --- |
-| Profile library (built-in TOML plus a user folder) | Real `COMxx` ports (com0com + hub4com): planned commands shown, not automated |
-| Device store: create, rename, delete, erase flash, import a .bin at an offset | `--serial-tcp` end to end: wired up, but no engine build with it was available to test |
-| Flash persists across power cycles (`--flash-file`, graceful stop) when the engine supports it | Graceful stop on **Windows** (the engine has no quit path there yet → killed after the grace period) |
+| Profile library (built-in TOML plus a user folder) | Real `COMxx` ports on Windows: implemented (com0com detection, "Create COMx pair", hub4com relay per running device) but **never run on Windows**, only compile-checked |
+| Device store: create, rename, delete, erase flash, import a .bin at an offset | |
+| Flash persists across power cycles (`--flash-file`, graceful stop, exit 0) on Linux and, by the engine's contract, Windows | |
+| `--serial-tcp`: esptool `write-flash` over `rfc2217://127.0.0.1:PORT` tested end to end (921600 baud, hash verified, board reboots and draws) | |
 | Several devices running at once; graceful stop of all of them when the app exits | |
-| Power; EN = in-process reset when BOOT is unchanged, otherwise save + restart with the new strap | |
+| Power; EN and BOOT act in-process (no restart), see [Serial bridge](#serial-bridge) | |
+| Status dot follows the chip: green running, blue "download mode (serial)" when esptool put it there, red "halted: waiting for EN" | |
 | Live screen, touch (verified pixel-exact at 0° and 90°) and UART0 line input over `--web` | |
-| Per-device serial TCP port + COM name, `rfc2217://127.0.0.1:PORT` with Copy | |
-| Engine feature detection (`--help` + scanning the exe), shown in Settings and as badges | |
+| Engine feature detection (`--help`, binary scan as a fallback), shown in Settings and as badges | |
 | PNG fallback (`--tft-png`), console with a 5000-line ring buffer | |
 
 ## Architecture
@@ -33,9 +34,13 @@ src/
   app.rs      egui UI: device list, controls, screen, console, dialogs. Owns one DeviceView per device
   profile.rs  board profiles (TOML): parse, validate, library = built-ins + user dir
   device.rs   on-disk device store: device.toml + flash.bin per device; import/erase/rename/delete
-  engine.rs   Backend trait, ProcessBackend (esp32sim child process), command-line mapping,
-              port allocation, COM bridge design (bridge module), Windows job object (winjob)
-  weblink.rs  WebSocket client for esp32sim --web: frames in, touch/serial out
+  engine.rs   Backend trait, ProcessBackend (esp32sim child process + optional hub4com relay),
+              command-line mapping, feature detection, ChipStatus (boot mode from console lines),
+              port allocation, auto-reset truth table (bridge module), Windows job object (winjob)
+  rfc2217.rs  minimal RFC2217 client: pulses DTR/RTS on the engine's serial port for EN with BOOT
+  combridge.rs com0com/hub4com: detection, setupc/hub4com command lines, COM relay plan
+              (Windows-only parts are UNTESTED at runtime)
+  weblink.rs  WebSocket client for esp32sim --web: frames in, touch/serial/btn/reset/quit out
 profiles/     built-in profiles, compiled in with include_str!
 ```
 
@@ -60,25 +65,37 @@ profiles/     built-in profiles, compiled in with include_str!
   thread per device keeps only the newest frame in a single-slot mailbox, so a slow UI drops
   frames instead of slowing the engine. `--tft-png` is the fallback, but the engine writes
   it only when a run ends.
-* **EN: soft reset when possible, restart when needed.** On a real board EN resets the chip
-  and the ROM samples the strapping pins again. If BOOT hasn't changed since power-on, cyd-lab
-  sends the engine's in-process `{"t":"reset"}` (POWERON reset, same strap, flash untouched).
-  If BOOT changed (or there is no live link), it does a graceful stop - so flash is saved -
-  and restarts with the new strap (`0x0f` = download, `0x13` = SPI boot).
+* **EN and BOOT without restarting.** BOOT is a live pin: holding it sends
+  `{"t":"btn","pin":0,"v":0}` (releasing sends `v:1`), so firmware that reads GPIO0 sees it.
+  EN resets the chip, and the ROM samples GPIO0 again. If the chip is already in the mode the
+  BOOT checkbox asks for, EN is the engine's `{"t":"reset"}` (POWERON reset, the strap is
+  kept). If it is not (BOOT held but the chip is running the app, or released while it sits in
+  download mode), the WebSocket has no way to change the strap, so cyd-lab does what a USB
+  adapter does: it connects to the engine's `--serial-tcp` port and plays esptool's DTR/RTS
+  sequence through the auto-reset circuit (`rfc2217::pulse_en`: EN low, then IO0 held low as
+  EN rises for download mode). The chip resets in place, flash is untouched. The engine
+  takes one serial client at a time, so this disconnects a tool that is connected at that
+  moment (the console says so). Without a serial port it falls back to save + restart with
+  `--strap 0x0f`/`0x13`.
+* **Chip status from the console.** `ChipStatus::observe` reads the engine's
+  `[emu] serial: EN reset[, IO0 low: download mode]`, `[emu] serial: chip stopped …` and the
+  ROM banner (`boot:0x13 (SPI_FAST_FLASH_BOOT)` vs `boot:0xf (UART_BOOT(UART0))`), so the
+  status dot turns blue when esptool resets the board into the bootloader, red when the chip
+  stops and waits for a reset, and green again after it boots the app.
 * **Graceful stop, then kill.** With `--flash-file` the engine writes `flash.bin` only when it
-  quits cleanly. `request_stop` asks politely through every channel at once (a WS `quit`
-  message for future engines, closing stdin, and SIGTERM on Unix), shows "saving flash…",
-  and kills the process if it hasn't exited after `stop_grace_secs` (Settings, default 6 s).
-  Today's engine answers SIGINT/SIGTERM on Unix: it prints `[emu] flash: wrote N bytes …`
-  and exits with code 130, which cyd-lab reports as "flash.bin saved". On Windows there is
-  no such path yet, so the engine is killed after the grace period and that run's writes are
-  lost (the console says so). Without `--flash-file` support the engine is killed at once,
-  since there is nothing to save. On Linux engines also get `PR_SET_PDEATHSIG` so they do not
-  outlive a crashed cyd-lab. (The current engine then exits on its next log line without
-  saving; only a normal quit saves.)
-* **Feature detection.** `EngineFeatures::probe` runs `esp32sim --help` once per exe and also
-  scans the binary for flag names, because `--help` doesn't list every flag (`--flash-file`
-  is missing from it). New flags are used as soon as an engine build has them.
+  quits cleanly. When the engine has `--quit-on-stdin-eof`, cyd-lab passes it and stops a
+  device with the WS message `{"t":"quit"}` plus closing stdin. Both work the same on
+  Windows and Linux, and the engine saves and exits 0 (`[emu] flash: wrote N bytes …`,
+  reported as "flash.bin saved"). Older engines also get SIGTERM on Unix (exit 130). After
+  `stop_grace_secs` (Settings, default 6 s) the process is killed and that run's writes are
+  lost (the console says so). Without `--flash-file` support the engine is killed at once.
+  If cyd-lab itself dies: on Linux the engine gets `PR_SET_PDEATHSIG` = SIGTERM and stdin
+  EOF, both of which save. On Windows the Job object (`KILL_ON_JOB_CLOSE`) kills it
+  **without** saving (see open issues).
+* **Feature detection.** `EngineFeatures::probe` runs `esp32sim --help` once per exe; current
+  engines list `--flash-file`, `--serial-tcp`, `--quit-on-stdin-eof` and `--web` there. Only
+  if a flag is missing from the help does it scan the exe for the flag name (older builds
+  whose help was incomplete). New flags are used as soon as an engine build has them.
 * **Devices are plain folders.** `device.toml` plus a raw `flash.bin` (blank = 0xFF) is easy
   to back up, diff, or hand to `esptool`/`esp32sim` directly. Writes are atomic (temp file,
   then rename). The id is a slug fixed at creation, so renaming changes only the display name.
@@ -112,6 +129,7 @@ sleeps when nothing happens.
 | `--web PORT` | Settings "Live link" | ports from 18320 up, one per running device |
 | `--web-dir <device>/web` | Settings web dir, else an empty per-device folder | without it esp32sim looks for `web/` next to its exe and panics if it is missing |
 | `--serial-tcp PORT` | device `serial_tcp_port`, only if the engine has the flag | RFC2217 server for UART0; ports from 22170 up, saved per device |
+| `--quit-on-stdin-eof` | only if the engine has the flag | stdin is a pipe kept open by cyd-lab; closing it = save and exit 0 |
 | `--no-dump` | always | |
 | `--realtime` | Settings (default on) | |
 | profile `extra_args`, then Settings `extra_args` | | anything else, e.g. `--no-jit` |
@@ -121,8 +139,8 @@ Not used yet: `--flash-at OFFSET=FILE`. Import writes into `flash.bin` directly 
 so the image keeps what was imported.
 
 WebSocket messages used (`esp32sim docs/web-ui.md`): binary type 1 (TFT frame) in;
-`{"t":"touch","x","y","down"}`, `{"t":"serial","src":"uart0","line"}`, `{"t":"reset"}` (EN)
-and `{"t":"quit"}` (ignored by today's engine) out. Each touch is held for at least 120 ms,
+`{"t":"touch","x","y","down"}`, `{"t":"serial","src":"uart0","line"}`, `{"t":"btn","pin":0,"v"}`
+(BOOT), `{"t":"reset"}` (EN, same strap) and `{"t":"quit"}` (save and exit 0) out. Each touch is held for at least 120 ms,
 because the engine samples the panel at its own pace and a press and release in the same
 frame (a fast click, or `xdotool click`) would otherwise be missed. Touch
 coordinates are native panel pixels. The UI maps the mouse back through the view rotation
@@ -136,37 +154,58 @@ The header shows `rfc2217://127.0.0.1:PORT` with a **Copy** button. When the eng
 `--serial-tcp`, cyd-lab passes the port and the URL is live while the device runs:
 
 ```
-esptool.py --port "rfc2217://127.0.0.1:22170?ign_set_control" chip_id
+esptool --chip esp32 --port rfc2217://127.0.0.1:22170 --baud 921600 \
+  write-flash 0x1000 ESP32_GENERIC-v1.29.0.bin 0x200000 cyd-vfs.bin
 # PlatformIO / Arduino: upload_port = rfc2217://127.0.0.1:22170
 ```
 
-The engine maps DTR/RTS through the CH340 auto-reset circuit (`engine::bridge::auto_reset`:
-EN low = RTS ∧ ¬DTR, IO0 low = DTR ∧ ¬RTS), so esptool can reset the board into the ROM
-bootloader. If the engine has no `--serial-tcp`, the port is reserved and the UI says it is
-not served.
+Tested (esptool 5.6.0): 737.7 kbit/s effective, hashes verified, "Hard resetting via RTS pin"
+reboots the board into the new firmware, and the image survives a power cycle. The engine
+maps DTR/RTS through the CH340 auto-reset circuit (EN low = RTS ∧ ¬DTR, IO0 low = DTR ∧ ¬RTS),
+so no `?ign_set_control` is needed. It serves one client at a time; while one is connected,
+UART0 output goes to it rather than to cyd-lab's console. If the engine has no
+`--serial-tcp`, the port is reserved and the UI says it is not served.
 
-### COM ports on Windows (TODO, not automated, unverified)
+### COM ports on Windows (implemented, UNTESTED on Windows)
 
 Tools that want a real `COMxx` need a [com0com](https://sourceforge.net/projects/com0com/)
-virtual pair plus hub4com relaying the hidden end to the RFC2217 port. The planned commands
-(generated by `engine::bridge::planned_com0com_commands`, and shown in the COM tooltip) for
-`COM20` / port 22170:
+virtual pair. hub4com relays the hidden end of the pair to the RFC2217 port. For `COM20` /
+port 22170:
 
 ```
-:: once per device, admin (signed com0com driver):
-setupc.exe install PortName=COM20,EmuBR=yes PortName=CNCB20,EmuBR=yes
+:: once per device, as administrator (signed com0com driver):
+setupc.exe install PortName=COM20 PortName=CNCB20
 
-:: while the device is powered:
-hub4com.exe --create-filter=escparse,com,parse --create-filter=pinmap,com,pinmap:"--rts=cts --dtr=dsr --break=break" ^
-  --create-filter=linectl,com,lc:"--br=remote --lc=remote" --add-filters=0:com ^
-  --create-filter=telnet,tcp,telnet:"--comport=client" --create-filter=pinmap,tcp,pinmap:"--rts=cts --dtr=dsr --break=break" ^
-  --create-filter=linectl,tcp,lc:"--br=local --lc=local" --add-filters=1:tcp ^
-  --octs=off \\.\CNCB20 --use-driver=tcp 127.0.0.1:22170
+:: while the device is powered (what com2tcp-rfc2217.bat \\.\CNCB20 127.0.0.1 22170 runs):
+hub4com.exe --create-filter=escparse,com,parse --create-filter=pinmap,com,pinmap:"--rts=cts --dtr=dsr" ^
+  --create-filter=linectl,com,lc:"--br=local --lc=local" --add-filters=0:com ^
+  --create-filter=telnet,tcp,telnet:"--comport=client" ^
+  --create-filter=pinmap,tcp,pinmap:"--rts=cts --dtr=dsr --break=break" ^
+  --create-filter=linectl,tcp,lc:"--br=remote --lc=remote" --add-filters=1:tcp ^
+  --octs=off \\.\CNCB20 --use-driver=tcp *127.0.0.1:22170
 ```
 
-Plan: a "Create COM port…" action that runs `setupc` elevated once, then cyd-lab spawns
-hub4com next to the engine at power-on and stops it at power-off. Neither command has been
-run against the engine yet.
+What cyd-lab does (`combridge.rs`, `cfg(windows)`):
+
+* **Detection.** It looks for `setupc.exe` and `hub4com.exe` in `CYD_LAB_COM0COM_DIR`,
+  `%ProgramFiles(x86)%\com0com`, `%ProgramFiles%\com0com` (and `hub4com*` subfolders of
+  them), then `PATH`. The COM row of the device header shows what is missing, with where to
+  get it ("com0com is not installed. Install the signed com0com driver (com0com 3.0.0.0
+  signed) …", "hub4com.exe not found. Unzip hub4com (hub4com-2.1.0.0) into …").
+  `setupc list` tells whether `COMx` already exists.
+* **"Create COMx pair"** runs `setupc install PortName=COMx PortName=CNCBx` once, through
+  an administrator prompt (PowerShell `Start-Process -Verb RunAs`).
+* **At power-on**, if the pair exists and hub4com was found, cyd-lab starts `hub4com.exe`
+  directly (rather than the .bat via `cmd`, so killing it is reliable) with the arguments
+  above. It goes into the same Job object as the engine, its output is shown in the console
+  with a `[hub4com]` prefix, and it is stopped at power-off. The `*` before the address
+  makes hub4com reconnect, because it can start before the engine's port is listening.
+* On Linux and macOS the COM row says COM ports are Windows-only and suggests `socat` for a
+  pty, e.g. `socat pty,link=/tmp/ttyCYD,raw tcp:127.0.0.1:22170` (raw bytes only, no DTR/RTS).
+
+Unit tests cover the command lines, detection in a fake folder tree, `setupc list` parsing
+and the missing-component messages. The UAC prompt, `setupc` and hub4com themselves
+have not been run.
 
 ## Data layout
 
@@ -214,23 +253,28 @@ cargo build --release --target x86_64-pc-windows-gnu
 profile's size, unique ids, COM names and serial TCP ports), firmware import at offsets with
 bounds checks, command-line construction (strap selection, PSRAM rule, `--flash-file` vs
 `--flash-image`, `--serial-tcp` only when supported, quoting), engine feature detection, the
-auto-reset truth table, the planned com0com commands, rotation mapping, and process lifecycles
-against fake engine scripts (graceful stop, kill after the grace period, restart).
+auto-reset truth table and the RFC2217 EN sequences, chip status from console lines,
+com0com/hub4com command lines, detection and messages, rotation mapping, and process
+lifecycles against fake engine scripts (graceful stop, kill after the grace period, restart,
+relay started and stopped with the engine). The esptool flow was tested by hand under Xvfb.
 
 ## What the engine needs next
 
-1. **A graceful quit that works on Windows**: honour a WS `{"t":"quit"}` message and/or EOF on
-   stdin (cyd-lab already sends both), and handle Ctrl-C / console close there, writing
-   `--flash-file` before exiting. Today only Unix signals save the flash.
-2. **Save before logging on the way out**: when stderr/stdout is a closed pipe (cyd-lab has
-   died), `eprintln!` panics before `save_flash` runs. Write the flash first, or ignore write
-   errors on the log lines.
-3. **`--serial-tcp PORT` (RFC2217)**: cyd-lab passes it as soon as the exe advertises it; then
-   test esptool against the URL and wire up hub4com.
-4. **List `--flash-file` in `--help`** so detection doesn't need to scan the binary, and
-   ideally a machine-readable `--capabilities` output.
-5. **Exit code**: a clean signal-triggered quit exits 130; a 0 (or a distinct documented code)
-   would be easier to tell apart from a real interrupt.
+Done in the engine since v0.2: graceful quit on Windows (WS `quit`, `--quit-on-stdin-eof`,
+Ctrl-C/close), saving even when the log pipe is closed, `--serial-tcp` (RFC2217), and
+`--help` listing every flag. Still useful:
+
+1. **A WS message to set the strap / hold IO0 across a reset** (for example
+   `{"t":"reset","strap":"0x0f"}`), so EN with a changed BOOT doesn't have to borrow the
+   serial port and kick off a connected tool.
+2. **Chip state as structured events** (a WS `{"t":"state","mode":"download"}` message, or a
+   machine-readable status line), instead of cyd-lab parsing console text.
+3. **Serial output to both the client and the console** (or a WS copy of UART0 TX) while a
+   client is connected. Today the console goes quiet while esptool or a hub4com relay
+   holds the port.
+4. **A save-on-Job-close story for Windows**: if cyd-lab crashes, the Job object kills the
+   engine before it can save. A periodic or on-write flush of `--flash-file` would cover it.
+5. Optional: `--capabilities` with machine-readable output.
 
 ## License
 

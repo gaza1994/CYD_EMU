@@ -93,6 +93,57 @@ pub struct Capabilities {
     pub serial_tcp: Option<u16>,
 }
 
+/// What the console says about the chip right now (beyond "the process runs").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChipStatus {
+    /// The boot mode the ROM last reported, if any was seen since power-on.
+    pub mode: Option<BootMode>,
+    /// The last reset came from the serial port's DTR/RTS (esptool or another client).
+    pub by_serial: bool,
+    /// The chip stopped (e.g. a half-written bootloader) and waits for an EN reset from
+    /// the serial client.
+    pub halted: bool,
+    /// The engine reported writing flash.bin during this stop.
+    pub flash_saved: bool,
+}
+
+impl ChipStatus {
+    /// Update from one console line (stdout or stderr). Pure; unit tested.
+    pub fn observe(&mut self, line: &str) {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("[emu] serial: EN reset") {
+            self.mode = Some(if rest.contains("download") { BootMode::Download } else { BootMode::Normal });
+            self.by_serial = true;
+            self.halted = false;
+        } else if l.contains("waiting for an EN reset from the client") {
+            self.halted = true;
+        } else if l.starts_with("[emu] flash: wrote") && l.contains("--flash-file") {
+            self.flash_saved = true;
+        } else if l.starts_with("rst:") {
+            if let Some(m) = rom_boot_mode(l) {
+                self.mode = Some(m);
+                self.halted = false;
+            }
+        }
+    }
+}
+
+/// The boot mode in the ESP32 ROM banner, e.g.
+/// `rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)` or `boot:0xf (UART_BOOT(UART0))`.
+pub fn rom_boot_mode(line: &str) -> Option<BootMode> {
+    let after = &line[line.find("boot:")? + 5..];
+    if after.contains("DOWNLOAD") || after.contains("UART_BOOT") {
+        return Some(BootMode::Download);
+    }
+    if after.contains("FLASH_BOOT") || after.contains("SPI_") {
+        return Some(BootMode::Normal);
+    }
+    let hex: String = after.trim_start_matches("0x").chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+    let v = u8::from_str_radix(&hex, 16).ok()?;
+    // GPIO0 is strap bit 4 (MTDI.. order: GPIO0 = 0x10): low = download family.
+    Some(if v & 0x10 == 0 { BootMode::Download } else { BootMode::Normal })
+}
+
 // ---------------------------------------------------------------------------
 // What the engine build supports
 
@@ -107,15 +158,27 @@ pub struct EngineFeatures {
     pub serial_tcp: bool,
     /// `--web-dir DIR`.
     pub web_dir: bool,
+    /// `--quit-on-stdin-eof`: save and exit 0 when stdin closes. Engines with it also
+    /// honour the WebSocket `{"t":"quit"}` and save on Ctrl-C / console close on Windows.
+    pub quit_on_stdin_eof: bool,
 }
 
 impl EngineFeatures {
-    /// Decide from the `--help` text and the executable's bytes. esp32sim's `--help` lists
-    /// only the common flags (the rest are in docs/cli.md), but every flag it accepts is a
-    /// string literal in its argument parser, so the binary is searched as a fallback.
+    /// The flags cyd-lab cares about.
+    pub const FLAGS: [&'static str; 4] = ["--flash-file", "--serial-tcp", "--web-dir", "--quit-on-stdin-eof"];
+
+    /// Decide from the `--help` text, falling back to the executable's bytes for a flag the
+    /// help does not mention. Current esp32sim lists all of these in `--help`; older builds
+    /// left some out, but every flag is a string literal in the argument parser.
     pub fn from_probe(help: &str, binary: &[u8]) -> EngineFeatures {
         let has = |flag: &str| help.contains(flag) || contains_bytes(binary, flag.as_bytes());
-        EngineFeatures { found: true, flash_file: has("--flash-file"), serial_tcp: has("--serial-tcp"), web_dir: has("--web-dir") }
+        EngineFeatures {
+            found: true,
+            flash_file: has("--flash-file"),
+            serial_tcp: has("--serial-tcp"),
+            web_dir: has("--web-dir"),
+            quit_on_stdin_eof: has("--quit-on-stdin-eof"),
+        }
     }
 
     /// Probe an engine executable (cached by path, size and mtime, so a rebuilt engine is
@@ -129,9 +192,10 @@ impl EngineFeatures {
             return *f;
         }
         let help = run_help(exe).unwrap_or_default();
-        let binary = std::fs::read(exe).unwrap_or_default();
+        // Only read the (large) executable when the help text leaves something out.
+        let binary = if Self::FLAGS.iter().all(|f| help.contains(f)) { Vec::new() } else { std::fs::read(exe).unwrap_or_default() };
         let mut f = EngineFeatures::from_probe(&help, &binary);
-        f.found = !help.is_empty() || !binary.is_empty();
+        f.found = !help.is_empty() || !binary.is_empty() || meta.len() > 0;
         cache.lock().unwrap().push((key, f));
         f
     }
@@ -219,6 +283,19 @@ pub trait Backend: Send {
     /// EN without a strap change: the engine's in-process reset (WebSocket `reset`), so
     /// nothing is lost. `Err` when there is no live link.
     fn soft_reset(&mut self) -> std::result::Result<(), TouchError>;
+    /// EN with a strap change, in-process: pulse the auto-reset lines on the engine's
+    /// RFC 2217 port (EN low, then IO0 low for download). `Err` without `--serial-tcp`.
+    fn strap_reset(&mut self, _boot: BootMode) -> std::result::Result<(), String> {
+        Err("needs the engine's --serial-tcp".into())
+    }
+    /// The BOOT button as a live input: GPIO0 low while held (WebSocket `btn`, pin 0).
+    fn set_boot_pin(&mut self, _low: bool) -> std::result::Result<(), TouchError> {
+        Err(TouchError::NotConnected)
+    }
+    /// What the console says about the chip (mode the ROM reported, halted, ...).
+    fn chip_status(&self) -> ChipStatus {
+        ChipStatus::default()
+    }
     fn state(&self) -> RunState;
     /// Drain pending events; also notices a process that exited.
     fn poll(&mut self) -> Vec<EngineEvent>;
@@ -295,6 +372,14 @@ pub struct LaunchSpec {
     pub serial_tcp: Option<u16>,
     /// Grace period for a graceful stop.
     pub stop_grace: Duration,
+    /// The engine has a portable quit (`--quit-on-stdin-eof`, WebSocket `quit`): it saves
+    /// and exits 0 on every OS, so no signal is needed.
+    pub portable_quit: bool,
+    /// A helper to run alongside (the Windows COM-port relay), started after the engine
+    /// and killed with it.
+    pub relay: Option<crate::combridge::Relay>,
+    /// Shown at power-on, e.g. why the COM relay is not running.
+    pub relay_note: Option<String>,
 }
 
 impl LaunchSpec {
@@ -353,6 +438,10 @@ impl LaunchSpec {
         if let Some(p) = serial_tcp {
             push("--serial-tcp", p.to_string());
         }
+        let portable_quit = features.quit_on_stdin_eof;
+        if portable_quit {
+            a.push("--quit-on-stdin-eof".into());
+        }
         a.push("--no-dump".into());
         if settings.realtime {
             a.push("--realtime".into());
@@ -364,7 +453,7 @@ impl LaunchSpec {
         if let Some(dir) = settings.rom_dir.as_ref().filter(|d| !d.as_os_str().is_empty()) {
             env.push(("ESP32SIM_ROM_DIR".to_string(), path_str(dir)));
         }
-        LaunchSpec { program: settings.engine_exe.clone(), args: a, env, boot, web_port, flash_image: device.flash_path(), web_dir, flash_persist, serial_tcp,
+        LaunchSpec { program: settings.engine_exe.clone(), args: a, env, boot, web_port, flash_image: device.flash_path(), web_dir, flash_persist, serial_tcp, portable_quit, relay: None, relay_note: None,
             stop_grace: Duration::from_secs(settings.stop_grace_secs.clamp(1, 120) as u64) }
     }
 
@@ -428,6 +517,11 @@ pub struct ProcessBackend {
     stop_deadline: Option<Instant>,
     /// EN with a strap change: start this once the old process is gone.
     pending_restart: Option<LaunchSpec>,
+    portable_quit: bool,
+    chip: ChipStatus,
+    relay: Option<Child>,
+    /// Our own DTR/RTS pulse is in flight until then: its EN reset is not "by a tool".
+    own_pulse_until: Option<Instant>,
 }
 
 impl ProcessBackend {
@@ -451,6 +545,10 @@ impl ProcessBackend {
             stop_grace: Duration::from_secs(6),
             stop_deadline: None,
             pending_restart: None,
+            portable_quit: false,
+            chip: ChipStatus::default(),
+            relay: None,
+            own_pulse_until: None,
         }
     }
 
@@ -463,6 +561,7 @@ impl ProcessBackend {
     /// after a stop request.
     fn finish(&mut self, code: Option<i32>, how: Finish) {
         self.child = None;
+        self.stop_relay();
         self.stdin = None;
         self.stop_deadline = None;
         if let Some(link) = self.link.take() {
@@ -475,7 +574,14 @@ impl ProcessBackend {
         match how {
             Finish::Graceful => {
                 self.state = RunState::Stopped;
-                self.lab(format!("[cyd-lab] power off: engine exited ({code_text}){}", if self.flash_persist { ", flash.bin saved" } else { "" }));
+                let saved = match (self.flash_persist, self.chip.flash_saved, code) {
+                    (false, ..) => "",
+                    (true, true, _) => ", flash.bin saved",
+                    // exit 0 = the engine's own save-and-quit; 130 = saved after a signal
+                    (true, false, Some(0) | Some(130)) => ", flash.bin saved (no confirmation line seen)",
+                    (true, false, _) => ", but it did not report saving flash.bin",
+                };
+                self.lab(format!("[cyd-lab] power off: engine exited ({code_text}){saved}"));
             }
             Finish::Killed { waited } => {
                 self.state = RunState::Stopped;
@@ -483,7 +589,7 @@ impl ProcessBackend {
                     self.lab(format!(
                         "[cyd-lab] power off: the engine did not stop within {:.0} s and was killed; flash writes since power-on were NOT saved{}",
                         waited.as_secs_f32(),
-                        if cfg!(windows) { " (esp32sim cannot stop gracefully on Windows yet)" } else { "" }
+                        if cfg!(windows) && !self.portable_quit { " (this esp32sim build cannot stop gracefully on Windows; update it)" } else { "" }
                     ));
                 } else {
                     self.lab("[cyd-lab] power off");
@@ -496,6 +602,7 @@ impl ProcessBackend {
         }
         self.flash_persist = false;
         self.serial_tcp = None;
+        self.portable_quit = false;
     }
 
     fn kill_now(&mut self) -> Option<i32> {
@@ -518,6 +625,72 @@ impl ProcessBackend {
         }
     }
 
+    /// Follow the chip through console lines: download mode entered by esptool shows up
+    /// in the state (and the status dot) just like one chosen with the BOOT button.
+    fn observe(&mut self, events: &[EngineEvent]) {
+        for e in events {
+            if let EngineEvent::Console(Stream::Stdout | Stream::Stderr, line) = e {
+                self.chip.observe(line);
+                if self.own_pulse_until.is_some_and(|t| Instant::now() < t) {
+                    self.chip.by_serial = false;
+                }
+            }
+        }
+        if let (RunState::Running(_), Some(mode)) = (self.state, self.chip.mode) {
+            self.state = RunState::Running(mode);
+        }
+    }
+
+    /// Start the helper next to the engine (Job object on Windows, so it also dies with
+    /// cyd-lab). Its output goes to the console prefixed with its name.
+    fn start_relay(&mut self, r: &crate::combridge::Relay) {
+        let mut cmd = Command::new(&r.program);
+        cmd.args(&r.args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    Ok(())
+                });
+            }
+        }
+        match cmd.spawn() {
+            Ok(mut child) => {
+                #[cfg(windows)]
+                winjob::assign(&child);
+                let name = r.program.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "relay".into());
+                for out in [child.stdout.take().map(|o| Box::new(o) as Box<dyn Read + Send>), child.stderr.take().map(|e| Box::new(e) as Box<dyn Read + Send>)].into_iter().flatten() {
+                    spawn_prefixed_reader(out, format!("[{name}] "), self.tx.clone(), self.waker.clone());
+                }
+                self.lab(format!("[cyd-lab] relay started: {} (pid {})", r.label, child.id()));
+                self.relay = Some(child);
+            }
+            Err(e) => self.lab(format!("[cyd-lab] could not start {}: {e} ({})", r.program.display(), r.label)),
+        }
+    }
+
+    fn stop_relay(&mut self) {
+        if let Some(mut c) = self.relay.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+            self.lab("[cyd-lab] relay stopped".to_string());
+        }
+    }
+
+    /// Is the helper process still running? (Tests.)
+    #[cfg(test)]
+    pub fn relay_running(&mut self) -> bool {
+        self.relay.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+    }
+
     fn start_pending(&mut self) {
         if let Some(spec) = self.pending_restart.take() {
             if let Err(e) = self.start(&spec) {
@@ -538,7 +711,7 @@ enum Finish {
 }
 
 /// Ask a child process to quit (Unix: SIGTERM, which esp32sim handles by saving
-/// `--flash-file` and exiting). Windows has no equivalent the engine listens to yet.
+/// `--flash-file` and exiting with 130). Only used for engines without a portable quit.
 fn signal_terminate(child: &Child) {
     #[cfg(unix)]
     unsafe {
@@ -564,6 +737,19 @@ fn spawn_reader<R: Read + Send + 'static>(r: R, stream: Stream, tx: Sender<Engin
                     waker();
                 }
             }
+        }
+    });
+}
+
+/// Like [`spawn_reader`] for a helper process: lines go to the lab stream with a prefix.
+fn spawn_prefixed_reader(r: Box<dyn Read + Send>, prefix: String, tx: Sender<EngineEvent>, waker: Waker) {
+    std::thread::spawn(move || {
+        for line in BufReader::new(r).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(EngineEvent::Console(Stream::Lab, format!("{prefix}{}", line.trim_end()))).is_err() {
+                break;
+            }
+            waker();
         }
     });
 }
@@ -604,8 +790,9 @@ impl Backend for ProcessBackend {
         {
             // If cyd-lab itself dies (crash, kill), the kernel sends the engine SIGTERM so it
             // does not linger as an orphan. (Fires when the spawning thread exits; we spawn
-            // from the UI thread.) Note: today's engine then fails its first log line on the
-            // closed stderr pipe and exits *without* saving flash.bin - only a normal quit saves.
+            // from the UI thread.) The engine saves flash.bin on SIGTERM and no longer
+            // dies on the closed stderr pipe; with --quit-on-stdin-eof the closed stdin alone
+            // already makes it save and exit 0.
             use std::os::unix::process::CommandExt;
             unsafe {
                 cmd.pre_exec(|| {
@@ -631,11 +818,19 @@ impl Backend for ProcessBackend {
         }
         self.stdin = child.stdin.take();
         self.child = Some(child);
+        if let Some(note) = &spec.relay_note {
+            self.lab(format!("[cyd-lab] {note}"));
+        }
+        if let Some(r) = &spec.relay {
+            self.start_relay(r);
+        }
         self.state = RunState::Running(spec.boot);
         self.boot = spec.boot;
         self.flash_persist = spec.flash_persist;
         self.serial_tcp = spec.serial_tcp;
         self.stop_grace = spec.stop_grace;
+        self.portable_quit = spec.portable_quit;
+        self.chip = ChipStatus { mode: Some(spec.boot), ..ChipStatus::default() };
         self.web_port = spec.web_port;
         if let Some(port) = spec.web_port {
             *self.frame_slot.lock().unwrap() = None;
@@ -653,13 +848,18 @@ impl Backend for ProcessBackend {
             let code = self.kill_now();
             return self.finish(code, Finish::Killed { waited: Duration::ZERO });
         }
-        // Every quit request the engine might honour; unknown ones are harmless.
+        // The engine's own quit (WebSocket `{"t":"quit"}`, stdin EOF with
+        // --quit-on-stdin-eof) saves and exits 0 on every OS. Older engines only save on
+        // SIGINT/SIGTERM (Unix), so they get the signal as well.
+        self.chip.flash_saved = false;
         if let Some(l) = self.link.as_ref().filter(|l| l.is_connected()) {
-            l.send_json(r#"{"t":"quit"}"#.to_string());
+            l.send_json(WS_QUIT.to_string());
         }
         self.stdin = None; // EOF
-        if let Some(child) = &self.child {
-            signal_terminate(child);
+        if !self.portable_quit {
+            if let Some(child) = &self.child {
+                signal_terminate(child);
+            }
         }
         self.state = RunState::Stopping;
         self.stop_deadline = Some(Instant::now() + self.stop_grace);
@@ -692,11 +892,41 @@ impl Backend for ProcessBackend {
         match &self.link {
             Some(l) if l.is_connected() && self.child.is_some() => {
                 l.send_json(r#"{"t":"reset"}"#.to_string());
-                self.lab(format!("[cyd-lab] EN: in-process reset (strap 0x{:02x} unchanged)", self.boot.strap()));
+                let mode = self.chip.mode.unwrap_or(self.boot);
+                self.lab(format!("[cyd-lab] EN: in-process reset ({} kept)", if mode == BootMode::Download { "download mode" } else { "normal boot" }));
                 Ok(())
             }
             _ => Err(TouchError::NotConnected),
         }
+    }
+
+    fn strap_reset(&mut self, boot: BootMode) -> std::result::Result<(), String> {
+        let Some(port) = self.serial_tcp.filter(|_| self.child.is_some()) else {
+            return Err("needs the engine's --serial-tcp".into());
+        };
+        crate::rfc2217::pulse_en(port, boot == BootMode::Download, self.tx.clone(), self.waker.clone()).map_err(|e| format!("serial port {port}: {e}"))?;
+        self.boot = boot;
+        self.own_pulse_until = Some(Instant::now() + Duration::from_secs(2));
+        self.lab(format!(
+            "[cyd-lab] EN with BOOT {}: in-process reset through the serial port's DTR/RTS ({}); a tool connected to port {port} is disconnected",
+            if boot == BootMode::Download { "held" } else { "released" },
+            if boot == BootMode::Download { "download mode" } else { "normal boot" }
+        ));
+        Ok(())
+    }
+
+    fn set_boot_pin(&mut self, low: bool) -> std::result::Result<(), TouchError> {
+        match &self.link {
+            Some(l) if l.is_connected() => {
+                l.send_json(format!(r#"{{"t":"btn","pin":0,"v":{}}}"#, low as u8));
+                Ok(())
+            }
+            _ => Err(TouchError::NotConnected),
+        }
+    }
+
+    fn chip_status(&self) -> ChipStatus {
+        self.chip
     }
 
     fn state(&self) -> RunState {
@@ -708,6 +938,7 @@ impl Backend for ProcessBackend {
         // (the engine closing its socket on the way out) is not mistaken for the next run's.
         let stopping = self.stop_deadline.is_some();
         let mut events: Vec<EngineEvent> = self.rx.try_iter().filter(|e| !(stopping && matches!(e, EngineEvent::LinkDown(_)))).collect();
+        self.observe(&events);
         let mut exited = None;
         if let Some(child) = self.child.as_mut() {
             match child.try_wait() {
@@ -730,7 +961,9 @@ impl Backend for ProcessBackend {
             self.start_pending();
         }
         // Late output still in the pipes arrives on later polls.
-        events.extend(self.rx.try_iter());
+        let late: Vec<EngineEvent> = self.rx.try_iter().collect();
+        self.observe(&late);
+        events.extend(late);
         events
     }
 
@@ -766,8 +999,12 @@ impl Backend for ProcessBackend {
 impl Drop for ProcessBackend {
     fn drop(&mut self) {
         self.stop();
+        self.stop_relay();
     }
 }
+
+/// The engine's quit message: save `--flash-file` and exit 0.
+pub const WS_QUIT: &str = r#"{"t":"quit"}"#;
 
 pub fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -794,21 +1031,15 @@ pub fn json_string(s: &str) -> String {
 pub mod bridge {
     //! How a device reaches host serial tools.
     //!
-    //! **Step 1 – TCP (engine side, in progress):** `esp32sim --serial-tcp PORT`
-    //! serves UART0 as an RFC 2217 server; DTR/RTS changes drive EN / GPIO0
-    //! through the classic auto-reset circuit ([`auto_reset`]). cyd-lab passes
-    //! the flag when the engine build has it ([`super::EngineFeatures`]) and
-    //! shows `rfc2217://127.0.0.1:PORT`, which esptool, pyserial, PlatformIO
-    //! and `esphome` accept directly.
+    //! **Step 1 – TCP:** `esp32sim --serial-tcp PORT` serves UART0 as an RFC 2217
+    //! server; DTR/RTS changes drive EN / GPIO0 through the classic auto-reset
+    //! circuit ([`auto_reset`]). cyd-lab passes the flag when the engine build has
+    //! it ([`super::EngineFeatures`]) and shows `rfc2217://127.0.0.1:PORT`, which
+    //! esptool, pyserial, PlatformIO and `esphome` accept directly. cyd-lab's own
+    //! EN-with-BOOT uses the same lines ([`crate::rfc2217`]).
     //!
-    //! **Step 2 – a real COM port on Windows (TODO, not automated):** for tools
-    //! that only list COMx (Arduino IDE), a com0com virtual null-modem pair
-    //! `COM20 <-> CNCB20` plus hub4com relaying CNCB20 to the TCP port, with the
-    //! RFC 2217 control lines mapped across. [`planned_com0com_commands`] holds
-    //! the intended commands; they are untested here (no Windows box) and need
-    //! the signed com0com driver, i.e. an admin install. Plan: run setupc once
-    //! per device at "Create COM port…", spawn hub4com next to the engine at
-    //! power-on and kill it at power-off.
+    //! **Step 2 – a real COM port on Windows:** see [`crate::combridge`] (com0com
+    //! pair + hub4com relay, started with the engine; compile-checked, not yet run).
 
     /// Host-side modem control lines, `true` = asserted (pin driven low on the USB chip).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -830,34 +1061,6 @@ pub mod bridge {
     /// terminal that raises both lines does not hold the chip in reset).
     pub fn auto_reset(l: ModemLines) -> ChipPins {
         ChipPins { en_low: l.rts && !l.dtr, io0_low: l.dtr && !l.rts }
-    }
-
-    /// The hidden end of the com0com pair for `COMn`: `CNCBn`.
-    pub fn com0com_peer(com: &str) -> String {
-        let n = com.trim().trim_start_matches(|c: char| c.is_ascii_alphabetic());
-        format!("CNCB{n}")
-    }
-
-    /// PLANNED (unverified) Windows commands that would expose `com` (e.g. "COM20")
-    /// as a real COM port backed by the engine's RFC 2217 server on `tcp_port`.
-    /// Returned as display strings: [0] one-off pair creation (admin, com0com's
-    /// setupc.exe), [1] the relay to run while the device is powered.
-    pub fn planned_com0com_commands(com: &str, tcp_port: u16) -> Vec<String> {
-        let peer = com0com_peer(com);
-        vec![
-            format!(r#"setupc.exe install PortName={com},EmuBR=yes PortName={peer},EmuBR=yes"#),
-            format!(
-                concat!(
-                    r#"hub4com.exe --create-filter=escparse,com,parse --create-filter=pinmap,com,pinmap:"--rts=cts --dtr=dsr --break=break" "#,
-                    r#"--create-filter=linectl,com,lc:"--br=remote --lc=remote" --add-filters=0:com "#,
-                    r#"--create-filter=telnet,tcp,telnet:"--comport=client" --create-filter=pinmap,tcp,pinmap:"--rts=cts --dtr=dsr --break=break" "#,
-                    r#"--create-filter=linectl,tcp,lc:"--br=local --lc=local" --add-filters=1:tcp "#,
-                    r#"--octs=off \\.\{peer} --use-driver=tcp 127.0.0.1:{port}"#
-                ),
-                peer = peer,
-                port = tcp_port
-            ),
-        ]
     }
 }
 
@@ -1028,14 +1231,6 @@ mod tests {
     }
 
     #[test]
-    fn planned_com0com_commands_name_both_ends() {
-        let c = bridge::planned_com0com_commands("COM20", 22170);
-        assert_eq!(bridge::com0com_peer("COM20"), "CNCB20");
-        assert!(c[0].contains("PortName=COM20") && c[0].contains("PortName=CNCB20"));
-        assert!(c[1].contains(r"\\.\CNCB20") && c[1].ends_with("127.0.0.1:22170"), "{}", c[1]);
-    }
-
-    #[test]
     fn feature_detection() {
         // help text alone
         let f = EngineFeatures::from_probe("  --serial-tcp PORT  RFC 2217 bridge", b"");
@@ -1047,6 +1242,35 @@ mod tests {
     }
 
     #[test]
+    fn feature_detection_current_help() {
+        let help = "  --flash-file F  read-write flash\n  --serial-tcp PORT  raw or RFC 2217\n  --quit-on-stdin-eof  save and exit 0\n  --web-dir D";
+        let f = EngineFeatures::from_probe(help, b"");
+        assert!(f.flash_file && f.serial_tcp && f.quit_on_stdin_eof && f.web_dir);
+        assert!(EngineFeatures::FLAGS.iter().all(|fl| help.contains(fl)));
+    }
+
+    #[test]
+    fn chip_status_from_console() {
+        let mut c = ChipStatus { mode: Some(BootMode::Normal), ..Default::default() };
+        c.observe("[emu] serial: EN reset, IO0 low: download mode");
+        assert_eq!((c.mode, c.by_serial), (Some(BootMode::Download), true));
+        c.observe("rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)");
+        assert_eq!(c.mode, Some(BootMode::Normal));
+        c.observe("[emu] serial: chip stopped (illegal instruction) at t=1.2s; waiting for an EN reset from the client");
+        assert!(c.halted);
+        c.observe("[emu] serial: EN reset");
+        assert_eq!((c.mode, c.halted), (Some(BootMode::Normal), false));
+        assert!(!c.flash_saved);
+        c.observe("[emu] flash: wrote 4194304 bytes to /x/flash.bin (--flash-file)");
+        assert!(c.flash_saved);
+        assert_eq!(rom_boot_mode("rst:0x1 (POWERON_RESET),boot:0xf (UART_BOOT(UART0))"), Some(BootMode::Download));
+        assert_eq!(rom_boot_mode("rst:0x1 (POWERON_RESET),boot:0x3 (DOWNLOAD_BOOT(UART0/UART1/SDIO_REI_REO_V2))"), Some(BootMode::Download));
+        assert_eq!(rom_boot_mode("rst:0x1,boot:0x0f"), Some(BootMode::Download));
+        assert_eq!(rom_boot_mode("rst:0x1,boot:0x13"), Some(BootMode::Normal));
+        assert_eq!(rom_boot_mode("rst:0x1 (POWERON_RESET)"), None);
+    }
+
+    #[test]
     fn feature_probe_of_missing_exe() {
         assert!(!EngineFeatures::probe(Path::new("/definitely/not/esp32sim")).found);
     }
@@ -1055,8 +1279,9 @@ mod tests {
     fn flash_file_and_serial_tcp_flags() {
         let (p, d) = fixture("esp32-2432s028r");
         let s = EngineSettings::default();
-        let all = EngineFeatures { found: true, flash_file: true, serial_tcp: true, web_dir: true };
+        let all = EngineFeatures { found: true, flash_file: true, serial_tcp: true, web_dir: true, quit_on_stdin_eof: true };
         let spec = LaunchSpec::build(&p, &d, &s, &all, BootMode::Normal, None, Some(22171));
+        assert!(spec.args.iter().any(|a| a == "--quit-on-stdin-eof") && spec.portable_quit);
         assert_eq!(PathBuf::from(value_of(&spec.args, "--flash-file").unwrap()), d.flash_path());
         assert!(!spec.args.iter().any(|a| a == "--flash-image"));
         assert_eq!(value_of(&spec.args, "--serial-tcp"), Some("22171"));
@@ -1067,10 +1292,35 @@ mod tests {
         let old = EngineFeatures { found: true, flash_file: true, ..Default::default() };
         let spec = LaunchSpec::build(&p, &d, &s, &old, BootMode::Normal, None, Some(22171));
         assert!(!spec.args.iter().any(|a| a == "--serial-tcp"));
+        assert!(!spec.args.iter().any(|a| a == "--quit-on-stdin-eof") && !spec.portable_quit);
         assert_eq!(spec.serial_tcp, None);
         // and an old engine falls back to the read-only image
         let spec = LaunchSpec::build(&p, &d, &s, &EngineFeatures::default(), BootMode::Normal, None, None);
         assert!(value_of(&spec.args, "--flash-image").is_some() && !spec.flash_persist);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_runs_with_the_engine() {
+        // Stand-ins: `sleep` as both the engine and the relay (the COM relay is hub4com on Windows).
+        let tmp = tempfile::tempdir().unwrap();
+        let (p, mut d) = fixture("esp32-2432s028r");
+        d.dir = tmp.path().to_path_buf();
+        std::fs::write(d.flash_path(), [0xFFu8; 16]).unwrap();
+        let mut spec = LaunchSpec::build(&p, &d, &EngineSettings::default(), &EngineFeatures::default(), BootMode::Normal, None, None);
+        spec.program = PathBuf::from("sleep");
+        spec.args = vec!["30".into()];
+        spec.relay = Some(crate::combridge::Relay { program: PathBuf::from("sleep"), args: vec!["30".into()], label: "test relay".into() });
+        spec.relay_note = Some("note shown at power-on".into());
+        let mut b = ProcessBackend::new(Arc::new(|| {}));
+        b.start(&spec).unwrap();
+        assert!(b.relay_running());
+        b.stop();
+        assert!(!b.relay_running() && b.relay.is_none());
+        let lines: Vec<String> = b.poll().into_iter().filter_map(|e| if let EngineEvent::Console(Stream::Lab, l) = e { Some(l) } else { None }).collect();
+        assert!(lines.iter().any(|l| l.contains("note shown at power-on")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("relay started: test relay")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("relay stopped")), "{lines:?}");
     }
 
     #[test]
