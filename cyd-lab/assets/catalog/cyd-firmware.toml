@@ -79,7 +79,7 @@ licence = "MIT"
 profiles = ["cyd-2432s028r", "cyd-2432s028r-2usb", "cyd-2432s032"]
 version = "0.7.0-rc13"
 emulator_status = "works"
-emulator_notes = "Draws Wi-Fi AP / QR screen upside-down on stock config (set rotate 2). 188 RAMWR, gs=true."
+emulator_notes = "Checked end to end: hotspot HASP-xxxxxx with QR screen (upside-down on stock config; set rotate 2), setup page through Device hotspot, saving Wi-Fi reboots it onto esp32sim (10.0.2.15) and its web UI answers there."
 notes = """
 Stable release ships as sunton.zip (no static ESP Web Tools manifest).
 Nightly installer at nightly.openhasp.com is currently rc12 (older than rc13).
@@ -104,7 +104,7 @@ licence = "MIT"
 profiles = ["cyd-2432s028r"]
 version = "v0.7.0-rc12 (nightly label says v0.7.0)"
 emulator_status = "works"
-emulator_notes = "Same UI as stable; nightly bin is older than the rc13 GitHub release."
+emulator_notes = "Same UI and the same hotspot setup and Wi-Fi join as stable; nightly bin is older than the rc13 GitHub release."
 [entries.source]
 type = "manifest"
 url = "https://nightly.openhasp.com/firmware/esp32-2432s028r_full_4MB.json"
