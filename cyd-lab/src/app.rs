@@ -2861,7 +2861,9 @@ impl CydLabApp {
         if features.ap_client {
             let catalog = &self.catalog;
             let live = d.link_up && alive;
-            let hs_state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("hotspot", i)), false);
+            let hs_id = ui.make_persistent_id(("hotspot", i));
+            let hs_state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), hs_id, false);
+            let mut hs_header_clicked = false;
             d.ap.panel_open = hs_state.is_open() && live;
             // Seen on the air (the engine's phone) first, then names the firmware printed.
             let mut seen: Vec<(String, Option<bool>)> = d.ap.status.as_ref().and_then(|s| s.phone.as_ref()).map(|p| p.hotspots.iter().map(|h| (h.ssid.clone(), Some(h.secure))).collect()).unwrap_or_default();
@@ -2886,7 +2888,7 @@ impl CydLabApp {
                         (_, None, 0) => "Device hotspot".to_string(),
                         (_, None, n) => format!("Device hotspot: {n} network{} seen", if n == 1 { "" } else { "s" }),
                     };
-                    ui.label(RichText::new(t).small());
+                    hs_header_clicked = header_text(ui, RichText::new(t).small());
                 })
                 .body(|ui| {
                     ui.label(RichText::new("Many firmwares start their own Wi-Fi network for first setup (openHASP HASP-xxxxxx, NerdMinerAP, Tasmota, WLED-AP, ESPHome's fallback hotspot) with a setup page at 192.168.4.1. cyd-lab joins it like a phone would and opens that page in your browser (on this PC only).").small().weak());
@@ -2988,6 +2990,7 @@ impl CydLabApp {
                         ui.label(RichText::new("The live link is off, so joining restarts the device.").small().weak());
                     }
                 });
+            toggle_if(ui, hs_id, hs_header_clicked);
             if let Some(m) = lab_msg {
                 d.lab(m);
             }
@@ -3051,10 +3054,12 @@ impl CydLabApp {
                 if ports.is_empty() { "no ports published".to_string() } else { format!("{} {}", if net.lan { ip_text.as_str() } else { "127.0.0.1" }, ports.join(", ")) }
             )
         };
-        let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("net", i)), false);
+        let net_id = ui.make_persistent_id(("net", i));
+        let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), net_id, false);
+        let mut net_header_clicked = false;
         state
             .show_header(ui, |ui| {
-                ui.label(RichText::new(summary).small());
+                net_header_clicked = header_text(ui, RichText::new(summary).small());
                 ui.menu_button(RichText::new("Use with…").small(), |ui| {
                     ui.set_max_width(460.0);
                     if let Some(k) = network_help_ui(ui, &ip_text, &d.dev.meta.network, features.mdns_relay) {
@@ -3148,6 +3153,7 @@ impl CydLabApp {
                     }
                 });
             });
+        toggle_if(ui, net_id, net_header_clicked);
         if let Some(k) = add_preset {
             let addr = if d.dev.meta.network.lan { "0.0.0.0" } else { "127.0.0.1" };
             d.dev.meta.network.add_preset_free(&crate::network::PRESETS[k], &others, &|p| bind_is_free(addr, p));
@@ -3618,6 +3624,21 @@ impl eframe::App for CydLabApp {
 impl Drop for CydLabApp {
     fn drop(&mut self) {
         self.stop_all();
+    }
+}
+
+/// Header text for a `CollapsingState` header: clickable, like a `CollapsingHeader`'s title
+/// (egui only makes the small triangle of a custom header toggle). Returns whether it was clicked.
+fn header_text(ui: &mut egui::Ui, text: RichText) -> bool {
+    ui.add(egui::Label::new(text).sense(egui::Sense::click())).clicked()
+}
+
+/// Toggles the `CollapsingState` stored under `id` when its header text was clicked.
+fn toggle_if(ui: &egui::Ui, id: egui::Id, clicked: bool) {
+    if clicked {
+        let mut s = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false);
+        s.toggle(ui);
+        s.store(ui.ctx());
     }
 }
 
