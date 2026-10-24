@@ -84,6 +84,13 @@ impl<S: Soc> Machine<S> {
             self.ws.ring_updates = updates;
             w.send_text(&format!("{{\"t\":\"ring\",\"leds\":[{}]}}", leds_json(leds)));
         } }
+        // the phone's state on every change (state, ip, join, hotspots), as `ap_status` with no `bound`
+        let ap = self.bus.station_link().and_then(|l| l.phone().map(|p| p.status_json()));
+        if let Some(ap) = ap.filter(|a| *a != self.ws.ap_sent) {
+            w.send_text(&format!("{{\"t\":\"ap_status\",\"bound\":null,\"phone\":{ap}}}"));
+            self.ws.ap_sent = ap;
+        }
+        let board = self.bus.board_ref();
         // snapshot for late-joining clients: backlog, frame, ring
         if w.needs_hello() {
             let mut hello: Vec<Vec<u8>> = Vec::new();
@@ -94,6 +101,7 @@ impl<S: Soc> Machine<S> {
             if let Some(rgb) = board.camera_preview(320, 240) { hello.push(frame(2, &camera_message(&rgb))); }
             if let Some((leds, _)) = board.leds() { hello.push(frame(1, format!("{{\"t\":\"ring\",\"leds\":[{}]}}", leds_json(leds)).as_bytes())); }
             for (id, leds, _) in board.led_grids() { hello.push(frame(1, format!("{{\"t\":\"grid\",\"id\":\"{}\",\"leds\":[{}]}}", id, leds_json(leds)).as_bytes())); }
+            if !self.ws.ap_sent.is_empty() { hello.push(frame(1, format!("{{\"t\":\"ap_status\",\"bound\":null,\"phone\":{}}}", self.ws.ap_sent).as_bytes())); }
             w.set_hello(hello);
         }
         w.send_text(&format!("{{\"t\":\"stat\",\"time\":{:.2},\"insns\":{},\"frames\":{},\"behind\":{:.2},\"resyncs\":{},\"speed\":{},\"cam\":{},\"gpio_in\":\"{:x}\"}}", self.seconds(), self.insns(), board.display_frames(), self.rt.behind, self.rt.resyncs, self.rt.speed.map_or_else(|| "null".to_string(), |s| format!("{:.3}", s)), self.bus.camera_frames(), self.bus.gpio_input()));
@@ -166,9 +174,11 @@ impl<S: Soc> Machine<S> {
                         None => r#"{"t":"ap_status","error":"this chip has no SoftAP phone"}"#.to_string(),
                         Some(link) => match if t == "ap_client" { Self::ap_client(link, &field) } else { Ok(String::new()) } {
                             Err(e) => format!("{{\"t\":\"ap_status\",\"error\":\"{}\"}}", crate::web::json_escape(&e)),
-                            Ok(bound) => format!("{{\"t\":\"ap_status\",\"bound\":{},\"phone\":{}}}",
-                                if bound.is_empty() { "null".into() } else { format!("\"{bound}\"") },
-                                link.phone().map_or("null".into(), |p| p.status_json())),
+                            Ok(bound) => {
+                                let phone = link.phone().map_or("null".into(), |p| p.status_json());
+                                if phone != "null" { self.ws.ap_sent = phone.clone(); }   // already told: no echo push
+                                format!("{{\"t\":\"ap_status\",\"bound\":{},\"phone\":{phone}}}", if bound.is_empty() { "null".into() } else { format!("\"{bound}\"") })
+                            }
                         },
                     };
                     w.send_text(&reply);

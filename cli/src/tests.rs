@@ -207,6 +207,30 @@ fn the_control_channel_makes_and_reports_the_softap_phone() {
     assert_eq!(link.phone().unwrap().cfg.psk.as_deref(), Some("MineYourCoins"));
 }
 
+/// A change of the phone is pushed once as `ap_status` (no `bound`) without being asked; an
+/// unchanged phone is not re-sent, and a reply counts as told.
+#[test]
+fn the_softap_phone_state_is_pushed_on_change() {
+    let mut m = esp32::machine([0; 6], 4 << 20);
+    let web = esp_soc::web::WebServer::queued();
+    m.web = Some(web.clone());
+    const PUSH: u64 = 10_000_000;   // instructions: past one 50 Hz push interval
+    let statuses = |web: &esp_soc::web::WebServer| -> Vec<String> { web.take_outbox().into_iter().filter(|(k, _)| *k == 1).map(|(_, d)| String::from_utf8(d).unwrap()).filter(|s| s.contains("ap_status")).collect() };
+    m.run(PUSH);
+    assert!(statuses(&web).is_empty(), "no phone, nothing to push");
+    web.push_incoming(r#"{"t":"ap_client","ssid":"openHASP-1a2b"}"#.into());
+    m.run(PUSH);
+    assert_eq!(statuses(&web).len(), 1, "the reply alone");
+    let link = esp_soc::SocBus::station_link(&mut m.bus).unwrap();
+    link.phone_mut().unwrap().configure(esp_soc::wifi::phone::PhoneConfig::parse("ssid=NerdMinerAP").unwrap());
+    m.run(PUSH);
+    let out = statuses(&web);
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert!(out[0].starts_with(r#"{"t":"ap_status","bound":null,"phone":{"state":"scanning","ip":null,"join":"NerdMinerAP""#), "{}", out[0]);
+    m.run(PUSH);
+    assert!(statuses(&web).is_empty());
+}
+
 #[test]
 fn analog_scripts_validate_inputs_and_keep_panel_touch_separate() {
     use esp_soc::ScriptAction;
