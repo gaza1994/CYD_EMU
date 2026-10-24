@@ -310,11 +310,24 @@ pub fn strip_ansi(s: &str) -> String {
 // Per-device UI state
 
 /// The device hotspot driven live over the engine's control channel (`ap_client` /
-/// `ap_status`): the engine does not push, so the panel polls while it is open.
+/// `ap_status`). Newer engines push `ap_status` on every change; older ones only answer,
+/// so the panel polls them while it is open.
 #[derive(Default)]
 struct ApUi {
     /// The newest `ap_status`.
     status: Option<crate::hotspot::ApStatus>,
+    /// Requests sent that have not been answered yet; an `ap_status` beyond those was pushed.
+    pending: u32,
+    /// The engine pushes `ap_status` (no polling needed).
+    pushes: bool,
+    /// The phone was up on the hotspot being joined this run.
+    was_up: bool,
+    /// After that, the hotspot went away (the firmware left setup mode).
+    gone: bool,
+    /// The firmware said it is on Wi-Fi after the phone was up on its hotspot.
+    station_up: bool,
+    /// Set once the device joined its Wi-Fi after leaving setup mode: the panel's note.
+    left: Option<String>,
     /// The panel was drawn open this frame (poll only then).
     panel_open: bool,
     next_poll: Option<Instant>,
@@ -335,6 +348,11 @@ impl ApUi {
     fn new_run(&mut self) {
         self.status = None;
         self.next_poll = None;
+        self.left = None;
+        self.pending = 0;
+        self.was_up = false;
+        self.gone = false;
+        self.station_up = false;
         self.scanning = false;
         self.bound = None;
         self.error = None;
@@ -353,7 +371,32 @@ impl ApUi {
         self.proxy.as_ref()
     }
 
+    /// Send a control request that the engine answers with an `ap_status`.
+    fn ask(&mut self, backend: &mut dyn Backend, msg: String) -> Result<(), String> {
+        backend.control(msg).map_err(|e| e.to_string())?;
+        self.pending += 1;
+        Ok(())
+    }
+
+    /// Poll for status only with engines that don't push it.
+    fn wants_poll(&self) -> bool {
+        !self.pushes
+    }
+
     fn on_status(&mut self, st: crate::hotspot::ApStatus) {
+        if self.pending > 0 {
+            self.pending -= 1;
+        } else {
+            self.pushes = true;
+        }
+        if let Some((ssid, _)) = self.joining.clone() {
+            if st.up_on(&ssid) {
+                self.was_up = true;
+                self.gone = false;
+            } else if self.was_up && st.phone.as_ref().is_some_and(|p| p.state != "up" || !st.sees(&ssid)) {
+                self.gone = true;
+            }
+        }
         self.error = st.error.clone();
         if st.error.is_some() {
             self.open_when_up = false;
@@ -370,6 +413,21 @@ impl ApUi {
             self.scanning = true;
         }
         self.status = Some(st);
+    }
+
+    /// The firmware left its hotspot and joined `station` (its Wi-Fi): stop joining and
+    /// close the proxy (its listener stops; open page connections already got EOF).
+    fn left_setup(&mut self, station: &str) {
+        self.left = Some(station.to_string());
+        self.joining = None;
+        self.open_when_up = false;
+        self.was_up = false;
+        self.gone = false;
+        self.station_up = false;
+        self.bound = None;
+        if let Some(p) = self.proxy.take() {
+            p.set_target(None, "");
+        }
     }
 
     /// The URL to open now, once: joined the network and the forward is in place.
@@ -453,6 +511,8 @@ struct DeviceView {
     hotspot_form: (String, String, String),
     /// The live device-hotspot session over the control channel.
     ap: ApUi,
+    /// Live clients on forwarded ports (engines that send `fwd` events).
+    fwd: crate::hotspot::FwdClients,
     /// After installing a firmware with a first-setup guide (the Home Assistant entry):
     /// its id, shown as a step card until dismissed.
     /// The setup checklist after installing a catalogue firmware that needs setting up.
@@ -823,6 +883,7 @@ impl DeviceView {
             hotspot_open_at: None,
             hotspot_form: (String::new(), String::new(), crate::hotspot::GUEST_AP_IP.to_string()),
             ap: ApUi::default(),
+            fwd: Default::default(),
             api_client: None,
         }
     }
@@ -1054,7 +1115,10 @@ impl DeviceView {
                 crate::hotspot::remember(&mut self.hotspot_ssids, ssid);
             }
             let before = self.wifi_watch.banner.clone();
-            self.wifi_watch.feed(&line, &self.wifi_ap);
+            if self.wifi_watch.feed(&line, &self.wifi_ap) && self.ap.was_up {
+                // Joined its Wi-Fi after its hotspot page was used (see the hotspot panel).
+                self.ap.station_up = true;
+            }
             if self.wifi_watch.banner != before {
                 if let Some(b) = self.wifi_watch.banner.clone() {
                     self.console.push_back((Stream::Lab, format!("[cyd-lab] {b}")));
@@ -1552,6 +1616,7 @@ impl CydLabApp {
         d.improv = ImprovUi::default();
         d.hotspot_ssids.clear();
         d.ap.new_run();
+        d.fwd = Default::default();
         // No automatic Improv probe: a real board on a PC gets no bytes unless a tool or the
         // user sends them. "Waiting for setup" is read from its log and its hotspot instead.
         d.hotspot_open_at = (r.is_ok() && hotspot_ok && d.hotspot.is_some()).then(|| Instant::now() + Duration::from_secs(10));
@@ -1644,10 +1709,15 @@ impl CydLabApp {
                     EngineEvent::Control(text) => {
                         if let Some(st) = crate::hotspot::ApStatus::parse(&text) {
                             d.ap.on_status(st);
+                        } else if let Some(ev) = crate::hotspot::FwdEvent::parse(&text) {
+                            d.fwd.apply(&ev);
                         }
                     }
                     EngineEvent::LinkUp => {
                         d.link_up = true;
+                        // A new session: its hello re-sends the open clients and the status.
+                        d.fwd = Default::default();
+                        d.ap.pending = 0;
                         d.link_lost = false;
                         d.link_note = "live link connected".into();
                     }
@@ -1687,14 +1757,21 @@ impl CydLabApp {
                     ctx.open_url(egui::OpenUrl::new_tab(url));
                 }
             }
-            // Live hotspot: poll ap_status while the panel is open (faster while joining).
-            if d.ap.panel_open && d.link_up {
+            // Live hotspot: newer engines push ap_status on change; older ones are polled
+            // while the panel is open (faster while joining).
+            if d.ap.panel_open && d.link_up && d.ap.wants_poll() {
                 let now = Instant::now();
                 if d.ap.next_poll.is_none_or(|t| now >= t) {
-                    let _ = d.backend.control(crate::hotspot::STATUS_MESSAGE.to_string());
+                    let _ = d.ap.ask(d.backend.as_mut(), crate::hotspot::STATUS_MESSAGE.to_string());
                     d.ap.next_poll = Some(now + if d.ap.open_when_up { Duration::from_millis(700) } else { Duration::from_secs(2) });
                 }
                 ctx.request_repaint_after(Duration::from_millis(500));
+            }
+            // The firmware saved the Wi-Fi from its page, left setup mode and joined.
+            if d.ap.gone && d.ap.station_up && d.ap.joining.is_some() {
+                let station = d.wifi_ap.ssid.clone();
+                d.ap.left_setup(&station);
+                d.lab(format!("device hotspot: the device left setup mode and joined \"{station}\"; closed the setup-page proxy"));
             }
             if let Some(url) = d.ap.take_open_url() {
                 d.lab(format!("device hotspot: joined; opening {url} (the page at {} on the device's hotspot)", d.ap.bound.as_ref().map(|b| b.1.clone()).unwrap_or_default()));
@@ -2631,6 +2708,9 @@ impl CydLabApp {
         let wifi_done = g.wifi_sent || wifi_connected;
         let ha_client = d.api_client.clone();
         g.ha_seen |= ha_client.as_deref().is_some_and(|c| c.contains("Home Assistant"));
+        // The engine's port events: a client the firmware accepted on the published API port.
+        let (api_clients, api_peers) = api.map(|p| d.fwd.on_host_port(p)).map(|(n, p)| (n, p.to_vec())).unwrap_or_default();
+        g.ha_seen |= alive && api_clients > 0;
         let ha_done = g.ha_manual || g.ha_seen;
         let mut close = false;
         let green = Color32::from_rgb(110, 200, 130);
@@ -2690,9 +2770,11 @@ impl CydLabApp {
                     });
                 }
                 ui.horizontal_wrapped(|ui| {
-                    tick(ui, ha_done, "Add to Home Assistant");
+                    tick(ui, ha_done, if g.ha_seen { "Home Assistant connected" } else { "Add to Home Assistant" });
                     if let Some(c) = &ha_client {
                         ui.label(RichText::new(format!("{c} connected")).small().color(green));
+                    } else if api_clients > 0 {
+                        ui.label(RichText::new(format!("API client{} connected", if api_clients == 1 { "" } else { "s" })).small().color(green)).on_hover_text(api_peers.join("\n"));
                     }
                 });
                 if !ha_done {
@@ -2876,7 +2958,7 @@ impl CydLabApp {
             }
             if hs_state.is_open() && live && !d.ap.scanning {
                 // A phone that only listens, so the panel can list the hotspots on the air.
-                if d.backend.control(crate::hotspot::client_message(None, "", None)).is_ok() {
+                if d.ap.ask(d.backend.as_mut(), crate::hotspot::client_message(None, "", None)).is_ok() {
                     d.ap.scanning = true;
                 }
             }
@@ -2885,6 +2967,8 @@ impl CydLabApp {
                 .show_header(ui, |ui| {
                     let progress = d.ap.joining.as_ref().and(d.ap.status.as_ref()).and_then(|s| s.phone.as_ref()).map(|p| p.progress());
                     let t = match (&d.hotspot, progress, seen.len()) {
+                        _ if d.ap.left.is_some() => format!("Device hotspot: device left setup mode and joined {}", d.ap.left.as_deref().unwrap_or_default()),
+                        _ if d.ap.gone && d.ap.joining.is_some() => format!("Device hotspot: device is leaving setup mode (joining {})", d.wifi_ap.ssid),
                         (_, Some(p), _) => format!("Device hotspot: {p}"),
                         (Some(p), None, _) => format!("Device hotspot: joined \"{}\" at power-on", p.ssid),
                         (_, None, 0) => "Device hotspot".to_string(),
@@ -2954,14 +3038,18 @@ impl CydLabApp {
                                 d.ap.joining = Some((name.clone(), page.clone()));
                                 d.ap.open_when_up = true;
                                 d.ap.error = None;
+                                d.ap.left = None;
+                                d.ap.was_up = false;
+                                d.ap.gone = false;
+                                d.ap.station_up = false;
                                 if let Some((addr, _)) = d.ap.bound.clone() {
                                     if let Some(p) = d.ap.proxy() {
                                         p.set_target(Some(addr), &page);
                                     }
                                 }
                                 d.ap.next_poll = None;
-                                if let Err(e) = d.backend.control(crate::hotspot::client_message(Some(&name), pw, fwd)) {
-                                    d.ap.error = Some(e.to_string());
+                                if let Err(e) = d.ap.ask(d.backend.as_mut(), crate::hotspot::client_message(Some(&name), pw, fwd)) {
+                                    d.ap.error = Some(e);
                                 }
                                 lab_msg = Some(format!("device hotspot: joining \"{name}\""));
                             } else {
@@ -2984,6 +3072,12 @@ impl CydLabApp {
                     });
                     if let Some(e) = &d.ap.error {
                         ui.label(RichText::new(format!("Engine: {e}")).small().color(Color32::from_rgb(240, 120, 100)));
+                    }
+                    if let Some(station) = &d.ap.left {
+                        ui.label(RichText::new(format!("✔ Device left setup mode and joined {station}")).color(Color32::from_rgb(120, 220, 140)));
+                        ui.label(RichText::new("Its setup page is closed (the hotspot is gone). Reach the device on its Wi-Fi now, e.g. through the ports under Network.").small().weak());
+                    } else if d.ap.gone && d.ap.joining.is_some() {
+                        ui.label(RichText::new(format!("The hotspot is gone: the device is leaving setup mode (waiting for it to join {})…", d.wifi_ap.ssid)).small().weak());
                     }
                     if let Some(st) = d.ap.status.as_ref().and_then(|s| s.phone.as_ref()).filter(|_| d.ap.joining.is_some()) {
                         ui.label(RichText::new(st.progress()).small().weak());
@@ -3026,6 +3120,7 @@ impl CydLabApp {
         d.improv = ImprovUi::default();
         d.hotspot_ssids.clear();
         d.ap.new_run();
+        d.fwd = Default::default();
         d.hotspot_open_at = open.then(|| Instant::now() + Duration::from_secs(10));
         if let Err(e) = r {
             d.lab(format!("restart failed: {e:#}"));
@@ -3046,7 +3141,15 @@ impl CydLabApp {
         let d = &mut self.devices[i];
         let net = d.dev.meta.network.clone();
         let eff = net.effective(&defaults);
-        let ports: Vec<String> = net.active_forwards().iter().map(|f| format!("{}->{}", f.host, f.guest)).collect();
+        let live_fwd = alive && d.fwd.reported;
+        let ports: Vec<String> = net
+            .active_forwards()
+            .iter()
+            .map(|f| {
+                let n = d.fwd.on_host_port(f.host).0;
+                if live_fwd && n > 0 { format!("{}->{} ({n} connected)", f.host, f.guest) } else { format!("{}->{}", f.host, f.guest) }
+            })
+            .collect();
         let summary = if !net.wifi {
             "Network: Wi-Fi off".to_string()
         } else {
@@ -3070,6 +3173,21 @@ impl CydLabApp {
                 });
             })
             .body(|ui| {
+                // Live clients per published port (engines that report them), outside the
+                // greyed-out settings below.
+                if live_fwd && !d.dev.meta.network.active_forwards().is_empty() {
+                    ui.label(RichText::new("Connected clients").small().strong());
+                    egui::Grid::new(("fwd-live", i)).num_columns(3).show(ui, |ui| {
+                        for f in d.dev.meta.network.active_forwards() {
+                            let (n, peers) = d.fwd.on_host_port(f.host);
+                            ui.label(RichText::new(format!("{} -> {}", f.host, f.guest)).monospace().small());
+                            ui.label(RichText::new(if f.label.is_empty() { "TCP" } else { f.label.as_str() }).small().weak());
+                            let c = if n > 0 { Color32::from_rgb(120, 220, 140) } else { Color32::from_gray(150) };
+                            ui.label(RichText::new(format!("{n} connected")).small().color(c)).on_hover_text(if peers.is_empty() { "Nobody is connected to this port".to_string() } else { peers.join("\n") });
+                            ui.end_row();
+                        }
+                    });
+                }
                 let n = &mut d.dev.meta.network;
                 ui.add_enabled_ui(!alive, |ui| {
                     if alive {

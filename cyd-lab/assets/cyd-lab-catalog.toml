@@ -149,7 +149,7 @@ name = "ESPHome Web (generic ESP32, no screen)"
 group = "other"
 description = "The generic image from web.esphome.io: no screen driver, so the display stays dark. Only for adopting a blank ESP32 into Home Assistant and then flashing your own config. For a CYD with a working screen use \"ESPHome for Home Assistant (with screen)\" above, or the \"ESPHome CYD starter YAML\" (Copy config)."
 home_assistant = true
-first_setup = { improv = true, hotspot = "esphome-web-xxxxxx", password = "", page = "http://192.168.4.1", note = "in the emulator it crashes when it turns Bluetooth on, before Wi-Fi setup can finish" }
+first_setup = { improv = true, hotspot = "esphome-web-xxxxxx", password = "", page = "http://192.168.4.1", note = "no screen: use Send Wi-Fi details (Improv over serial) or join its hotspot" }
 
 [[overrides]]
 id = "circuitpython"

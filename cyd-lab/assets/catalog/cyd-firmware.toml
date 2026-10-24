@@ -120,7 +120,7 @@ licence = "MIT"
 profiles = ["cyd-2432s028r", "cyd-2432s028r-2usb", "cyd-2432s024", "cyd-3248s035"]
 version = "1.19.2"
 emulator_status = "partial"
-emulator_notes = "Shows 'ESP32 Marauder v1.19.2 Initializing...' splash then StoreProhibited loop (EXCVADDR 0x19c) after SD init failure — splash only."
+emulator_notes = "Shows the 'ESP32 Marauder v1.19.2 Initializing...' splash and stays there: its older Bluetooth controller (IDF 4.4) needs radio events the emulator does not model yet."
 notes = """
 App-only release assets need bootloader@0x1000 + partition-table@0x8000 +
 ota-data@0xe000 from marauder-installer-assets.zip (same release). Official
@@ -260,8 +260,8 @@ homepage = "https://circuitpython.org/board/sunton_esp32_2432S028/"
 licence = "MIT"
 profiles = ["cyd-2432s028r"]
 version = "10.3.1"
-emulator_status = "broken"
-emulator_notes = "Repeated SW_CPU_RESET (~1.8 s) after 'Serial console setup'; last bus fault write 0x19c; 0 RAMWR. USB-C board has a known display bug (adafruit/circuitpython#9151)."
+emulator_status = "works"
+emulator_notes = "Boots to the console on the screen: runs code.py (Hello World!) and gives the REPL over serial. BLE workflow advertises (title bar 'BLE:CIRCUITPY1124'). Wi-Fi stays off until settings.toml has CIRCUITPY_WIFI_SSID / _PASSWORD. USB-C board has a known display bug (adafruit/circuitpython#9151)."
 [entries.source]
 type = "direct"
 url = "https://downloads.circuitpython.org/bin/sunton_esp32_2432S028/en_GB/adafruit-circuitpython-sunton_esp32_2432S028-en_GB-10.3.1.bin"
@@ -313,8 +313,8 @@ homepage = "https://web.esphome.io/"
 licence = "MIT / GPL-3.0 (ESPHome dual)"
 profiles = ["cyd-2432s028r"]
 version = "26.9.2"
-emulator_status = "partial"
-emulator_notes = "setup() finishes, Improv/Wi-Fi AP starts, then StoreProhibited (EXCVADDR 0x19c) on BLE enable — no TFT (expected)."
+emulator_status = "works"
+emulator_notes = "Runs: Bluetooth (BLE Improv service) and its fallback hotspot esphome-web-xxxxxx start, Improv over serial provisions Wi-Fi, and the API answers on 6053. No screen (generic image, no CYD display driver)."
 notes = "Use esphome-cyd-starter for a CYD-aware YAML."
 [entries.source]
 type = "manifest"

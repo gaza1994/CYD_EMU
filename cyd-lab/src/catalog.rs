@@ -453,8 +453,7 @@ impl Entry {
             return n.clone();
         }
         let v: &[&str] = match self.id.as_str() {
-            "marauder" => &["SD card", "Bluetooth"],
-            "esphome-web" => &["Bluetooth"],
+            "marauder" => &["SD card", "Bluetooth (its older controller)"],
             "wled" => &["LED strip (no screen UI)"],
             "bruce" => &["RF / IR / NRF24 add-on modules"],
             _ => &[],
@@ -904,9 +903,12 @@ mod tests {
         assert!(c.profile_for("ttgo-tdisplay").is_none());
         let shown = c.entries_for(&p.id, false);
         assert!(shown.iter().any(|e| e.id == "nerdminer"));
-        assert!(!shown.iter().any(|e| e.id == "circuitpython"), "broken hidden by default");
-        assert!(c.entries_for(&p.id, true).iter().any(|e| e.id == "circuitpython"));
-        assert_eq!(c.hidden_broken(&p.id), 1);
+        // CircuitPython boots since the engine runs its BLE; nothing bundled is broken now.
+        assert!(shown.iter().any(|e| e.id == "circuitpython" && e.emulator_status == Status::Works));
+        assert_eq!(c.hidden_broken(&p.id), 0);
+        assert_eq!(c.entries_for(&p.id, true).len(), shown.len());
+        assert!(c.entries.iter().any(|e| e.id == "esphome-web" && e.emulator_status == Status::Works && e.needs().is_empty()));
+        assert!(c.entries.iter().any(|e| e.id == "marauder" && e.emulator_status == Status::Partial));
         // The two-USB 2.8" board also gets the micro-USB board's entries; others only their own.
         let usb = c.entries_for("cyd-2432s028r-2usb", true);
         assert!(usb.iter().any(|e| e.id == "wled") && usb.iter().any(|e| e.id == "esphome-ha-cyd"));

@@ -237,10 +237,11 @@ fn session(
                 }
             }
             Ok(Message::Close(_)) => return Session::Dropped("engine closed the link".into()),
-            // Control-channel answers (the device hotspot's `ap_status`) go to the app.
+            // Control-channel messages go to the app: the device hotspot's `ap_status`
+            // (answers, and pushes on newer engines) and forwarded-port `fwd` events.
             Ok(Message::Text(t)) => {
                 busy = true;
-                if t.contains("\"ap_status\"") {
+                if t.contains("\"ap_status\"") || t.contains("\"fwd\"") {
                     let _ = events.send(EngineEvent::Control(t.to_string()));
                     waker();
                 }

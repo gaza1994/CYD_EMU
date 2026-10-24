@@ -6,8 +6,11 @@
 //!
 //! With the live link up this happens at run time over the engine's WebSocket control
 //! channel: `{"t":"ap_client","ssid","psk","fwd"}` makes the "phone", joins and forwards,
-//! `{"t":"ap_status"}` reports what it sees (polled; the engine does not push). Without the
-//! link, [`Plan`] puts the same request on the command line and the device restarts.
+//! newer engines push `{"t":"ap_status"}` whenever the phone's state changes (older ones
+//! only answer when asked, so the panel polls them). Without the link, [`Plan`] puts the
+//! same request on the command line and the device restarts.
+//!
+//! Newer engines also report clients on forwarded ports as [`FwdEvent`]s.
 //!
 //! The browser never talks to the forwarded port directly but to [`HostProxy`], which sends
 //! `Host: 192.168.4.1` as a phone would: captive portals such as WiFiManager (NerdMiner)
@@ -128,9 +131,74 @@ impl ApStatus {
     pub fn bound_addr(&self) -> Option<SocketAddr> {
         self.bound.as_deref().and_then(|b| b.parse().ok())
     }
+    /// `ssid` is among the hotspots the phone sees.
+    pub fn sees(&self, ssid: &str) -> bool {
+        self.phone.as_ref().is_some_and(|p| p.hotspots.iter().any(|h| h.ssid == ssid))
+    }
     /// Joined `ssid` and has an address.
     pub fn up_on(&self, ssid: &str) -> bool {
         self.phone.as_ref().is_some_and(|p| p.state == "up" && p.join.as_deref() == Some(ssid))
+    }
+}
+
+/// A client came or went on a forwarded port (`{"t":"fwd",...}`, newer engines). Only
+/// clients the guest accepted count: a refused port never sends `connect`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct FwdEvent {
+    /// `connect` or `disconnect`
+    pub event: String,
+    /// `hostfwd` (published ports) or `ap-fwd` (the device hotspot's page)
+    pub via: String,
+    /// This PC's port.
+    pub port: u16,
+    pub peer: String,
+    /// Clients on that port as of this event.
+    pub clients: u32,
+}
+
+impl FwdEvent {
+    pub fn parse(text: &str) -> Option<FwdEvent> {
+        let v: serde_json::Value = serde_json::from_str(text).ok()?;
+        if v.get("t")?.as_str()? != "fwd" {
+            return None;
+        }
+        serde_json::from_value(v).ok()
+    }
+    pub fn connected(&self) -> bool {
+        self.event == "connect"
+    }
+}
+
+/// Live clients per forwarded port, from [`FwdEvent`]s.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FwdClients {
+    /// (via, host port) -> (count, peers)
+    pub ports: std::collections::BTreeMap<(String, u16), (u32, Vec<String>)>,
+    /// The engine sends these events (so "0 clients" means something).
+    pub reported: bool,
+}
+
+impl FwdClients {
+    pub fn apply(&mut self, e: &FwdEvent) {
+        self.reported = true;
+        let entry = self.ports.entry((e.via.clone(), e.port)).or_default();
+        entry.1.retain(|p| *p != e.peer);
+        if e.connected() {
+            entry.1.push(e.peer.clone());
+        }
+        entry.0 = e.clients;
+        if e.clients == 0 {
+            entry.1.clear();
+        }
+        // Keep the peer list no longer than the count the engine gives.
+        while entry.1.len() > entry.0 as usize {
+            entry.1.remove(0);
+        }
+    }
+    /// Clients on a published port (`--hostfwd`).
+    pub fn on_host_port(&self, port: u16) -> (u32, &[String]) {
+        self.ports.get(&("hostfwd".to_string(), port)).map(|(n, p)| (*n, p.as_slice())).unwrap_or((0, &[]))
     }
 }
 
@@ -329,6 +397,26 @@ fn proxy_one(mut client: TcpStream, to: Option<SocketAddr>, host: &str, port: u1
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_events_count_clients() {
+        let c = FwdEvent::parse(r#"{"t":"fwd","event":"connect","via":"hostfwd","port":16053,"peer":"127.0.0.1:50000","clients":1}"#).unwrap();
+        assert!(c.connected() && c.port == 16053 && c.via == "hostfwd");
+        assert!(FwdEvent::parse(r#"{"t":"ap_status"}"#).is_none() && FwdEvent::parse("x").is_none());
+        let mut live = FwdClients::default();
+        assert!(!live.reported);
+        live.apply(&c);
+        live.apply(&FwdEvent::parse(r#"{"t":"fwd","event":"connect","via":"hostfwd","port":16053,"peer":"127.0.0.1:50001","clients":2}"#).unwrap());
+        live.apply(&FwdEvent::parse(r#"{"t":"fwd","event":"connect","via":"ap-fwd","port":40000,"peer":"127.0.0.1:50002","clients":1}"#).unwrap());
+        assert_eq!(live.on_host_port(16053), (2, &["127.0.0.1:50000".to_string(), "127.0.0.1:50001".to_string()][..]));
+        live.apply(&FwdEvent::parse(r#"{"t":"fwd","event":"disconnect","via":"hostfwd","port":16053,"peer":"127.0.0.1:50000","clients":1}"#).unwrap());
+        assert_eq!(live.on_host_port(16053), (1, &["127.0.0.1:50001".to_string()][..]));
+        // Guest left its hotspot: everything on the page forward closes at once.
+        live.apply(&FwdEvent::parse(r#"{"t":"fwd","event":"disconnect","via":"ap-fwd","port":40000,"peer":"127.0.0.1:50002","clients":0}"#).unwrap());
+        assert_eq!(live.ports[&("ap-fwd".to_string(), 40000)], (0, vec![]));
+        assert_eq!(live.on_host_port(3232), (0, &[][..]));
+        assert!(live.reported);
+    }
 
     #[test]
     fn status_and_messages() {

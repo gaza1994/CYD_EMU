@@ -371,6 +371,8 @@ pub fn wifi_event(line: &str) -> Option<WifiEvent> {
         || line.contains("WL_CONNECTED")
         || lower.contains("sta ip:")
         || lower.contains("got ip:")
+        // openHASP: "WIFI: Received IP address 10.0.2.15"
+        || lower.contains("received ip address")
         || line.contains("STA_GOT_IP")
     {
         return Some(WifiEvent::Connected);
@@ -389,8 +391,12 @@ pub struct WifiWatch {
 }
 
 impl WifiWatch {
-    pub fn feed(&mut self, line: &str, ap: &WifiDetails) {
-        let Some(ev) = wifi_event(line) else { return };
+    /// Returns true when this line says the firmware is on Wi-Fi.
+    pub fn feed(&mut self, line: &str, ap: &WifiDetails) -> bool {
+        // "Connected to esp32sim" (openHASP, many sketches) names this device's network.
+        let named = !ap.ssid.is_empty() && line.contains(&format!("Connected to {}", ap.ssid)) && !line.to_ascii_lowercase().contains("disconnected");
+        let Some(ev) = wifi_event(line).or(named.then_some(WifiEvent::Connected)) else { return false };
+        let on = ev == WifiEvent::Connected;
         match ev {
             WifiEvent::Trying(s) => {
                 if s != ap.ssid {
@@ -416,6 +422,7 @@ impl WifiWatch {
                 self.banner = None;
             }
         }
+        on
     }
 }
 
@@ -587,6 +594,13 @@ mod tests {
         assert!(watch.banner.is_none());
         watch.feed("Could not find network HomeNet (status 1), retrying", &ap);
         assert!(watch.banner.as_deref().unwrap().contains("looking for Wi-Fi \"HomeNet\""));
+        // openHASP after its setup page saved the Wi-Fi
+        let mut watch = WifiWatch::default();
+        let ap8 = w("esp32sim", "esp32sim-pass");
+        assert!(watch.feed("[       2.966][77812/87700 11][42468/42476  1] WIFI: Connected to esp32sim, requesting IP...", &ap8) && watch.connected);
+        assert!(watch.feed("WIFI: Received IP address 10.0.2.15", &ap8));
+        assert!(!watch.feed("WIFI: Disconnected from esp32sim (Reason: 201)", &ap8));
+        let mut watch = WifiWatch::default();
         watch.feed("Connecting to \"LabNet\"", &ap);
         assert_eq!(watch.wanted.as_deref(), Some("LabNet"));
         // not a network name
