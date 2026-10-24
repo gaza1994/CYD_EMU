@@ -153,7 +153,7 @@ impl DeviceStore {
             notes: String::new(),
             view_rotation: profile.display.as_ref().map(|d| d.default_rotation).unwrap_or(0),
             created: now,
-            network: crate::network::DeviceNetwork::for_new_device(wifi, &existing.iter().map(|d| d.meta.network.clone()).collect::<Vec<_>>()),
+            network: crate::network::DeviceNetwork::for_new_device(wifi),
         };
         let dev = Device { id, dir, meta };
         write_blank_flash(&dev.flash_path(), profile.flash.size_bytes())?;
