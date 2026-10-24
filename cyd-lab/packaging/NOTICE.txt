@@ -35,8 +35,9 @@ ESP-IDF second-stage bootloader and Arduino-ESP32 default partition table
   Copyright Espressif Systems (Shanghai) Co Ltd, Apache License 2.0
   (https://github.com/espressif/esp-idf). The partition table is the core's
   default.csv layout (https://github.com/espressif/arduino-esp32, tools/
-  partitions; the core is LGPL-2.1, its build data files are Apache-2.0
-  compatible). Both are unmodified.
+  partitions/default.csv; Arduino-ESP32 is LGPL-2.1-or-later). The table
+  is a list of partition offsets and sizes, compiled with gen_esp32part.
+  Both are included unmodified.
 
 Third-party Rust crates
   Listed with their licences in third-party-cyd-lab.txt and
