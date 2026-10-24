@@ -21,9 +21,12 @@ target, and it also builds and runs on Linux.
 3. **+ New device** > ESP32-2432S028R > **Create**, then **Power on**. A new board has blank
    flash and loops on `invalid header`, the same as a real erased chip.
 4. Drag a firmware `.bin` onto the window, or use **Install from web** with a manifest URL.
-   cyd-lab guesses the offset from the image (`0xE9` at 0 = merged/factory at 0x0,
-   at 0x1000 = merged with bootloader, an app image alone = 0x10000, partition table =
-   0x8000), asks when it can't tell, and power-cycles the device around the write.
+   cyd-lab picks the offset from the image: merged/factory (bootloader at 0x1000 and
+   partitions at 0x8000 inside the file) at 0x0, a merged image that starts at the
+   bootloader at 0x1000, a bootloader at 0x1000, a partition table at 0x8000, and an app
+   image at the device's first app partition (0x10000 by default). It asks first when it
+   can't tell, when an app image would land on blank flash (use the factory .bin), or when
+   the image is for another chip. It power-cycles the device around the write.
 5. **Use with...** (device toolbar) shows copy-paste commands for esptool, PlatformIO,
    Arduino, ESPHome and a serial terminal, all on `rfc2217://127.0.0.1:PORT`.
 6. **Set up Arduino IDE** copies the bundled board package into
