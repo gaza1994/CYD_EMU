@@ -336,6 +336,10 @@ pub struct EngineSettings {
     /// WebSocket, so by default it points the engine at an empty per-device folder: without
     /// `--web-dir` esp32sim looks for `web/` next to its exe and panics if it is missing.
     pub web_dir: Option<PathBuf>,
+    /// Optional extra, Windows only, off by default: expose each device as a real COMxx port
+    /// through com0com + hub4com. Not needed for esptool, Arduino, ESPHome or PlatformIO,
+    /// which all take the `rfc2217://` URL directly.
+    pub com_bridge: bool,
 }
 
 impl Default for EngineSettings {
@@ -351,6 +355,7 @@ impl Default for EngineSettings {
             stop_grace_secs: 6,
             extra_args: Vec::new(),
             web_dir: None,
+            com_bridge: false,
         }
     }
 }

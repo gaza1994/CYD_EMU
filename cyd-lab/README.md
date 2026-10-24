@@ -15,7 +15,7 @@ target, and it also builds and runs on Linux.
 
 | Works | Stubbed / not yet |
 | --- | --- |
-| Profile library (built-in TOML plus a user folder) | Real `COMxx` ports on Windows: implemented (com0com detection, "Create COMx pair", hub4com relay per running device) but **never run on Windows**, only compile-checked |
+| Profile library (built-in TOML plus a user folder) | Optional real `COMxx` ports on Windows (off by default): implemented (com0com detection, "Create COMx pair", hub4com relay per running device) but **never run on Windows**, only compile-checked |
 | Device store: create, rename, delete, erase flash, import a .bin at an offset | |
 | Flash persists across power cycles (`--flash-file`, graceful stop, exit 0) on Linux and, by the engine's contract, Windows | |
 | `--serial-tcp`: esptool `write-flash` over `rfc2217://127.0.0.1:PORT` tested end to end (921600 baud, hash verified, board reboots and draws) | |
@@ -166,7 +166,15 @@ so no `?ign_set_control` is needed. It serves one client at a time; while one is
 UART0 output goes to it rather than to cyd-lab's console. If the engine has no
 `--serial-tcp`, the port is reserved and the UI says it is not served.
 
-### COM ports on Windows (implemented, UNTESTED on Windows)
+### Optional extra: COM ports on Windows (off by default, UNTESTED on Windows)
+
+**You don't need this.** Everything in cyd-lab works over the network: esptool, the Arduino
+IDE / arduino-cli (see [Arduino](#arduino-ide-2--arduino-cli-no-driver)), PlatformIO and
+ESPHome all accept `rfc2217://127.0.0.1:PORT` directly, and web installers can be imported
+with [Install from web installer](#install-from-web-installer). A real `COMxx` port is only
+for old tools that insist on one. It is off by default: turn on **Settings → COM ports
+(optional)** to show the COM name field and start the relay at power-on.
+
 
 Tools that want a real `COMxx` need a [com0com](https://sourceforge.net/projects/com0com/)
 virtual pair. hub4com relays the hidden end of the pair to the RFC2217 port. For `COM20` /

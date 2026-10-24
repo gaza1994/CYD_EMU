@@ -300,7 +300,7 @@ impl CydLabApp {
         #[allow(unused_mut)]
         let mut spec = LaunchSpec::build(&profile, &self.devices[i].dev, &self.settings.engine, &features, boot, port, serial);
         #[cfg(windows)]
-        if let Some(com) = &self.devices[i].dev.meta.com_port {
+        if let Some(com) = self.devices[i].dev.meta.com_port.as_ref().filter(|_| self.settings.engine.com_bridge) {
             match serial {
                 Some(p) => match crate::combridge::plan_for(com, p) {
                     Ok(relay) => spec.relay = Some(relay),
@@ -554,6 +554,9 @@ impl CydLabApp {
                 ui.end_row();
                 ui.label("Power-off grace");
                 ui.add(egui::DragValue::new(&mut e.stop_grace_secs).range(1..=120).suffix(" s")).on_hover_text("How long to wait for the engine to write flash.bin before killing it");
+                ui.end_row();
+                ui.label("COM ports (optional)");
+                ui.checkbox(&mut e.com_bridge, "Windows only: also expose devices as COMxx via com0com + hub4com (off by default; not needed: tools take the rfc2217:// URL)");
                 ui.end_row();
                 ui.label("Real time");
                 ui.checkbox(&mut e.realtime, "pace emulation to the wall clock (--realtime)");
@@ -887,11 +890,14 @@ impl CydLabApp {
                     d.dev.meta.serial_tcp_port = p;
                     save = true;
                 }
+                let com_bridge = self.settings.engine.com_bridge;
+                if com_bridge {
                 ui.label("COM name");
                 let mut com = d.dev.meta.com_port.clone().unwrap_or_default();
                 if ui.add(egui::TextEdit::singleline(&mut com).desired_width(60.0)).on_hover_text("Windows only: expose the board as this COM port (com0com pair COMn <-> CNCBn plus a hub4com relay started at power-on). Empty = no COM port. While the relay is connected, the chip's serial output goes to the COM port instead of this console.").changed() {
                     d.dev.meta.com_port = if com.trim().is_empty() { None } else { Some(com.trim().to_uppercase()) };
                     save = true;
+                }
                 }
             });
             let port = live_port.or(d.dev.meta.serial_tcp_port);
@@ -912,7 +918,7 @@ impl CydLabApp {
                 (false, _, true) => "served at power-on".to_string(),
             };
             ui.label(RichText::new(note).small().weak());
-            if let Some(com) = d.dev.meta.com_port.clone() {
+            if let Some(com) = d.dev.meta.com_port.clone().filter(|_| self.settings.engine.com_bridge) {
                 com_port_ui(ui, d, &com);
             }
         });
