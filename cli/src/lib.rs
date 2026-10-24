@@ -564,6 +564,19 @@ fn run_with_reboots<S: Soc>(m: &mut Machine<S>, mut remaining: u64, reboot: bool
     }
 }
 
+/// `--web` without `--web-dir`: the first `web/` beside the executable or up to three directories
+/// above it (a cargo `target/release` build), else under the working directory. With none, the
+/// page's files are missing (404) but the WebSocket still serves a page or tool kept elsewhere.
+fn default_web_dir() -> String {
+    let exe = std::env::current_exe().ok();
+    let found = exe.iter().flat_map(|e| e.ancestors().skip(1).take(4)).map(|d| d.join("web"))
+        .chain(std::env::current_dir().ok().map(|d| d.join("web"))).find(|d| d.is_dir());
+    found.map(|d| d.to_string_lossy().into_owned()).unwrap_or_else(|| {
+        eprintln!("[emu] --web: no web/ directory beside the executable or here; pass --web-dir DIR for the page (the WebSocket still works)");
+        "web".into()
+    })
+}
+
 /// Images, boot, observers, scripts: everything before the first instruction. Returns the boot mode.
 fn prepare<S: Soc>(m: &mut Machine<S>, o: &Opts) -> String {
     let c3 = S::CORES == 1;
@@ -644,7 +657,7 @@ fn prepare<S: Soc>(m: &mut Machine<S>, o: &Opts) -> String {
     m.console.prefix = o.console_prefix;
     if let Some(p) = &o.regtrace { m.add_observer(Box::new(RegTrace::new(std::fs::File::create(p).expect("regtrace file"), o.regtrace_max, o.regtrace_from_pc))); }
     if let Some(port) = o.web_port {
-        let dir = o.web_dir.clone().unwrap_or_else(|| { let exe = std::env::current_exe().unwrap(); let mut d = exe.parent().unwrap().to_path_buf(); for _ in 0..3 { if d.join("web").exists() { break; } d = d.parent().unwrap().to_path_buf(); } d.join("web").to_string_lossy().to_string() });
+        let dir = o.web_dir.clone().unwrap_or_else(default_web_dir);
         let w = esp_soc::web::WebServer::start(port, dir.clone()).expect("web server");
         eprintln!("[emu] board UI: http://127.0.0.1:{}/  (serving {})", port, dir);
         m.web = Some(w); m.rt.enabled = true;

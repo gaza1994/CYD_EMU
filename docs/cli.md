@@ -80,7 +80,7 @@ the final image of a one-shot run uses it, a harness that wants "configure once,
 | `--script F` | host actions at emulated times (below) |
 | `--console usb\|uart0\|both\|all\|none`, `--console-prefix` | which consoles to print |
 | `--realtime` | pace to wall time without the UI |
-| `--web PORT [--web-dir DIR]` | browser UI (implies real time) |
+| `--web PORT [--web-dir DIR]` | browser UI (implies real time); without `--web-dir`, the `web/` beside the executable or up to three directories above it, else `./web`; with none found the WebSocket still runs and the page is a 404 |
 | `--cam-image F`, `--cam-fps N` | camera source for boards with a camera |
 | `--cooja` (C6) | run as a Cooja-NG external mote: the lock-step NDJSON protocol on stdin/stdout, the guest console as `log` events, the 802.15.4 frames as `tx`/`rx`. Honors `--no-reboot` and `--max-seconds` (see [esp32c6.md](esp32c6.md), "Cooja-NG lock-step") |
 | `--cooja-slice-us N` | how long a busy guest runs before asking csim to step it again (default 100; `hello.args.slice_us` overrides). A transmission reaches csim's medium at the end of the slice it started in, so this bounds how late it is |
