@@ -294,6 +294,8 @@ pub enum EngineEvent {
     Exited(Option<i32>),
     LinkUp,
     LinkDown(String),
+    /// A text message from the engine's control channel (JSON, e.g. `ap_status`).
+    Control(String),
 }
 
 #[derive(Debug)]
@@ -359,6 +361,11 @@ pub trait Backend: Send {
     fn serial_line(&mut self, line: &str) -> std::result::Result<(), TouchError>;
     /// The command line of the current / last run, for display.
     fn last_command(&self) -> Option<String>;
+    /// A JSON message on the live link's control channel (e.g. the device hotspot's
+    /// `ap_client` / `ap_status`); answers arrive as [`EngineEvent::Control`].
+    fn control(&mut self, _json: String) -> std::result::Result<(), TouchError> {
+        Err(TouchError::NotConnected)
+    }
 }
 
 /// Engine-related settings (persisted by the app in `settings.toml`).
@@ -1092,6 +1099,16 @@ impl Backend for ProcessBackend {
 
     fn last_command(&self) -> Option<String> {
         self.last_command.clone()
+    }
+
+    fn control(&mut self, json: String) -> std::result::Result<(), TouchError> {
+        match &self.link {
+            Some(l) if l.is_connected() => {
+                l.send_json(json);
+                Ok(())
+            }
+            _ => Err(TouchError::NotConnected),
+        }
     }
 }
 

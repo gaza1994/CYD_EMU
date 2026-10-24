@@ -237,6 +237,14 @@ fn session(
                 }
             }
             Ok(Message::Close(_)) => return Session::Dropped("engine closed the link".into()),
+            // Control-channel answers (the device hotspot's `ap_status`) go to the app.
+            Ok(Message::Text(t)) => {
+                busy = true;
+                if t.contains("\"ap_status\"") {
+                    let _ = events.send(EngineEvent::Control(t.to_string()));
+                    waker();
+                }
+            }
             Ok(_) => busy = true,
             Err(e) if is_transient_ws(&e) => {}
             Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => return Session::Dropped("engine closed the link".into()),

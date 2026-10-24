@@ -309,6 +309,80 @@ pub fn strip_ansi(s: &str) -> String {
 // ---------------------------------------------------------------------------
 // Per-device UI state
 
+/// The device hotspot driven live over the engine's control channel (`ap_client` /
+/// `ap_status`): the engine does not push, so the panel polls while it is open.
+#[derive(Default)]
+struct ApUi {
+    /// The newest `ap_status`.
+    status: Option<crate::hotspot::ApStatus>,
+    /// The panel was drawn open this frame (poll only then).
+    panel_open: bool,
+    next_poll: Option<Instant>,
+    /// A scanning phone was made this run (so the panel can list hotspots).
+    scanning: bool,
+    /// Joining (ssid, page ip); open the page once the phone is up on it.
+    joining: Option<(String, String)>,
+    open_when_up: bool,
+    /// This run's forward to the page, and the guest address it points at.
+    bound: Option<(std::net::SocketAddr, String)>,
+    /// The Host-rewriting proxy the browser uses (kept across runs, so its URL stays).
+    proxy: Option<crate::hotspot::HostProxy>,
+    error: Option<String>,
+}
+
+impl ApUi {
+    /// A new run: the engine's phone and forwards are gone.
+    fn new_run(&mut self) {
+        self.status = None;
+        self.next_poll = None;
+        self.scanning = false;
+        self.bound = None;
+        self.error = None;
+        if self.joining.is_none() {
+            self.open_when_up = false;
+        }
+        if let Some(p) = &self.proxy {
+            p.set_target(None, "");
+        }
+    }
+
+    fn proxy(&mut self) -> Option<&crate::hotspot::HostProxy> {
+        if self.proxy.is_none() {
+            self.proxy = crate::hotspot::HostProxy::start().ok();
+        }
+        self.proxy.as_ref()
+    }
+
+    fn on_status(&mut self, st: crate::hotspot::ApStatus) {
+        self.error = st.error.clone();
+        if st.error.is_some() {
+            self.open_when_up = false;
+            return;
+        }
+        if let Some(addr) = st.bound_addr() {
+            let guest = self.joining.as_ref().map(|j| j.1.clone()).unwrap_or_else(|| crate::hotspot::GUEST_AP_IP.to_string());
+            if let Some(p) = self.proxy() {
+                p.set_target(Some(addr), &guest);
+            }
+            self.bound = Some((addr, guest));
+        }
+        if st.phone.is_some() {
+            self.scanning = true;
+        }
+        self.status = Some(st);
+    }
+
+    /// The URL to open now, once: joined the network and the forward is in place.
+    fn take_open_url(&mut self) -> Option<String> {
+        let (ssid, _) = self.joining.as_ref()?;
+        if !self.open_when_up || self.bound.is_none() || !self.status.as_ref().is_some_and(|s| s.up_on(ssid)) {
+            return None;
+        }
+        self.open_when_up = false;
+        self.proxy.as_ref().map(|p| p.url())
+    }
+}
+
 struct DeviceView {
     dev: Device,
     backend: Box<dyn Backend>,
@@ -377,6 +451,8 @@ struct DeviceView {
     hotspot_open_at: Option<Instant>,
     /// The "Device hotspot" form: network name, password, page address.
     hotspot_form: (String, String, String),
+    /// The live device-hotspot session over the control channel.
+    ap: ApUi,
     /// After installing a firmware with a first-setup guide (the Home Assistant entry):
     /// its id, shown as a step card until dismissed.
     /// The setup checklist after installing a catalogue firmware that needs setting up.
@@ -756,6 +832,7 @@ impl DeviceView {
             hotspot: None,
             hotspot_open_at: None,
             hotspot_form: (String::new(), String::new(), crate::hotspot::GUEST_AP_IP.to_string()),
+            ap: ApUi::default(),
             guide: None,
             api_client: None,
         }
@@ -1493,6 +1570,7 @@ impl CydLabApp {
         let d = &mut self.devices[i];
         d.improv = ImprovUi::default();
         d.hotspot_ssids.clear();
+        d.ap.new_run();
         if r.is_ok() && boot == BootMode::Normal && !bridged {
             // Auto-detect Improv: "request current state" once the firmware has booted.
             // Each try briefly takes the serial port, so not while a COM bridge relays it.
@@ -1586,6 +1664,11 @@ impl CydLabApp {
                         d.touch_since = None;
                         d.touch_release_due = None;
                     }
+                    EngineEvent::Control(text) => {
+                        if let Some(st) = crate::hotspot::ApStatus::parse(&text) {
+                            d.ap.on_status(st);
+                        }
+                    }
                     EngineEvent::LinkUp => {
                         d.link_up = true;
                         d.link_lost = false;
@@ -1615,10 +1698,30 @@ impl CydLabApp {
             d.poll_improv();
             if d.hotspot_open_at.is_some_and(|t| Instant::now() >= t) {
                 d.hotspot_open_at = None;
-                if let Some(url) = d.hotspot.as_ref().map(|p| p.url()) {
+                // The command-line plan's forward, behind the Host-rewriting proxy.
+                if let Some(plan) = d.hotspot.clone() {
+                    let target = std::net::SocketAddr::from(([127, 0, 0, 1], plan.host_port));
+                    let url = d.ap.proxy().map(|p| {
+                        p.set_target(Some(target), &plan.guest_ip);
+                        p.url()
+                    });
+                    let url = url.unwrap_or_else(|| plan.url());
                     d.lab(format!("device hotspot: opening {url}"));
                     ctx.open_url(egui::OpenUrl::new_tab(url));
                 }
+            }
+            // Live hotspot: poll ap_status while the panel is open (faster while joining).
+            if d.ap.panel_open && d.link_up {
+                let now = Instant::now();
+                if d.ap.next_poll.is_none_or(|t| now >= t) {
+                    let _ = d.backend.control(crate::hotspot::STATUS_MESSAGE.to_string());
+                    d.ap.next_poll = Some(now + if d.ap.open_when_up { Duration::from_millis(700) } else { Duration::from_secs(2) });
+                }
+                ctx.request_repaint_after(Duration::from_millis(500));
+            }
+            if let Some(url) = d.ap.take_open_url() {
+                d.lab(format!("device hotspot: joined; opening {url} (the page at {} on the device's hotspot)", d.ap.bound.as_ref().map(|b| b.1.clone()).unwrap_or_default()));
+                ctx.open_url(egui::OpenUrl::new_tab(url));
             }
             if d.improv.busy.is_some() || d.improv.probe_at.is_some() || d.hotspot_open_at.is_some() {
                 ctx.request_repaint_after(Duration::from_millis(250));
@@ -2753,65 +2856,141 @@ impl CydLabApp {
             ui.label(RichText::new(format!("  firmware error: {}", crate::improv::error_label(err))).small().weak());
         }
 
-        // Device hotspot: only with an engine that can join it (--ap-client/--ap-fwd).
+        // Device hotspot: only with an engine that can join it (--ap-client/--ap-fwd). With the
+        // live link it is joined at run time (control channel); otherwise at the next power-on.
         if features.ap_client {
+            let catalog = &self.catalog;
+            let live = d.link_up && alive;
             let hs_state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("hotspot", i)), false);
+            d.ap.panel_open = hs_state.is_open() && live;
+            // Seen on the air (the engine's phone) first, then names the firmware printed.
+            let mut seen: Vec<(String, Option<bool>)> = d.ap.status.as_ref().and_then(|s| s.phone.as_ref()).map(|p| p.hotspots.iter().map(|h| (h.ssid.clone(), Some(h.secure))).collect()).unwrap_or_default();
+            for n in &d.hotspot_ssids {
+                if !seen.iter().any(|(s, _)| s == n) {
+                    seen.push((n.clone(), None));
+                }
+            }
+            if hs_state.is_open() && live && !d.ap.scanning {
+                // A phone that only listens, so the panel can list the hotspots on the air.
+                if d.backend.control(crate::hotspot::client_message(None, "", None)).is_ok() {
+                    d.ap.scanning = true;
+                }
+            }
+            let mut lab_msg = None;
             hs_state
                 .show_header(ui, |ui| {
-                    let t = match (&d.hotspot, d.hotspot_ssids.len()) {
-                        (Some(p), _) => format!("Device hotspot: joined \"{}\" → {}", p.ssid, p.url()),
-                        (_, 0) => "Device hotspot".to_string(),
-                        (_, n) => format!("Device hotspot: firmware announced {n} network{}", if n == 1 { "" } else { "s" }),
+                    let progress = d.ap.joining.as_ref().and(d.ap.status.as_ref()).and_then(|s| s.phone.as_ref()).map(|p| p.progress());
+                    let t = match (&d.hotspot, progress, seen.len()) {
+                        (_, Some(p), _) => format!("Device hotspot: {p}"),
+                        (Some(p), None, _) => format!("Device hotspot: joined \"{}\" at power-on", p.ssid),
+                        (_, None, 0) => "Device hotspot".to_string(),
+                        (_, None, n) => format!("Device hotspot: {n} network{} seen", if n == 1 { "" } else { "s" }),
                     };
                     ui.label(RichText::new(t).small());
                 })
                 .body(|ui| {
-                    ui.label(RichText::new("Many firmwares start their own Wi-Fi network for first setup (openHASP HASP-xxxxxx, Tasmota tasmota-xxxxxx, WLED-AP, ESPHome's fallback hotspot) with a setup page at 192.168.4.1. cyd-lab can join it for you and open that page here.").small().weak());
-                    {
-                        let (ssid, pw, ip) = &mut d.hotspot_form;
-                        if ssid.is_empty() {
-                            if let Some(first) = d.hotspot_ssids.first() {
-                                *ssid = first.clone();
-                            }
-                        }
-                        egui::Grid::new(("hs-grid", i)).num_columns(2).show(ui, |ui| {
-                            ui.label(RichText::new("Network").small());
-                            ui.horizontal(|ui| {
-                                ui.add(egui::TextEdit::singleline(ssid).desired_width(170.0).hint_text("e.g. HASP-1A2B3C"));
-                                if !d.hotspot_ssids.is_empty() {
-                                    egui::ComboBox::from_id_salt(("hs-seen", i)).selected_text(RichText::new("seen").small()).show_ui(ui, |ui| {
-                                        for s in &d.hotspot_ssids {
-                                            if ui.selectable_label(ssid == s, s).clicked() {
-                                                *ssid = s.clone();
-                                            }
+                    ui.label(RichText::new("Many firmwares start their own Wi-Fi network for first setup (openHASP HASP-xxxxxx, NerdMinerAP, Tasmota, WLED-AP, ESPHome's fallback hotspot) with a setup page at 192.168.4.1. cyd-lab joins it like a phone would and opens that page in your browser (on this PC only).").small().weak());
+                    let (ssid, pw, ip) = &mut d.hotspot_form;
+                    if !seen.is_empty() {
+                        egui::Grid::new(("hs-seen", i)).num_columns(3).show(ui, |ui| {
+                            for (name, secure) in &seen {
+                                ui.label(RichText::new(name).monospace());
+                                ui.label(RichText::new(match secure { Some(true) => "password", Some(false) => "open", None => "from the log" }).small().weak());
+                                if ui.small_button("Use").clicked() {
+                                    *ssid = name.clone();
+                                    match catalog.hotspot_setup(name) {
+                                        Some(f) => {
+                                            *pw = f.password.clone();
+                                            *ip = f.page_ip().unwrap_or_else(|| crate::hotspot::GUEST_AP_IP.to_string());
                                         }
-                                    });
+                                        None if *secure == Some(false) => pw.clear(),
+                                        None => {}
+                                    }
                                 }
-                            });
-                            ui.end_row();
-                            ui.label(RichText::new("Password").small());
-                            ui.add(egui::TextEdit::singleline(pw).password(true).desired_width(170.0).hint_text("blank if open"));
-                            ui.end_row();
-                            ui.label(RichText::new("Page at").small());
-                            ui.add(egui::TextEdit::singleline(ip).desired_width(110.0)).on_hover_text("192.168.4.1 for most firmwares, 4.3.2.1 for WLED");
-                            ui.end_row();
+                                ui.end_row();
+                            }
                         });
+                    } else if live {
+                        ui.label(RichText::new("Listening for hotspots… (the firmware starts one when it has no Wi-Fi saved)").small().weak());
+                    }
+                    let known = catalog.hotspot_setup(ssid.trim());
+                    egui::Grid::new(("hs-grid", i)).num_columns(2).show(ui, |ui| {
+                        ui.label(RichText::new("Network").small());
+                        ui.add(egui::TextEdit::singleline(ssid).desired_width(170.0).hint_text("e.g. HASP-1A2B3C"));
+                        ui.end_row();
+                        ui.label(RichText::new("Password").small());
                         ui.horizontal(|ui| {
-                            if ui.add_enabled(!ssid.trim().is_empty(), egui::Button::new("Connect & open setup page")).on_hover_text("Restarts the device joined to that network and opens its setup page in your browser (served on 127.0.0.1 only).").clicked() {
+                            ui.add(egui::TextEdit::singleline(pw).password(true).desired_width(170.0).hint_text("blank if open"));
+                            if let Some(f) = known.filter(|f| !f.password.is_empty() && *pw != f.password) {
+                                if ui.small_button("Use catalogue password").on_hover_text(format!("The firmware's default hotspot password ({})", f.hotspot)).clicked() {
+                                    *pw = f.password.clone();
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        ui.label(RichText::new("Page at").small());
+                        ui.add(egui::TextEdit::singleline(ip).desired_width(110.0)).on_hover_text("192.168.4.1 for most firmwares, 4.3.2.1 for WLED");
+                        ui.end_row();
+                    });
+                    let secure = seen.iter().find(|(n, _)| n == ssid.trim()).and_then(|(_, s)| *s);
+                    if secure == Some(true) && pw.is_empty() {
+                        ui.label(RichText::new("This network needs a password (see the firmware's docs or its screen).").small().color(Color32::from_rgb(240, 200, 120)));
+                    }
+                    if !pw.is_empty() && pw.len() < 8 {
+                        ui.label(RichText::new("Wi-Fi passwords are 8 to 63 characters.").small().color(Color32::from_rgb(240, 200, 120)));
+                    }
+                    ui.horizontal(|ui| {
+                        let ok = !ssid.trim().is_empty() && (pw.is_empty() || (8..=63).contains(&pw.len()));
+                        let tip = if live { "Joins that network now and opens its setup page in your browser (served on 127.0.0.1 only)." } else { "Restarts the device joined to that network and opens its setup page in your browser (served on 127.0.0.1 only)." };
+                        if ui.add_enabled(ok, egui::Button::new("Connect & open setup page")).on_hover_text(tip).clicked() {
+                            let (name, page) = (ssid.trim().to_string(), if ip.trim().is_empty() { crate::hotspot::GUEST_AP_IP.to_string() } else { ip.trim().to_string() });
+                            if live {
+                                // One forward per run (per page address); the proxy follows it.
+                                let fwd = if d.ap.bound.as_ref().is_some_and(|b| b.1 == page) { None } else { Some((page.as_str(), 80)) };
+                                d.ap.joining = Some((name.clone(), page.clone()));
+                                d.ap.open_when_up = true;
+                                d.ap.error = None;
+                                if let Some((addr, _)) = d.ap.bound.clone() {
+                                    if let Some(p) = d.ap.proxy() {
+                                        p.set_target(Some(addr), &page);
+                                    }
+                                }
+                                d.ap.next_poll = None;
+                                if let Err(e) = d.backend.control(crate::hotspot::client_message(Some(&name), pw, fwd)) {
+                                    d.ap.error = Some(e.to_string());
+                                }
+                                lab_msg = Some(format!("device hotspot: joining \"{name}\""));
+                            } else {
                                 let host_port = d.hotspot.as_ref().map(|p| p.host_port).filter(|&p| bind_is_free("127.0.0.1", p)).or_else(free_local_port).unwrap_or(18480);
-                                d.hotspot = Some(crate::hotspot::Plan { ssid: ssid.trim().to_string(), password: pw.clone(), host_port, guest_ip: ip.trim().to_string(), guest_port: 80 });
+                                d.hotspot = Some(crate::hotspot::Plan { ssid: name, password: pw.clone(), host_port, guest_ip: page, guest_port: 80 });
                                 restart = true;
                             }
-                            if d.hotspot.is_some() && ui.button("Leave hotspot").on_hover_text("Back to the normal Wi-Fi at the next power-on").clicked() {
-                                d.hotspot = None;
-                                d.hotspot_open_at = None;
+                        }
+                        if let Some(url) = d.ap.proxy.as_ref().filter(|p| p.target().is_some()).map(|p| p.url()) {
+                            if ui.small_button("Open page").on_hover_text(url.clone()).clicked() {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
                             }
-                        });
+                        }
+                        if (d.hotspot.is_some() || d.ap.joining.is_some()) && ui.button("Leave hotspot").on_hover_text("Stop using the device's hotspot (back to the normal Wi-Fi at the next power-on)").clicked() {
+                            d.hotspot = None;
+                            d.hotspot_open_at = None;
+                            d.ap.joining = None;
+                            d.ap.open_when_up = false;
+                        }
+                    });
+                    if let Some(e) = &d.ap.error {
+                        ui.label(RichText::new(format!("Engine: {e}")).small().color(Color32::from_rgb(240, 120, 100)));
                     }
-                    if d.hotspot_ssids.is_empty() {
-                        ui.label(RichText::new("No hotspot announced in this run's log yet.").small().weak());
+                    if let Some(st) = d.ap.status.as_ref().and_then(|s| s.phone.as_ref()).filter(|_| d.ap.joining.is_some()) {
+                        ui.label(RichText::new(st.progress()).small().weak());
+                    }
+                    if !live {
+                        ui.label(RichText::new("The live link is off, so joining restarts the device.").small().weak());
                     }
                 });
+            if let Some(m) = lab_msg {
+                d.lab(m);
+            }
         }
         if let Some(j) = job {
             d.start_improv(j);
@@ -2841,6 +3020,7 @@ impl CydLabApp {
         d.link_up = false;
         d.improv = ImprovUi::default();
         d.hotspot_ssids.clear();
+        d.ap.new_run();
         d.hotspot_open_at = open.then(|| Instant::now() + Duration::from_secs(10));
         if let Err(e) = r {
             d.lab(format!("restart failed: {e:#}"));

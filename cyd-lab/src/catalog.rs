@@ -268,6 +268,12 @@ pub enum Spec {
 }
 
 impl Catalog {
+    /// The catalogue's first-setup details for a hotspot name (its password and page), if a
+    /// firmware's `first_setup.hotspot` pattern fits it.
+    pub fn hotspot_setup(&self, ssid: &str) -> Option<&FirstSetup> {
+        self.entries.iter().filter_map(|e| e.first_setup.as_ref()).find(|f| !f.hotspot.is_empty() && crate::hotspot::ssid_matches(&f.hotspot, ssid))
+    }
+
     pub fn parse(text: &str) -> Result<Catalog> {
         let v: toml::Value = toml::from_str(text).context("catalogue is not valid TOML")?;
         let schema = v.get("schema_version").and_then(|s| s.as_integer()).ok_or_else(|| anyhow!("catalogue has no schema_version"))?;
