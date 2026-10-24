@@ -314,6 +314,36 @@ struct DeviceView {
     wifi_ap: crate::network::WifiDetails,
     /// Show the Wi-Fi password in the Network section.
     show_password: bool,
+    /// Improv Wi-Fi over serial: detection, the last session and its result.
+    improv: ImprovUi,
+    /// Access point names the firmware announced in this run (its setup hotspot).
+    hotspot_ssids: Vec<String>,
+    /// "Device hotspot": join this network at the next power-on (needs a newer engine).
+    hotspot: Option<crate::hotspot::Plan>,
+    /// Open the hotspot's setup page in the browser once the restarted run is up.
+    hotspot_open_at: Option<Instant>,
+    /// The "Device hotspot" form: network name, password, page address.
+    hotspot_form: (String, String, String),
+    /// After installing a firmware with a first-setup guide (the Home Assistant entry):
+    /// its id, shown as a step card until dismissed.
+    setup_card: Option<String>,
+}
+
+/// Improv Wi-Fi state for one device (see `crate::improv`).
+#[derive(Default)]
+struct ImprovUi {
+    rx: Option<std::sync::mpsc::Receiver<crate::improv::Event>>,
+    /// "probe" or "provision" while a session runs.
+    busy: Option<&'static str>,
+    state: Option<crate::improv::State>,
+    error: Option<u8>,
+    /// Firmware name, version, chip, device name.
+    info: Vec<String>,
+    url: Option<String>,
+    outcome: Option<Result<String, String>>,
+    /// Automatic "request current state" after power-on.
+    probe_at: Option<Instant>,
+    probes_left: u8,
 }
 
 /// Firmware queued for flash.bin. Applied once the engine is stopped (it owns the file
@@ -412,6 +442,12 @@ impl DeviceView {
             wifi_watch: Default::default(),
             wifi_ap: Default::default(),
             show_password: false,
+            improv: ImprovUi::default(),
+            hotspot_ssids: Vec::new(),
+            hotspot: None,
+            hotspot_open_at: None,
+            hotspot_form: (String::new(), String::new(), crate::hotspot::GUEST_AP_IP.to_string()),
+            setup_card: None,
         }
     }
 
@@ -471,9 +507,72 @@ impl DeviceView {
         }
         let what = format!("{} {}", if p.name.is_empty() { "firmware" } else { &p.name }, p.version);
         if p.improv {
-            self.lab("web install: this firmware offers Improv Wi-Fi setup over serial; cyd-lab doesn't do that step, use the firmware's own setup (e.g. its access point or web UI).");
+            self.lab(format!("{}: this firmware offers Improv Wi-Fi setup over serial: once it has booted, use \"Send Wi-Fi details\" (Wi-Fi setup row).", self.job_label));
         }
         self.queue_flash(p.erase, p.parts, what.trim().to_string(), true);
+    }
+
+    /// Start an Improv session on the device's serial port.
+    fn start_improv(&mut self, job: crate::improv::Job) {
+        let kind = match job {
+            crate::improv::Job::Probe => "probe",
+            crate::improv::Job::Provision { .. } => "provision",
+        };
+        match self.backend.improv(job) {
+            Ok(rx) => {
+                self.improv.rx = Some(rx);
+                self.improv.busy = Some(kind);
+                if kind == "provision" {
+                    self.improv.outcome = None;
+                    self.improv.error = None;
+                }
+            }
+            Err(e) if kind == "provision" => self.improv.outcome = Some(Err(e)),
+            Err(_) => {}
+        }
+    }
+
+    fn poll_improv(&mut self) {
+        use crate::improv::Event;
+        let running = matches!(self.backend.state(), RunState::Running(_));
+        if !running {
+            self.improv.probe_at = None;
+        }
+        if let Some(rx) = &self.improv.rx {
+            let evs: Vec<Event> = rx.try_iter().collect();
+            for ev in evs {
+                match ev {
+                    Event::State(s) => self.improv.state = Some(s),
+                    Event::Error(e) => self.improv.error = Some(e),
+                    Event::Info(v) => self.improv.info = v,
+                    Event::Url(u) => self.improv.url = Some(u),
+                    Event::Done(r) => {
+                        let kind = self.improv.busy.take();
+                        self.improv.rx = None;
+                        match (kind, r) {
+                            (Some("provision"), Ok(m)) => {
+                                self.lab(format!("Wi-Fi setup (Improv): {m}"));
+                                self.improv.outcome = Some(Ok(m));
+                            }
+                            (Some("provision"), Err(e)) => {
+                                self.lab(format!("Wi-Fi setup (Improv) failed: {e}"));
+                                self.improv.outcome = Some(Err(e));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        // Stop probing once the firmware answered (or a session is running).
+        if self.improv.state.is_some() {
+            self.improv.probe_at = None;
+        }
+        if self.improv.busy.is_none() && self.improv.probe_at.is_some_and(|t| Instant::now() >= t) {
+            self.improv.probes_left = self.improv.probes_left.saturating_sub(1);
+            self.improv.probe_at = (self.improv.probes_left > 0).then(|| Instant::now() + Duration::from_secs(9));
+            self.start_improv(crate::improv::Job::Probe);
+        }
     }
 
     fn queue_flash(&mut self, erase: bool, parts: Vec<(u64, Vec<u8>, String)>, what: String, power_on_after: bool) {
@@ -576,6 +675,12 @@ impl DeviceView {
         }
         let line = strip_ansi(&line);
         if stream != Stream::Lab {
+            if let Some(st) = crate::improv::sniff_console(&line) {
+                self.improv.state = Some(st);
+            }
+            if let Some(ssid) = crate::hotspot::sniff_ssid(&line) {
+                crate::hotspot::remember(&mut self.hotspot_ssids, ssid);
+            }
             let before = self.wifi_watch.banner.clone();
             self.wifi_watch.feed(&line, &self.wifi_ap);
             if self.wifi_watch.banner != before {
@@ -1024,6 +1129,10 @@ impl CydLabApp {
         let (net_args, notes) = crate::network::engine_args(&self.devices[i].dev.meta.network, &self.settings.wifi, features.net(), &bind_is_free);
         spec.args.extend(net_args);
         spec.notes.extend(notes);
+        if let Some(plan) = self.devices[i].hotspot.as_ref().filter(|_| features.ap_client) {
+            spec.args.extend(plan.args());
+            spec.notes.push(format!("joining the firmware's hotspot \"{}\"; its page at {}", plan.ssid, plan.url()));
+        }
         #[cfg(windows)]
         if let Some(com) = self.devices[i].dev.meta.com_port.as_ref().filter(|_| self.settings.engine.com_bridge) {
             match serial {
@@ -1049,7 +1158,18 @@ impl CydLabApp {
             }
             r
         });
+        let bridged = cfg!(windows) && self.settings.engine.com_bridge && self.devices[i].dev.meta.com_port.is_some();
+        let hotspot_ok = self.engine_features().ap_client;
         let d = &mut self.devices[i];
+        d.improv = ImprovUi::default();
+        d.hotspot_ssids.clear();
+        if r.is_ok() && boot == BootMode::Normal && !bridged {
+            // Auto-detect Improv: "request current state" once the firmware has booted.
+            // Each try briefly takes the serial port, so not while a COM bridge relays it.
+            d.improv.probe_at = Some(Instant::now() + Duration::from_secs(6));
+            d.improv.probes_left = 2;
+        }
+        d.hotspot_open_at = (r.is_ok() && hotspot_ok && d.hotspot.is_some()).then(|| Instant::now() + Duration::from_secs(10));
         d.wifi_ap = d.dev.meta.network.effective(&self.settings.wifi);
         d.wifi_watch = Default::default();
         d.link_up = false;
@@ -1138,6 +1258,17 @@ impl CydLabApp {
                         }
                     }
                 }
+            }
+            d.poll_improv();
+            if d.hotspot_open_at.is_some_and(|t| Instant::now() >= t) {
+                d.hotspot_open_at = None;
+                if let Some(url) = d.hotspot.as_ref().map(|p| p.url()) {
+                    d.lab(format!("device hotspot: opening {url}"));
+                    ctx.open_url(egui::OpenUrl::new_tab(url));
+                }
+            }
+            if d.improv.busy.is_some() || d.improv.probe_at.is_some() || d.hotspot_open_at.is_some() {
+                ctx.request_repaint_after(Duration::from_millis(250));
             }
             if let Some(f) = d.backend.take_frame() {
                 let img = egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &f.rgba);
@@ -1752,6 +1883,7 @@ impl CydLabApp {
         });
         self.serial_bridge_ui(ui, i, alive, &features);
         self.network_ui(ui, i, alive, &features);
+        self.wifi_setup_ui(ui, i, alive, &features);
         ui.separator();
 
         // --- controls
@@ -1911,6 +2043,186 @@ impl CydLabApp {
             ui.separator();
             ui.vertical(|ui| self.console_ui(ui, i));
         });
+    }
+
+    /// Wi-Fi setup for firmware that asks for it: Improv over serial ("Send Wi-Fi details")
+    /// and the firmware's own setup hotspot ("Device hotspot").
+    fn wifi_setup_ui(&mut self, ui: &mut egui::Ui, i: usize, alive: bool, features: &EngineFeatures) {
+        use crate::improv::State;
+        let wifi = self.devices[i].dev.meta.network.effective(&self.settings.wifi);
+        let wifi_on = self.devices[i].dev.meta.network.wifi;
+        let mut job = None;
+        let mut restart = false;
+        let d = &mut self.devices[i];
+        let serial = d.backend.capabilities().serial_tcp.filter(|_| alive);
+        let waiting = d.improv.state == Some(State::Ready) && d.improv.busy != Some("provision") && !matches!(d.improv.outcome, Some(Ok(_)));
+        let send_tip = if !wifi_on {
+            "Wi-Fi is off for this device (Network section)".to_string()
+        } else {
+            format!("Sends this device's Wi-Fi network (\"{}\", set under Network) to the firmware over its USB serial port, the way ESPHome Web or WLED's installer do it (Improv Wi-Fi). Takes up to a minute.", wifi.ssid)
+        };
+        let send_enabled = serial.is_some() && wifi_on && d.improv.busy.is_none();
+        let provision = crate::improv::Job::Provision { ssid: wifi.ssid.clone(), password: wifi.password.clone() };
+        if waiting {
+            egui::Frame::new().fill(Color32::from_rgb(90, 60, 10)).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("This firmware is waiting for Wi-Fi setup:").color(Color32::WHITE));
+                    if ui.add_enabled(send_enabled, egui::Button::new("Send Wi-Fi details")).on_hover_text(&send_tip).clicked() {
+                        job = Some(provision.clone());
+                    }
+                });
+            });
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Wi-Fi setup:").small());
+            if !waiting && ui.add_enabled(send_enabled, egui::Button::new(RichText::new("Send Wi-Fi details").small())).on_hover_text(&send_tip).on_disabled_hover_text(if serial.is_none() { "Power the device on first (needs the engine's serial port)" } else { send_tip.as_str() }).clicked() {
+                job = Some(provision.clone());
+            }
+            if ui
+                .add_enabled(serial.is_some() && d.improv.busy.is_none(), egui::Button::new(RichText::new("Check").small()))
+                .on_hover_text("Asks the firmware over serial whether it supports Wi-Fi setup (Improv) and what state it is in. Briefly takes the serial port: a connected tool is disconnected.")
+                .clicked()
+            {
+                job = Some(crate::improv::Job::Probe);
+            }
+            let status = match (d.improv.busy, d.improv.state) {
+                (Some("provision"), Some(s)) => format!("sending… firmware: {}", s.label()),
+                (Some("provision"), None) => "sending…".into(),
+                (Some(_), _) => "asking the firmware…".into(),
+                (None, Some(s)) => format!("firmware: {}", s.label()),
+                (None, None) if alive && d.improv.probe_at.is_some() => "checking after boot…".into(),
+                (None, None) if alive => "no Improv answer (the firmware may use a hotspot or its own menu instead)".into(),
+                (None, None) => "power on to check".into(),
+            };
+            if d.improv.busy.is_some() {
+                ui.spinner();
+            }
+            ui.label(RichText::new(status).small().weak());
+        });
+        if !d.improv.info.is_empty() {
+            ui.label(RichText::new(format!("  {}", d.improv.info.join(" · "))).small().weak());
+        }
+        match d.improv.outcome.clone() {
+            Some(Ok(m)) => {
+                let forwards: Vec<(u16, u16)> = d.dev.meta.network.active_forwards().iter().map(|f| (f.host, f.guest)).collect();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("  ✔ {m}")).small().color(Color32::LIGHT_GREEN));
+                    if let Some(url) = d.improv.url.clone() {
+                        match crate::improv::local_url(&url, &forwards) {
+                            Some(local) => {
+                                ui.hyperlink_to(RichText::new(format!("open {local}")).small(), local).on_hover_text(format!("The firmware reported {url} (its address on the emulated network), published on this PC."));
+                            }
+                            None => {
+                                ui.label(RichText::new(format!("(it reported {url}, its address inside the emulator: publish port {} under Network to open it here)", url_port(&url))).small().weak());
+                            }
+                        }
+                    }
+                });
+            }
+            Some(Err(e)) => {
+                ui.label(RichText::new(format!("  ✖ {e}")).small().color(Color32::from_rgb(240, 120, 100)));
+            }
+            None => {}
+        }
+        if let Some(err) = d.improv.error.filter(|_| d.improv.outcome.is_none()) {
+            ui.label(RichText::new(format!("  firmware error: {}", crate::improv::error_label(err))).small().weak());
+        }
+
+        // Device hotspot (needs the engine's --ap-client/--ap-fwd).
+        let hs_state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("hotspot", i)), false);
+        hs_state
+            .show_header(ui, |ui| {
+                let t = match (&d.hotspot, d.hotspot_ssids.len()) {
+                    (Some(p), _) if features.ap_client => format!("Device hotspot: joined \"{}\" → {}", p.ssid, p.url()),
+                    (_, 0) => "Device hotspot".to_string(),
+                    (_, n) => format!("Device hotspot: firmware announced {n} network{}", if n == 1 { "" } else { "s" }),
+                };
+                ui.label(RichText::new(t).small());
+                if !features.ap_client {
+                    ui.label(RichText::new("needs newer engine").small().color(Color32::from_rgb(230, 180, 60)))
+                        .on_hover_text("Joining the firmware's own setup hotspot needs an engine with --ap-client and --ap-fwd (being added). Until then use Send Wi-Fi details if the firmware supports it, or set its Wi-Fi another way.");
+                }
+            })
+            .body(|ui| {
+                ui.label(RichText::new("Many firmwares start their own Wi-Fi network for first setup (openHASP HASP-xxxxxx, Tasmota tasmota-xxxxxx, WLED-AP, ESPHome's fallback hotspot) with a setup page at 192.168.4.1. cyd-lab can join it for you and open that page here.").small().weak());
+                ui.add_enabled_ui(features.ap_client, |ui| {
+                    let (ssid, pw, ip) = &mut d.hotspot_form;
+                    if ssid.is_empty() {
+                        if let Some(first) = d.hotspot_ssids.first() {
+                            *ssid = first.clone();
+                        }
+                    }
+                    egui::Grid::new(("hs-grid", i)).num_columns(2).show(ui, |ui| {
+                        ui.label(RichText::new("Network").small());
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(ssid).desired_width(170.0).hint_text("e.g. HASP-1A2B3C"));
+                            if !d.hotspot_ssids.is_empty() {
+                                egui::ComboBox::from_id_salt(("hs-seen", i)).selected_text(RichText::new("seen").small()).show_ui(ui, |ui| {
+                                    for s in &d.hotspot_ssids {
+                                        if ui.selectable_label(ssid == s, s).clicked() {
+                                            *ssid = s.clone();
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                        ui.end_row();
+                        ui.label(RichText::new("Password").small());
+                        ui.add(egui::TextEdit::singleline(pw).password(true).desired_width(170.0).hint_text("blank if open"));
+                        ui.end_row();
+                        ui.label(RichText::new("Page at").small());
+                        ui.add(egui::TextEdit::singleline(ip).desired_width(110.0)).on_hover_text("192.168.4.1 for most firmwares, 4.3.2.1 for WLED");
+                        ui.end_row();
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!ssid.trim().is_empty(), egui::Button::new("Connect & open setup page")).on_hover_text("Restarts the device joined to that network and opens its setup page in your browser (served on 127.0.0.1 only).").clicked() {
+                            let host_port = d.hotspot.as_ref().map(|p| p.host_port).filter(|&p| bind_is_free("127.0.0.1", p)).or_else(free_local_port).unwrap_or(18480);
+                            d.hotspot = Some(crate::hotspot::Plan { ssid: ssid.trim().to_string(), password: pw.clone(), host_port, guest_ip: ip.trim().to_string(), guest_port: 80 });
+                            restart = true;
+                        }
+                        if d.hotspot.is_some() && ui.button("Leave hotspot").on_hover_text("Back to the normal Wi-Fi at the next power-on").clicked() {
+                            d.hotspot = None;
+                            d.hotspot_open_at = None;
+                        }
+                    });
+                });
+                if d.hotspot_ssids.is_empty() {
+                    ui.label(RichText::new("No hotspot announced in this run's log yet.").small().weak());
+                }
+            });
+        if let Some(j) = job {
+            d.start_improv(j);
+        }
+        if restart {
+            self.restart_device(i);
+        }
+    }
+
+    /// Power-cycle (or power on) with a fresh command line, e.g. after joining a hotspot.
+    fn restart_device(&mut self, i: usize) {
+        if !matches!(self.devices[i].backend.state(), RunState::Running(_)) {
+            return self.power_on(i, false);
+        }
+        let r = self.launch_spec(i, BootMode::Normal).and_then(|spec| {
+            let port = spec.web_port;
+            let r = self.devices[i].backend.restart(spec);
+            if r.is_err() {
+                if let Some(p) = port {
+                    engine::release_port(p);
+                }
+            }
+            r
+        });
+        let open = self.devices[i].hotspot.is_some() && self.engine_features().ap_client;
+        let d = &mut self.devices[i];
+        d.link_up = false;
+        d.improv = ImprovUi::default();
+        d.hotspot_ssids.clear();
+        d.hotspot_open_at = open.then(|| Instant::now() + Duration::from_secs(10));
+        if let Err(e) = r {
+            d.lab(format!("restart failed: {e:#}"));
+        }
     }
 
     /// Per-device serial settings: TCP port for `--serial-tcp`, the planned COM name,
@@ -2512,4 +2824,14 @@ mod tests {
         assert!(!partial.engine.realtime);
         assert!(partial.engine.live_link);
     }
+}
+
+/// The port in an http URL (80 if none).
+fn url_port(url: &str) -> u16 {
+    url.split_once("://").map(|(_, r)| r.split('/').next().unwrap_or("")).and_then(|h| h.rsplit_once(':')).and_then(|(_, p)| p.parse().ok()).unwrap_or(80)
+}
+
+/// A free TCP port on 127.0.0.1 (for a forwarded setup page).
+fn free_local_port() -> Option<u16> {
+    std::net::TcpListener::bind(("127.0.0.1", 0)).ok().and_then(|l| l.local_addr().ok()).map(|a| a.port())
 }

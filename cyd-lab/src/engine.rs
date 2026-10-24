@@ -167,6 +167,9 @@ pub struct EngineFeatures {
     pub hostfwd: bool,
     /// `--mdns-relay`: answer/forward mDNS between the LAN and the NAT'd chip.
     pub mdns_relay: bool,
+    /// `--ap-client` + `--ap-fwd`: join the firmware's own setup hotspot and forward its page
+    /// (being added to the engine; detected from `--help` only).
+    pub ap_client: bool,
 }
 
 impl EngineFeatures {
@@ -187,6 +190,7 @@ impl EngineFeatures {
             wifi: has("--wifi"),
             hostfwd: has("--hostfwd"),
             mdns_relay: has("--mdns-relay"),
+            ap_client: help.contains("--ap-client") && help.contains("--ap-fwd"),
         }
     }
 
@@ -299,6 +303,11 @@ pub trait Backend: Send {
     /// EN with a strap change, in-process: pulse the auto-reset lines on the engine's
     /// RFC 2217 port (EN low, then IO0 low for download). `Err` without `--serial-tcp`.
     fn strap_reset(&mut self, _boot: BootMode) -> std::result::Result<(), String> {
+        Err("needs the engine's --serial-tcp".into())
+    }
+    /// Talk Improv Wi-Fi over UART0 (the `--serial-tcp` port): see [`crate::improv`].
+    /// Events arrive on the returned channel; chip output keeps going to the console.
+    fn improv(&mut self, _job: crate::improv::Job) -> std::result::Result<std::sync::mpsc::Receiver<crate::improv::Event>, String> {
         Err("needs the engine's --serial-tcp".into())
     }
     /// The BOOT button as a live input: GPIO0 low while held (WebSocket `btn`, pin 0).
@@ -959,6 +968,15 @@ impl Backend for ProcessBackend {
             if boot == BootMode::Download { "download mode" } else { "normal boot" }
         ));
         Ok(())
+    }
+
+    fn improv(&mut self, job: crate::improv::Job) -> std::result::Result<std::sync::mpsc::Receiver<crate::improv::Event>, String> {
+        let Some(port) = self.serial_tcp.filter(|_| self.child.is_some()) else {
+            return Err("needs the engine's --serial-tcp".into());
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::improv::start(port, job, self.tx.clone(), self.waker.clone(), tx).map_err(|e| format!("serial port {port}: {e}"))?;
+        Ok(rx)
     }
 
     fn set_boot_pin(&mut self, low: bool) -> std::result::Result<(), TouchError> {

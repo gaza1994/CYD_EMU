@@ -174,7 +174,7 @@ pub fn prepare(src: &str, erase_choice: bool, flash_size: u64, progress: &mut dy
         if m.name.is_empty() { "firmware" } else { &m.name },
         m.version,
         build.parts.len(),
-        if build.improv { ", improv Wi-Fi setup (not done by cyd-lab)" } else { "" }
+        if build.improv { ", Wi-Fi setup over serial (Improv): use Send Wi-Fi details after it boots" } else { "" }
     ));
     let mut parts = Vec::new();
     for p in &build.parts {
