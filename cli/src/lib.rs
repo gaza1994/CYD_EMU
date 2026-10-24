@@ -30,6 +30,7 @@ fn help(chip: &str, code: i32) -> ! {
     eprintln!("  --tft-png F, --wav F  save the display / the audio at the end of the run");
     eprintln!("  --web PORT            serve the board UI at http://127.0.0.1:PORT/ in real time");
     eprintln!("  --serial-tcp PORT     UART0 at 127.0.0.1:PORT, raw or RFC 2217 with DTR/RTS auto-reset (esptool rfc2217://)");
+    eprintln!("  --quit-on-stdin-eof   save (--flash-file) and exit 0 when stdin closes; the page's {{\"t\":\"quit\"}} does the same");
     eprintln!("  --elf F               symbols for logs, traces and profiles (repeatable)");
     eprintln!("  --trace-fn PREFIX, --break PC, --watch ADDR, --peek ADDR,N, --profile, --vcd F, --debug AREAS, --no-jit");
     eprintln!("                        debugging; --no-jit is the oracle when a result looks wrong");
@@ -48,34 +49,63 @@ fn apply_adc_raw<S: Soc>(m: &mut Machine<S>, specs: &[(u8, u16)]) {
     }
 }
 
-/// `SIGINT`/`SIGTERM` as a flag rather than a kill: a run that owns a persistent flash file
-/// (`--flash-file`) has to write it out before it leaves. The handler only sets the flag — nothing
-/// else is safe there — and the run loop polls it between chunks. A run without a flash file
-/// installs nothing and is killed exactly as before.
-#[cfg(unix)]
+/// `SIGINT`/`SIGTERM` (Windows: Ctrl-C, Ctrl-Break, closing the console) as a flag rather than a
+/// kill: a run that owns a persistent flash file (`--flash-file`) has to write it out before it
+/// leaves. The handler only sets the flag — nothing else is safe there — and the run loop polls it
+/// between chunks; `request` is the same flag for a quit that is not a signal (stdin at EOF). A run
+/// that polls nothing installs nothing and is killed exactly as before.
 mod interrupt {
     use std::sync::atomic::{AtomicBool, Ordering};
-    const SIGINT: i32 = 2;
-    const SIGTERM: i32 = 15;
     static PENDING: AtomicBool = AtomicBool::new(false);
-    // `SIG_DFL` is 0 in every libc we build against, so the handler is installed and restored as a
-    // plain address and the handler can put the default disposition back by itself.
-    extern "C" { fn signal(signum: i32, handler: usize) -> usize; }
-    extern "C" fn note(signum: i32) {
-        PENDING.store(true, Ordering::SeqCst);
-        // Installing a handler replaced the default disposition, so a second Ctrl-C would be swallowed
-        // by a run that is stuck (a blocked accept, a write that cannot finish). One signal asks for a
-        // clean save and exit; the next one kills the process, as it would without this module.
-        unsafe { signal(signum, 0) };
-    }
-    pub fn install() { unsafe { signal(SIGINT, note as *const () as usize); signal(SIGTERM, note as *const () as usize); } }
+    pub fn request() { PENDING.store(true, Ordering::SeqCst) }
     pub fn pending() -> bool { PENDING.load(Ordering::SeqCst) }
-}
 
-#[cfg(not(unix))]
-mod interrupt {
+    /// `--quit-on-stdin-eof`: a front end that owns our stdin closes it (or dies) to ask for a save
+    /// and quit, which works the same on every platform. Anything read is discarded.
+    pub fn on_stdin_eof() {
+        std::thread::spawn(|| {
+            use std::io::Read;
+            let (mut stdin, mut buf) = (std::io::stdin(), [0u8; 256]);
+            while matches!(stdin.read(&mut buf), Ok(n) if n > 0) {}
+            request();
+        });
+    }
+
+    #[cfg(unix)]
+    pub fn install() {
+        const SIGINT: i32 = 2;
+        const SIGTERM: i32 = 15;
+        // `SIG_DFL` is 0 in every libc we build against, so the handler is installed and restored as a
+        // plain address and the handler can put the default disposition back by itself.
+        extern "C" { fn signal(signum: i32, handler: usize) -> usize; }
+        extern "C" fn note(signum: i32) {
+            super::interrupt::request();
+            // Installing a handler replaced the default disposition, so a second Ctrl-C would be swallowed
+            // by a run that is stuck (a blocked accept, a write that cannot finish). One signal asks for a
+            // clean save and exit; the next one kills the process, as it would without this module.
+            unsafe { signal(signum, 0) };
+        }
+        unsafe { signal(SIGINT, note as *const () as usize); signal(SIGTERM, note as *const () as usize); }
+    }
+
+    #[cfg(windows)]
+    pub fn install() {
+        #[link(name = "kernel32")]
+        extern "system" { fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32; }
+        // Runs on a thread of its own. Ctrl-C / Ctrl-Break (0, 1): the first asks for the save, a second
+        // falls through to the default handler, which ends the process. Close, logoff, shutdown (2, 5, 6)
+        // end the process as soon as this returns, so it holds on (Windows allows about 5 s) while the run
+        // loop saves and exits.
+        unsafe extern "system" fn note(ctrl: u32) -> i32 {
+            if PENDING.swap(true, Ordering::SeqCst) && ctrl < 2 { return 0; }
+            if ctrl >= 2 { std::thread::sleep(std::time::Duration::from_secs(10)); }
+            1
+        }
+        unsafe { SetConsoleCtrlHandler(Some(note), 1); }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     pub fn install() {}
-    pub fn pending() -> bool { false }
 }
 
 fn timing_cycles(value: &str, name: &str) -> Result<u32, String> {
@@ -136,7 +166,7 @@ pub struct Opts {
     pub board: String, pub wifi: Option<String>, pub wifi_nearby: Vec<String>, pub ble: bool, pub ble_full: bool, pub ble_observe: bool, pub ble_scan: bool, pub net: String, pub cam_image: Option<String>, pub cam_stream: Option<String>, pub cam_size: Option<String>, pub cam_fps: f64,
     pub spi2_timing: bool, pub measured_te: bool,
     pub max_insns: u64, pub max_seconds: Option<f64>, pub script: Option<String>, pub serial: Option<String>,
-    pub console: Option<String>, pub console_prefix: bool, pub realtime: bool, pub web_port: Option<u16>, pub web_dir: Option<String>, pub no_reboot: bool, pub serial_tcp: Option<String>,
+    pub console: Option<String>, pub console_prefix: bool, pub realtime: bool, pub web_port: Option<u16>, pub web_dir: Option<String>, pub no_reboot: bool, pub serial_tcp: Option<String>, pub quit_on_stdin_eof: bool,
     pub i2s_tone: Vec<String>,
     pub wav: Option<String>, pub tft_png: Option<String>, pub gram_png: Option<String>, pub dump: bool,
     pub trace: bool, pub trace_from: u64, pub breaks: Vec<u32>, pub watch: Option<u32>, pub peeks: Vec<(u32, usize)>, pub pwm_pins: Vec<u8>, pub adc_pins: Vec<u8>, pub adc_raw: Vec<(u8, u16)>, pub disasms: Vec<(u32, usize)>,
@@ -203,6 +233,7 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--web" => o.web_port = Some(next().parse().expect("port")),
             "--web-dir" => o.web_dir = Some(next()),
             "--serial-tcp" => o.serial_tcp = Some(next()),
+            "--quit-on-stdin-eof" => o.quit_on_stdin_eof = true,
             "--no-reboot" => o.no_reboot = true,
             "--i2s-tone" => o.i2s_tone.push(next()),
             "--wav" => o.wav = Some(next()),
@@ -489,15 +520,21 @@ fn run<S: Soc>(mut m: Machine<S>, o: &Opts) {
     let boot = prepare(&mut m, o);
     let t0 = std::time::Instant::now();
     m.web_restart = !o.no_reboot;
-    // A run that saves its flash has to survive a signal long enough to save it.
-    let signal_poll = o.flash_file.is_some();
+    // A run that saves its flash has to survive a signal long enough to save it; a web or serial run
+    // and --quit-on-stdin-eof are asked to quit by a front end that may own the flash file.
+    let signal_poll = o.flash_file.is_some() || o.web_port.is_some() || o.serial_tcp.is_some() || o.quit_on_stdin_eof;
     if signal_poll { interrupt::install(); }
-    let stop = run_with_reboots(&mut m, o.max_insns, !o.no_reboot && boot == "rom", boot == "app", signal_poll);
+    if o.quit_on_stdin_eof { interrupt::on_stdin_eof(); }
+    // A log line to a closed pipe (the front end died) panics in eprintln!: the run is given up but
+    // the flash is still written, before anything else is printed.
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+        run_with_reboots(&mut m, o.max_insns, !o.no_reboot && boot == "rom", boot == "app", signal_poll)));
     let dt = t0.elapsed().as_secs_f64();
-    let interrupted = signal_poll && interrupt::pending();
-    if interrupted { eprintln!("[emu] signal: stopping to write the flash image"); }
-    report(&mut m, o, (!interrupted).then_some(stop), dt);
+    let interrupted = signal_poll && (interrupt::pending() || m.quit_requested);
     save_flash(&m, o);
+    let Ok(stop) = run else { std::process::exit(101) };
+    if interrupted { log(format_args!("[emu] {}: stopped, flash image written", if m.quit_requested { "quit" } else { "signal" })); }
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report(&mut m, o, (!interrupted).then_some(stop), dt))).is_err() { std::process::exit(101) }
     let pending = m.bus.ble_pending_commands();
     if pending != 0 { eprintln!("[ble] {pending} command(s) still pending at end of run"); }
     if let Some(model) = approximate { eprintln!("[emu] approximate timing totals: {:?}", model.stats()); }
@@ -505,7 +542,7 @@ fn run<S: Soc>(mut m: Machine<S>, o: &Opts) {
         eprintln!("[emu] approximate memory totals [internal, ROM, flash, PSRAM, MMIO]: {:?}", model.memory.borrow().stats);
         if let Some(cache) = &model.cache { eprintln!("[emu] approximate physical data cache: {:?}", cache.borrow().stats()); }
     }
-    if interrupted { std::process::exit(130); }
+    if interrupted { std::process::exit(0); }
 }
 
 /// Instructions between polls for a handled signal. Only a run with a `--flash-file` polls at all:
@@ -520,15 +557,18 @@ const SIGNAL_POLL_INSNS: u64 = 1 << 24;
 fn save_flash<S: Soc>(m: &Machine<S>, o: &Opts) {
     if o.flash_file.is_none() && o.flash_out.is_none() { return; }
     let size = m.flash_len();
-    let Some(image) = m.read_flash(0, size) else { eprintln!("[emu] flash: the model cannot report a complete image"); return };
+    let Some(image) = m.read_flash(0, size) else { log(format_args!("[emu] flash: the model cannot report a complete image")); return };
     for (path, flag) in [(o.flash_file.as_deref(), "--flash-file"), (o.flash_out.as_deref(), "--flash-out")] {
         let Some(path) = path else { continue };
         match esp_soc::flash::write(std::path::Path::new(path), image) {
-            Ok(()) => eprintln!("[emu] flash: wrote {} bytes to {} ({})", size, path, flag),
-            Err(e) => { eprintln!("{}: {}", flag, e); std::process::exit(1); }
+            Ok(()) => log(format_args!("[emu] flash: wrote {} bytes to {} ({})", size, path, flag)),
+            Err(e) => { log(format_args!("{}: {}", flag, e)); std::process::exit(1); }
         }
     }
 }
+
+/// A line on stderr that cannot panic: on the way out stderr may be a pipe nobody reads any more.
+fn log(line: std::fmt::Arguments) { use std::io::Write; let _ = writeln!(std::io::stderr(), "{line}"); }
 
 /// Run, coming back up after a chip reset where that is possible: through the ROM when it booted
 /// the run (`reboot`), and for an app-mode run (`app`) when the reset was the page's Restart — the
@@ -543,7 +583,7 @@ fn run_with_reboots<S: Soc>(m: &mut Machine<S>, mut remaining: u64, reboot: bool
         let budget = if signal_poll { remaining.min(SIGNAL_POLL_INSNS) } else { remaining };
         let stop = m.run(budget);
         remaining = remaining.saturating_sub(m.run_steps().saturating_sub(before));
-        if signal_poll && interrupt::pending() { return Stop::MaxInsns }
+        if signal_poll && (interrupt::pending() || m.quit_requested) { return Stop::MaxInsns }
         let stop = match stop {
             Stop::MaxInsns | Stop::SwReset => stop,
             // A stopped chip behind --serial-tcp stays on the line: its client's EN reset reboots it.

@@ -49,12 +49,15 @@ filesystem — lives in the same array the run boots from, so a one-shot `--flas
 exit: the next run starts from the same image again. `--flash-file F` makes the array a file:
 
 - It is loaded at start when it already holds an image, so the run begins where the previous one ended.
-- It is written back at exit, after the report, and also when `SIGINT`/`SIGTERM` interrupts the run: the
-  loop is split into chunks of 16 M instructions — about 0.2 s of emulated work at native speed — so a
-  signal is noticed within that grain, and a second signal kills the process as it would without a
-  handler. The report then says `interrupted by a signal`, and the exit status is 130. A run without
-  `--flash-file` is killed by a signal exactly as before. With `--web` the write happens when `run`
-  returns instead, so closing the page and letting the server exit is the clean way out of a web run.
+- It is written back at exit, before the report, and also when the run is asked to quit: `SIGINT`/`SIGTERM`
+  (Windows: Ctrl-C, Ctrl-Break, closing the console), a `{"t":"quit"}` message on the `--web` WebSocket, or
+  stdin reaching end of file with `--quit-on-stdin-eof` (a front end that owns the pipe closes it, or dies).
+  The loop is split into chunks of 16 M instructions — about 0.2 s of emulated work at native speed — so a
+  request is noticed within that grain, and a second signal kills the process as it would without a
+  handler. The report then says `interrupted by a signal`, and the exit status is 0. A run without
+  `--flash-file`, `--web`, `--serial-tcp` or `--quit-on-stdin-eof` is killed by a signal exactly as before.
+- Log lines cannot lose it: if stderr is a closed pipe (the front end died) the first failing line ends the
+  run, and the file is still written; the exit status is then 101.
 - It is written atomically — a `.<name>.<pid>.tmp` file in the same directory, flushed and renamed over
   the target — so a killed run leaves the previous image, never half of one.
 - The file is exactly the configured flash size (`--flash-mb`). A longer file is refused (exit status 2);

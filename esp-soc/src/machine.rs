@@ -96,6 +96,8 @@ pub struct Machine<S: Soc> {
     /// can bring the machine back up after the reset. Otherwise the message is ignored, so a run
     /// that stops at a chip reset is not ended from the page.
     pub web_restart: bool,
+    /// The page (or a front end on its WebSocket) asked the run to save and quit: `{"t":"quit"}`.
+    pub quit_requested: bool,
     button_reset: bool,
     ws: WebState,
     pub rt: Realtime,
@@ -149,7 +151,7 @@ const BB_DEFAULT: u64 = match option_env!("ESP32SIM_BB_BUILD") {
 impl<S: Soc> Machine<S> {
     pub fn new(mac: [u8; 6], bus: S::Bus) -> Self {
         Machine {
-            web_restart: false, button_reset: false, mac, reboots: 0, stubs: HashMap::new(), stub_bloom: 0, probe_bloom: 0, stub_hits: 0, fn_probes: HashMap::new(),
+            web_restart: false, quit_requested: false, button_reset: false, mac, reboots: 0, stubs: HashMap::new(), stub_bloom: 0, probe_bloom: 0, stub_hits: 0, fn_probes: HashMap::new(),
             cores: (0..S::CORES).map(|i| S::new_core_with_bus(i, &bus)).collect(), core_held: (0..S::CORES).map(|i| i > 0).collect(), quantum: QUANTUM, run_steps: 0, vq_stats: [0; 4], vq_skip: 0, vq_penalty: 0, vq_max: std::env::var("ESP32SIM_VQ").ok().and_then(|v| v.parse().ok()).unwrap_or(VQ_DEFAULT),
             bb_max: std::env::var("ESP32SIM_BB").ok().and_then(|v| v.parse().ok()).unwrap_or(BB_DEFAULT).min(4096), bb_stats: [0; 8], serial_tcp: None, serial_last: 0,
             bus, symbols: BTreeMap::new(),
@@ -1120,7 +1122,7 @@ impl<S: Soc> Machine<S> {
     /// line up until its client pulses EN, true then with the reset requested, or false once `quit`.
     pub fn serial_wait_reset(&mut self, quit: impl Fn() -> bool) -> bool {
         if self.serial_tcp.is_none() { return false; }
-        while !quit() {
+        while !quit() && !self.quit_requested {
             self.serial_poll();
             if self.web.is_some() { self.web_poll_input(); }
             if self.button_reset { return true; }

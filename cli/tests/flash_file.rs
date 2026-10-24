@@ -125,9 +125,55 @@ fn a_handled_signal_still_writes_the_flash_file() {
     let out = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
 
-    assert_eq!(out.status.code(), Some(130), "the run ends by the signal, not by its budget: {stderr}");
+    assert_eq!(out.status.code(), Some(0), "the run ends by the signal, not by its budget: {stderr}");
     assert!(stderr.contains("interrupted by a signal"), "{stderr}");
     assert_eq!(read(&flash).len(), FLASH_BYTES, "the image was written before the process left");
+}
+
+/// `--quit-on-stdin-eof`: a front end closing our stdin is a save and quit on every platform.
+#[test]
+fn stdin_eof_saves_and_quits() {
+    use std::process::{Command, Stdio};
+    let app = app_image();
+    let flash = tmp("flash.bin");
+    let mut child = Command::new(BIN)
+        .args(args(&app, &["--flash-file", flash.to_str().unwrap(), "--max-seconds", "5", "--quit-on-stdin-eof"]))
+        .current_dir(root()).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("interrupted by a signal"), "the run did not wait for its budget: {stderr}");
+    assert_eq!(read(&flash).len(), FLASH_BYTES, "{stderr}");
+}
+
+/// The front end died: stderr is a closed pipe and the next log line fails. The signal that follows
+/// (Linux's parent-death SIGTERM) still writes the flash file instead of a panic losing it.
+#[cfg(unix)]
+#[test]
+fn a_closed_stderr_does_not_lose_the_flash_file() {
+    use std::process::{Command, Stdio};
+    let app = app_image();
+    let flash = tmp("flash.bin");
+    let mut child = Command::new(BIN)
+        .args(args(&app, &["--flash-file", flash.to_str().unwrap(), "--max-seconds", "5"]))
+        .current_dir(root()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    // Up and running first (the boot line), then the reader goes away.
+    let mut first = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stderr.take().unwrap()), &mut first).unwrap();
+    assert!(first.contains("app boot"), "{first}");
+    drop(child.stdout.take());
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    let signal = Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
+    assert!(signal.success(), "kill -TERM {}", child.id());
+    let status = child.wait().unwrap();
+
+    assert!(status.code().is_some(), "ended by a signal rather than its own exit: {status:?}");
+    assert_eq!(read(&flash).len(), FLASH_BYTES, "the image was written: {status:?}");
 }
 
 /// A flash file that already holds an image is the state of the previous run: it wins over
