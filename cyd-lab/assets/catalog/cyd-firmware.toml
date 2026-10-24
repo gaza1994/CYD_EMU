@@ -1,0 +1,462 @@
+# CYD firmware catalogue for cyd-lab (Windows emulator / flasher).
+# schema_version bumps when the entry shape changes incompatibly.
+# Bundled with the app; optional refresh from a raw GitHub URL (see README).
+schema_version = 1
+updated = "2026-10-24"
+notes = """
+Verified against esp32sim --chip esp32 --board cyd (ESP32-2432S028R /
+ILI9341 / XPT2046, 4 MB, no PSRAM). Profiles list which board variants an
+entry targets; the emulator currently models only the classic ILI9341 board.
+"""
+
+[[profiles]]
+id = "cyd-2432s028r"
+name = "ESP32-2432S028R (classic)"
+chip = "esp32"
+flash_mb = 4
+psram = false
+display = "ILI9341"
+display_notes = "HSPI CLK14 MOSI13 MISO12 CS15 DC2 BL21; XPT2046 CLK25 MOSI32 MISO39 CS33 IRQ36; RGB 4/16/17; LDR 34; CH340 USB-UART"
+aliases = ["cyd", "2432S028R", "Cheap Yellow Display"]
+
+[[profiles]]
+id = "cyd-2432s028r-2usb"
+name = "ESP32-2432S028R 2-USB / USB-C"
+chip = "esp32"
+flash_mb = 4
+psram = false
+display = "ST7789"
+display_notes = "Same pins as classic; panel is ST7789 (BGR, inversion off). Emulator models ILI9341 only — UI colours / inversion will look wrong."
+aliases = ["cyd2usb", "2-USB", "USB-C"]
+
+[[profiles]]
+id = "cyd-2432s024"
+name = "ESP32-2432S024"
+chip = "esp32"
+flash_mb = 4
+psram = false
+display = "ILI9341"
+aliases = ["2432S024"]
+
+[[profiles]]
+id = "cyd-2432s032"
+name = "ESP32-2432S032"
+chip = "esp32"
+flash_mb = 4
+psram = false
+display = "ST7789"
+aliases = ["2432S032", "2432S032C"]
+
+[[profiles]]
+id = "cyd-3248s035"
+name = "ESP32-3248S035"
+chip = "esp32"
+flash_mb = 4
+psram = false
+display = "ST7796"
+aliases = ["3248S035", "3248S035C", "3248S035R"]
+
+[[profiles]]
+id = "cyd-8048s043"
+name = "ESP32-S3 8048S043 / S070"
+chip = "esp32s3"
+flash_mb = 8
+psram = true
+display = "RGB"
+aliases = ["8048S043", "8048S070", "S3 CYD"]
+notes = "Not bootable in the current emulator (classic ESP32 only)."
+
+# ---------------------------------------------------------------------------
+# Entries
+# ---------------------------------------------------------------------------
+
+[[entries]]
+id = "openhasp"
+name = "openHASP"
+description = "Home Assistant Smart Plate UI for the CYD (QR Wi-Fi setup on first boot)."
+homepage = "https://www.openhasp.com/"
+licence = "MIT"
+profiles = ["cyd-2432s028r", "cyd-2432s028r-2usb", "cyd-2432s032"]
+version = "0.7.0-rc13"
+emulator_status = "works"
+emulator_notes = "Draws Wi-Fi AP / QR screen upside-down on stock config (set rotate 2). 188 RAMWR, gs=true."
+notes = """
+Stable release ships as sunton.zip (no static ESP Web Tools manifest).
+Nightly installer at nightly.openhasp.com is currently rc12 (older than rc13).
+Also ships esp32-2432s028r-ili9342_full_4MB for the 2-USB / ST7789 board.
+"""
+[entries.source]
+type = "github-release"
+repo = "HASwitchPlate/openHASP"
+tag = "0.7.0-rc13"
+asset = "sunton.zip"
+inner = "build_output/firmware/esp32-2432s028r_full_4MB_v0.7.0-rc13_042fe05.bin"
+offset = 0
+sha256 = "09e1a01953615ca468cc609d2afc47a0167435aea0ea708bf0530214a04e8fff"
+size = 1776320
+
+[[entries]]
+id = "openhasp-nightly"
+name = "openHASP (nightly installer)"
+description = "Nightly ESP Web Tools manifest for classic CYD (currently rc12)."
+homepage = "https://www.openhasp.com/latest/devices/sunton-esp32-2432s028/"
+licence = "MIT"
+profiles = ["cyd-2432s028r"]
+version = "v0.7.0-rc12 (nightly label says v0.7.0)"
+emulator_status = "works"
+emulator_notes = "Same UI as stable; nightly bin is older than the rc13 GitHub release."
+[entries.source]
+type = "manifest"
+url = "https://nightly.openhasp.com/firmware/esp32-2432s028r_full_4MB.json"
+sha256_bin = "8b9ea17e8fa72716283c6107b5681fb1386e707a1773216ace51ebca145aec7e"
+size_bin = 1775840
+
+[[entries]]
+id = "marauder"
+name = "ESP32 Marauder"
+description = "Wi-Fi / Bluetooth offensive toolkit with on-device menu UI."
+homepage = "https://github.com/justcallmekoko/ESP32Marauder"
+licence = "MIT"
+profiles = ["cyd-2432s028r", "cyd-2432s028r-2usb", "cyd-2432s024", "cyd-3248s035"]
+version = "1.19.2"
+emulator_status = "partial"
+emulator_notes = "Shows 'ESP32 Marauder v1.19.2 Initializing...' splash then StoreProhibited loop (EXCVADDR 0x19c) after SD init failure — splash only."
+notes = """
+App-only release assets need bootloader@0x1000 + partition-table@0x8000 +
+ota-data@0xe000 from marauder-installer-assets.zip (same release). Official
+flasher https://justcallmekoko.github.io/MarauderInstaller/ is custom (not
+ESP Web Tools). Classic CYD build is IDF 4.4.5; 2usb build is IDF 5.5.1.
+Installer-zip 2usb app sha differs from the standalone release asset.
+"""
+[entries.source]
+type = "github-release"
+repo = "justcallmekoko/ESP32Marauder"
+tag = "v1.19.2"
+asset_app = "esp32_marauder_v1_19_2_20261023_cyd_2432S028.bin"
+asset_bundle = "marauder-installer-assets.zip"
+parts = [
+  { path_pattern = "esp32_marauder_*_cyd_2432S028.bootloader.bin", offset = 4096, sha256 = "0fdc7cfec9ebdeabc63484b2569488f60b2100f34b01db323b03372132b0f5f1", size = 17568 },
+  { path_pattern = "esp32_marauder_*_cyd_2432S028.partition-table.bin", offset = 32768, sha256 = "0a8b5720e7b77ff11f1462458c3a509dee79224e5279898f26d6a2e3ae0517b7", size = 3072 },
+  { path_pattern = "esp32_marauder_*_cyd_2432S028.ota-data.bin", offset = 57344, sha256 = "f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0", size = 8192 },
+  { path_pattern = "esp32_marauder_v1_19_2_*_cyd_2432S028.bin", offset = 65536, sha256 = "2174947f276c04538580a163a20e41a2b79ce08d354c5e8340fcb0da6f8c9bb3", size = 1610832 },
+]
+
+[[entries]]
+id = "bruce"
+name = "Bruce"
+description = "Multi-tool firmware (Wi-Fi, RF, BadUSB, etc.) with touch UI — CYD builds included."
+homepage = "https://bruce.computer/"
+licence = "AGPL-3.0"
+profiles = ["cyd-2432s028r", "cyd-2432s028r-2usb", "cyd-2432s024", "cyd-3248s035"]
+version = "1.16.1"
+emulator_status = "works"
+emulator_notes = "Boots to WiFi menu (neon-green UI). Firmware enables panel inversion (inverted=true); colours look wrong vs real ILI9341 if the panel does not invert."
+notes = """
+Merged factory image @0. Web flasher https://bruce.computer/flasher builds a
+blob: URL virtual manifest pointing at https://dl.bruce.computer/<tag>/Bruce-<board>.bin
+(no static manifest). Also ships LAUNCHER_ variants.
+"""
+[entries.source]
+type = "github-release"
+repo = "BruceDevices/firmware"
+tag = "1.16.1"
+asset = "Bruce-CYD-2432S028.bin"
+offset = 0
+sha256 = "b0ed2710db5dfdd7117487b624ff742860614e1c3d8095d42b39b54f4ca18924"
+size = 3648096
+cdn = "https://dl.bruce.computer/1.16.1/Bruce-CYD-2432S028.bin"
+
+[[entries]]
+id = "nerdminer"
+name = "NerdMiner v2"
+description = "Bitcoin solo-miner with CYD UI and Wi-Fi setup AP."
+homepage = "https://github.com/BitMaker-hub/NerdMiner_v2"
+licence = "MIT"
+profiles = ["cyd-2432s028r", "cyd-2432s028r-2usb", "cyd-2432s024"]
+version = "1.8.3"
+emulator_status = "works"
+emulator_notes = "Shows WAITING CONFIG / NerdMinerAP / MineYourCoins + QR (landscape in PNG)."
+notes = """
+diyflasher (bitmaker-hub.github.io/diyflasher) builds manifests dynamically
+from GitHub; its UI still lists 1.6.3 — prefer the GitHub release assets.
+"""
+[entries.source]
+type = "github-release"
+repo = "BitMaker-hub/NerdMiner_v2"
+tag = "nerdminer-release-V1.8.3"
+asset = "ESP32-2432S028R_factory.bin"
+offset = 0
+sha256 = "e7aece42f24ad7fd4146b94eeb28d04de7ce27f0c45e19be1bf38ad39ce0582c"
+size = 2224128
+
+[[entries]]
+id = "cyd-klipper"
+name = "CYD-Klipper"
+description = "Klipper touchscreen client for 3D printers, CYD-specific builds."
+homepage = "https://github.com/suchmememanyskill/CYD-Klipper"
+licence = "GPL-3.0"
+profiles = ["cyd-2432s028r", "cyd-2432s024", "cyd-2432s032", "cyd-3248s035", "cyd-8048s043"]
+version = "2.1.2"
+emulator_status = "works"
+emulator_notes = "Boots to 'Calibrate Screen' + touch target (rotated 90°). One SW reset on first run when NVS global_config is missing."
+[entries.source]
+type = "manifest"
+url = "https://suchmememanyskill.github.io/CYD-Klipper/esp32-2432S028R.json"
+parts_verified = [
+  { path = "out/esp32-2432S028R/bootloader.bin", offset = 4096, sha256 = "095bbcc7357184f68144ab40b152e2f6d68fc9d07f642c17c7888c533ddc67d3", size = 17536 },
+  { path = "out/esp32-2432S028R/partitions.bin", offset = 32768, sha256 = "148b959cbff1c38aa8e1d5c0ba9d612c54997b945e56a63f41223eef650653a1", size = 3072 },
+  { path = "out/esp32-2432S028R/boot_app0.bin", offset = 57344, sha256 = "f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0", size = 8192 },
+  { path = "out/esp32-2432S028R/firmware.bin", offset = 65536, sha256 = "fd6a954c4a2b38034ca26f1af41850f4a2473f51bc2ce118f27e56ee278f2ec1", size = 1263888 },
+]
+
+[[entries]]
+id = "wled"
+name = "WLED"
+description = "LED controller firmware (no on-device TFT UI — web / LED output only)."
+homepage = "https://kno.wled.ge/"
+licence = "EUPL-1.2"
+profiles = ["cyd-2432s028r"]
+version = "16.0.1"
+emulator_status = "works"
+emulator_notes = "Boots (Adafruit bootloader banner, Wi-Fi, RMT activity); 0 RAMWR — no TFT driver, expected."
+notes = """
+install.wled.me builds a virtual manifest in app.js — no static URL.
+Bootloader from install.wled.me is 8 MB-flagged; cyd-lab must reflag the
+header size nibble to 4 MB and recompute the appended SHA-256 (same as the
+WLED installer does client-side). Partitions: partitions_c3_4m.bin @0x8000.
+"""
+[entries.source]
+type = "github-release"
+repo = "wled/WLED"
+tag = "v16.0.1"
+parts = [
+  { url = "https://install.wled.me/bin/boot/bootloaders/esp32/bootloader_esp32_8m.bin", offset = 4096, sha256 = "dd83e828882288c738d5f8916ba74d400491e6832abd65440b91f0a03fd2308e", size = 16384, patch_flash_size_mb = 4 },
+  { url = "https://install.wled.me/bin/boot/partitions/partitions_c3_4m.bin", offset = 32768, sha256 = "ab7a19ebb0ea19e684687802f2d8f199225a270c6b7dd72d73e8a8876f382e73", size = 3072 },
+  { url = "https://github.com/wled/WLED/releases/download/v16.0.1/WLED_16.0.1_ESP32.bin", offset = 65536, sha256 = "628917b0753edcfc9a8408e6387c6d1ace6a360d315441e9563d60299fef8594", size = 1304720 },
+]
+
+[[entries]]
+id = "micropython"
+name = "MicroPython (ESP32_GENERIC)"
+description = "Official MicroPython for classic ESP32 — blank display until you load a driver."
+homepage = "https://micropython.org/download/ESP32_GENERIC/"
+licence = "MIT"
+profiles = ["cyd-2432s028r"]
+version = "1.29.0"
+emulator_status = "works"
+emulator_notes = "Reaches REPL '>>>'; 0 RAMWR (no display driver by design)."
+[entries.source]
+type = "direct"
+url = "https://micropython.org/resources/firmware/ESP32_GENERIC-20260824-v1.29.0.bin"
+offset = 4096
+sha256 = "e67ad6015a0a504c1fec9aa9bbf589d0432ed28e62546f4f8dd8a147f8bd95f6"
+size = 1790544
+
+[[entries]]
+id = "circuitpython"
+name = "CircuitPython (sunton_esp32_2432S028)"
+description = "Adafruit CircuitPython board build for the classic CYD."
+homepage = "https://circuitpython.org/board/sunton_esp32_2432S028/"
+licence = "MIT"
+profiles = ["cyd-2432s028r"]
+version = "10.3.1"
+emulator_status = "broken"
+emulator_notes = "Repeated SW_CPU_RESET (~1.8 s) after 'Serial console setup'; last bus fault write 0x19c; 0 RAMWR. USB-C board has a known display bug (adafruit/circuitpython#9151)."
+[entries.source]
+type = "direct"
+url = "https://downloads.circuitpython.org/bin/sunton_esp32_2432S028/en_GB/adafruit-circuitpython-sunton_esp32_2432S028-en_GB-10.3.1.bin"
+offset = 0
+sha256 = "7b2d14b7e5d674cd8316f94048f36bb297c8f5d608f80ca7152cd42458c66baa"
+size = 1812352
+
+[[entries]]
+id = "tasmota32-lvgl"
+name = "Tasmota32 (LVGL / HASPmota)"
+description = "Tasmota LVGL build — needs CYD template + display.ini after flash."
+homepage = "https://tasmota.github.io/docs/"
+licence = "GPL-3.0"
+profiles = ["cyd-2432s028r", "cyd-2432s028r-2usb"]
+version = "16.0.0"
+emulator_status = "partial"
+emulator_notes = "Boots WiFiManager AP (tasmota-001122-4386 @ 192.168.4.1) but 0 RAMWR until template + display.ini are applied (config-template)."
+notes = """
+Manifest size field (2722992) does not match the downloaded factory.bin
+(3640496). Apply templates/tasmota-cyd-2432s028r.md after flashing.
+"""
+[entries.source]
+type = "manifest"
+url = "https://tasmota.github.io/install/manifest_ext/release.tasmota32-lvgl.manifest.json"
+sha256_bin = "8020ccb7f0101aa9d66621f8fbc01786927d2bd161171547c5b747c52b483de8"
+size_bin = 3640496
+
+[[entries]]
+id = "tasmota-cyd-template"
+name = "Tasmota CYD template + display.ini"
+description = "Community device template and ILI9341/XPT2046 display.ini for Tasmota32-lvgl on classic CYD."
+homepage = "https://templates.blakadder.com/sunton_ESP32-2432S028.html"
+licence = "GPL-3.0"
+profiles = ["cyd-2432s028r"]
+emulator_status = "untested"
+emulator_notes = "Config only — pair with tasmota32-lvgl."
+[entries.source]
+type = "config-template"
+files = [
+  "templates/tasmota-cyd-2432s028r.md",
+  "templates/tasmota-cyd-display.ini",
+]
+
+[[entries]]
+id = "esphome-web"
+name = "ESPHome Web (generic ESP32)"
+description = "Adoption firmware from web.esphome.io — no CYD display driver."
+homepage = "https://web.esphome.io/"
+licence = "MIT / GPL-3.0 (ESPHome dual)"
+profiles = ["cyd-2432s028r"]
+version = "26.9.2"
+emulator_status = "partial"
+emulator_notes = "setup() finishes, Improv/Wi-Fi AP starts, then StoreProhibited (EXCVADDR 0x19c) on BLE enable — no TFT (expected)."
+notes = "Use esphome-cyd-starter for a CYD-aware YAML."
+[entries.source]
+type = "manifest"
+url = "https://firmware.esphome.io/esphome-web/manifest.json"
+chip_family = "ESP32"
+sha256_bin = "06eafa64a02fc54809dc712daa88822cbaefcc6789998e310dffacd0c46f2be5"
+size_bin = 1222624
+
+[[entries]]
+id = "esphome-cyd-starter"
+name = "ESPHome CYD starter YAML"
+description = "Starter config: ILI9341 + XPT2046 + RGB + LDR on classic CYD pins."
+homepage = "https://esphome.io/"
+licence = "MIT"
+profiles = ["cyd-2432s028r"]
+emulator_status = "untested"
+emulator_notes = "Config template — compile with esphome to produce a factory.bin."
+[entries.source]
+type = "config-template"
+file = "templates/esphome-cyd-2432s028r.yaml"
+
+[[entries]]
+id = "cyd-weather-dashboard"
+name = "CYD Weather Dashboard"
+description = "Self-hosted weather station dashboard with browser flasher."
+homepage = "https://github.com/HenrysCat/CYD-Weather-Dashboard"
+licence = "GPL-3.0"
+profiles = ["cyd-2432s028r"]
+version = "latest"
+emulator_status = "works"
+emulator_notes = "Wi-Fi setup portal (AP CYD-xxxx / cyd-setup) renders cleanly (landscape MADCTL 0x28, inverted=true)."
+[entries.source]
+type = "manifest"
+url = "https://henryscat.github.io/CYD-Weather-Dashboard/manifest.json"
+parts_verified = [
+  { path = "firmware/bootloader.bin", offset = 4096, sha256 = "3d234a7471f67b013686dabd4dee7c1fa915c9928463616a94bc9297acf1abf8", size = 17536 },
+  { path = "firmware/partitions.bin", offset = 32768, sha256 = "e4dc20fc5b2a9c38a746635d9127032340f944ef84e1e7fc775a771e7a536146", size = 3072 },
+  { path = "firmware/firmware.bin", offset = 65536, sha256 = "b6bbc0e823cc36a4283b7a6b20280c5698030aea94711865194c8c083d66e0d7", size = 1361856 },
+]
+
+[[entries]]
+id = "pranavek-weather"
+name = "ESP32 CYD Weather Station"
+description = "One-click weather station installer (OpenWeatherMap) with LittleFS assets."
+homepage = "https://pranavek.com/esp32-cyd-weather-station/"
+licence = "MIT"
+profiles = ["cyd-2432s028r"]
+version = "1.0.0"
+emulator_status = "works"
+emulator_notes = "Shows 'Setup needed / cyd-weather-setup / 192.168.4.1' (upside-down vs stock portrait capture)."
+[entries.source]
+type = "manifest"
+url = "https://pranavek.com/esp32-cyd-weather-station/manifest.json"
+parts_verified = [
+  { path = "firmware/bootloader.bin", offset = 4096, sha256 = "3d234a7471f67b013686dabd4dee7c1fa915c9928463616a94bc9297acf1abf8", size = 17536 },
+  { path = "firmware/partitions.bin", offset = 32768, sha256 = "148b959cbff1c38aa8e1d5c0ba9d612c54997b945e56a63f41223eef650653a1", size = 3072 },
+  { path = "firmware/boot_app0.bin", offset = 57344, sha256 = "f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0", size = 8192 },
+  { path = "firmware/firmware.bin", offset = 65536, sha256 = "ba5995c4aec1ebc4328e6cca46178f86db551fe0ee917f3b75604f4c80dd0775", size = 1086240 },
+  { path = "firmware/littlefs.bin", offset = 2686976, sha256 = "23ff385fb96977c61d75f3b2c328b6a957f29b34454d6abc73ddb2f18f15afde", size = 1441792 },
+]
+
+[[entries]]
+id = "cyd-diagnostic"
+name = "CYD Hardware Diagnostic Tool"
+description = "Identify unknown CYD boards and test display / touch / SD / RGB / LDR."
+homepage = "https://github.com/HenrysCat/ESP32-2432S028-CYD-Diagnostic-Tool"
+licence = "MIT"
+profiles = ["cyd-2432s028r"]
+version = "1.1.0"
+emulator_status = "partial"
+emulator_notes = "Console shows 'CYD Hardware Diagnostic Tool v1.1.0' and ILI9341 init; waits 6 s for tap to start wizard — black screen without touch input."
+[entries.source]
+type = "manifest"
+url = "https://henryscat.github.io/ESP32-2432S028-CYD-Diagnostic-Tool/manifest.json"
+
+[[entries]]
+id = "wm-hello-world"
+name = "CYD example: HelloWorld"
+description = "CYD Example Web Installer — Basics/1-HelloWorld for classic CYD."
+homepage = "https://witnessmenow.github.io/ESP32-Cheap-Yellow-Display/"
+licence = "MIT"
+profiles = ["cyd-2432s028r", "cyd-2432s028r-2usb"]
+emulator_status = "works"
+emulator_notes = "Draws 'Hello' / 'World' (portrait / rotated)."
+[entries.source]
+type = "manifest"
+url = "https://witnessmenow.github.io/ESP32-Cheap-Yellow-Display/Examples/Basics/1-HelloWorld/cyd/manifest.json"
+sha256_bin = "ecaa392d39899cbbf7587e7e9419c37616f8af9c23991957a8726bfa4626716e"
+size_bin = 342992
+
+[[entries]]
+id = "wm-touch-test"
+name = "CYD example: TouchTest"
+description = "CYD Example Web Installer — Basics/2-TouchTest."
+homepage = "https://witnessmenow.github.io/ESP32-Cheap-Yellow-Display/"
+licence = "MIT"
+profiles = ["cyd-2432s028r"]
+emulator_status = "works"
+emulator_notes = "Display init OK (22 RAMWR); touch feedback needs emulator touch injection."
+[entries.source]
+type = "manifest"
+url = "https://witnessmenow.github.io/ESP32-Cheap-Yellow-Display/Examples/Basics/2-TouchTest/cyd/manifest.json"
+sha256_bin = "a3a5a4094e60b44b422b5b4c55d36b07107bfe2e82939157318d30818b9cac04"
+size_bin = 374240
+
+[[entries]]
+id = "wm-lvgl9"
+name = "CYD example: LVGL9 demo"
+description = "CYD Example Web Installer — LVGL9 SquareLine-style Profile/Analytics demo."
+homepage = "https://witnessmenow.github.io/ESP32-Cheap-Yellow-Display/"
+licence = "MIT"
+profiles = ["cyd-2432s028r"]
+emulator_status = "works"
+emulator_notes = "Renders Profile/Analytics tab UI with avatar (portrait)."
+[entries.source]
+type = "manifest"
+url = "https://witnessmenow.github.io/ESP32-Cheap-Yellow-Display/Examples/LVGL9/cyd/manifest.json"
+sha256_bin = "d2f8106e647bd41a4ec3959260ff921fe22d0e18033a8228be48db9251de8753"
+size_bin = 778048
+
+# ---------------------------------------------------------------------------
+# Unsupported / not catalogued as flashable
+# ---------------------------------------------------------------------------
+
+[[unsupported]]
+id = "meshtastic"
+name = "Meshtastic"
+reason = "No official CYD target; board has no LoRa radio. Community PRIVATE_HW + external LoRa module only — not in Web Flasher."
+homepage = "https://github.com/meshtastic/firmware/discussions/9290"
+
+[[unsupported]]
+id = "sunton-factory"
+name = "Sunton / Makerfabs factory demo"
+reason = "Distributed as a one-off zip on vendor sites; no stable public URL or versioning suitable for a catalogue."
+
+[[unsupported]]
+id = "ratdeck-games"
+name = "Ratdeck / CYD games collections"
+reason = "Scattered personal repos; no single maintained release channel. Prefer the CYD web-installer examples + Bruce."
+
+[[unsupported]]
+id = "marauder-web-only"
+name = "MarauderInstaller (custom)"
+reason = "Custom flasher (not ESP Web Tools). Catalogue uses GitHub release parts instead."
+homepage = "https://justcallmekoko.github.io/MarauderInstaller/"

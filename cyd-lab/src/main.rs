@@ -15,6 +15,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod catalog;
+mod catalog_assets;
 mod arduino_setup;
 mod combridge;
 mod device;
