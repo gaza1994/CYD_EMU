@@ -1037,7 +1037,9 @@ impl Backend for ProcessBackend {
 
     fn touch(&mut self, x: u16, y: u16, down: bool) -> std::result::Result<(), TouchError> {
         match &self.link {
-            Some(l) if l.is_connected() => {
+            // A release is always queued while the run's link exists, even mid-reconnect:
+            // it goes out as soon as the link is back, so the panel never stays pressed.
+            Some(l) if l.is_connected() || !down => {
                 l.send_json(format!(r#"{{"t":"touch","x":{x},"y":{y},"down":{}}}"#, down as u8));
                 Ok(())
             }
@@ -1197,6 +1199,7 @@ mod tests {
                 view_rotation: 0,
                 created: 0,
                 network: Default::default(),
+                screen_window: Default::default(),
             },
         };
         (profile, device)

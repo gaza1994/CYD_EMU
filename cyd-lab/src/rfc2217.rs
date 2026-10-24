@@ -97,7 +97,7 @@ pub fn pulse_en(port: u16, download: bool, tx: Sender<EngineEvent>, waker: Waker
                             }
                         }
                     }
-                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                    Err(e) if crate::weblink::is_transient_io(&e) => {}
                     Err(_) => break,
                 }
             }

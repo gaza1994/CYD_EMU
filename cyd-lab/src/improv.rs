@@ -361,7 +361,7 @@ fn session(s: &mut TcpStream, job: Job, mut lines: Lines, events: &Sender<Event>
                     _ => {}
                 }
             }
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+            Err(e) if crate::weblink::is_transient_io(&e) => {
                 // Joined but no address packet: allow a few seconds for it, then finish.
                 if let (Job::Provision { .. }, Some(State::Provisioned)) = (&job, state) {
                     if sent_wifi && provisioned_at.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(3) {
