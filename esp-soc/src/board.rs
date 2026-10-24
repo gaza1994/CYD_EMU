@@ -121,6 +121,11 @@ pub trait BoardModel {
     fn encoder(&self) -> Option<(u8, u8)> { None }
     /// Lines for the end-of-run report.
     fn report(&self) -> String { String::new() }
+    /// GPIOs whose PWM duty the board wants through `pwm_duty`, as a mask (a backlight dimmed by LEDC).
+    fn pwm_pins(&self) -> u64 { 0 }
+    /// `SocBus::pwm_output`'s duty (0..65535) on a `pwm_pins` GPIO, after a GPIO-matrix or LEDC
+    /// write or an edge on it; `None` while no running PWM drives the pin (its level then counts).
+    fn pwm_duty(&mut self, _pin: u8, _duty: Option<u32>) {}
     /// Opt-in software drive after GPIO/IO_MUX writes and board attachment (including reset).
     /// Unlike raw latch changes, this observes route, mux and enable-only transitions.
     /// `uses_gpio_waveform` enables this callback as well as instruction-sized scheduling.

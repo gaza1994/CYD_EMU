@@ -281,12 +281,25 @@ impl SocBus {
         self.run_gp_spi();
         self.flush_rmt();
         self.flush_gpio();
+        if matches!(a >> 12, 0x3ff44 | 0x3ff59) { self.sync_board_pwm(); }
         self.irq_dirty = true;
+    }
+    /// Hand the board the LEDC duty on the pins it asked for (`BoardModel::pwm_pins`).
+    fn sync_board_pwm(&mut self) {
+        let mut pins = self.board.pwm_pins();
+        while pins != 0 {
+            let pin = pins.trailing_zeros() as u8;
+            pins &= pins - 1;
+            let duty = self.periph.pwm_output(u32::from(pin)).map(|(_, duty)| duty);
+            self.board.pwm_duty(pin, duty);
+        }
     }
     #[inline]
     fn flush_gpio(&mut self) {
         if self.periph.gpio.gpio.changes.is_empty() { return; }
         let changes = std::mem::take(&mut self.periph.gpio.gpio.changes);
+        let pwm = self.board.pwm_pins();
+        if pwm != 0 && changes.iter().any(|&(pin, _)| pin < 64 && pwm & (1 << pin) != 0) { self.sync_board_pwm(); }
         if let Some(events) = &mut self.gpio_events {
             for &(pin, level) in &changes { events.push((self.cycles, pin, level)); }
         }
@@ -623,6 +636,39 @@ mod tests {
                 assert!(b.irq_dirty, "clear write must invalidate presentation");
             }
         }
+    }
+
+    #[derive(Default)]
+    struct PwmBoard { duty: std::sync::Arc<std::sync::Mutex<Vec<Option<u32>>>> }
+    impl esp_soc::BoardModel for PwmBoard {
+        fn name(&self) -> &'static str { "pwm-test" }
+        fn uses_gpio_edges(&self) -> bool { true }
+        fn pwm_pins(&self) -> u64 { 1 << 4 }
+        fn pwm_duty(&mut self, pin: u8, duty: Option<u32>) {
+            assert_eq!(pin, 4);
+            let mut d = self.duty.lock().unwrap();
+            if d.last() != Some(&duty) { d.push(duty); }
+        }
+    }
+
+    /// LEDC channel 0 at 25% routed to GPIO 4 (periph's `classic_ledc_routes_pwm_...` sequence):
+    /// the board hears the duty once the timer latches it, and `None` when the route goes.
+    #[test]
+    fn board_pwm_pins_hear_the_ledc_duty() {
+        let mut b = SocBus::new(4 << 20, [0; 6]);
+        let board = PwmBoard::default();
+        let duty = board.duty.clone();
+        b.board = Box::new(board);
+        b.attach_board_devices();
+        for (a, v) in [(0x3ff4_8070, 1 << 27), (0x3ff0_00c0, 1 << 11), (0x3ff5_9140, 8 | (16000 << 5) | (1 << 25)), (0x3ff5_9008, 64 << 4),
+                       (0x3ff5_900c, (1 << 31) | (1 << 30) | (1 << 20) | (1 << 10)), (0x3ff5_9000, 4), (0x3ff5_9188, (1 << 8) | 1), (0x3ff4_9048, (2 << 12) | (1 << 9)),
+                       (0x3ff4_4540, 71), (0x3ff4_4020, 1 << 4)] {
+            b.write32(a, v).unwrap();
+        }
+        for _ in 0..2000 { b.tick(240); }
+        assert_eq!(duty.lock().unwrap().last(), Some(&Some(16384)), "{:?}", duty.lock().unwrap());
+        b.write32(0x3ff4_4540, 256).unwrap();                                           // back to a plain GPIO
+        assert_eq!(duty.lock().unwrap().last(), Some(&None));
     }
 
     struct I2cBoard;
