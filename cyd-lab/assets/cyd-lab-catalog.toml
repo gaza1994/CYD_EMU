@@ -32,7 +32,7 @@ config = "esphome/cyd-panel-2432s028r.yaml"
 first_setup = { improv = true, hotspot = "cyd-panel-xxxxxx", password = "", page = "http://192.168.4.1", note = "" }
 steps = [
   "Send Wi-Fi details: once it has booted (a few seconds), press \"Send Wi-Fi details\" on the device panel. The screen then shows its IP.",
-  "Home Assistant: it appears under Settings > Devices & services > Discovered (needs the network's mDNS relay). Otherwise add the ESPHome integration with this PC's IP and the port published for the ESPHome API (Network > Use with… > ESPHome).",
+  "Home Assistant: look under Settings > Devices & services > Discovered. If it is not there (discovery uses mDNS, which may not reach your network from the emulator), add the ESPHome integration with this PC's IP and the port published for the ESPHome API (Network > Use with… > ESPHome (API + OTA)).",
   "To customise it: \"Copy config\", paste it as a new device in the ESPHome add-on (Device Builder), edit, then install over the air to this PC's IP and the published OTA port.",
 ]
 [entries.source]

@@ -5,7 +5,7 @@
 # metadata that documents the board (and will drive engine options later).
 
 id = "esp32-2432s028r"
-name = "ESP32-2432S028R (CYD 2.8\")"
+name = "ESP32-2432S028R original (micro-USB)"
 description = "Cheap Yellow Display: ESP32-WROOM-32, 2.8in ILI9341 240x320 + XPT2046 resistive touch, RGB LED, LDR, micro-SD, CH340 USB-serial."
 vendor = "Sunton"
 chip = "esp32"

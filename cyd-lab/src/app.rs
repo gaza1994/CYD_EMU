@@ -1363,6 +1363,11 @@ impl CydLabApp {
                     for p in self.profiles.profiles.values() {
                         ui.selectable_value(&mut dlg.profile, p.id.clone(), &p.name);
                     }
+                    ui.separator();
+                    ui.label(RichText::new("Coming soon").small().weak());
+                    for (name, why) in COMING_SOON_BOARDS {
+                        ui.add_enabled(false, egui::Button::selectable(false, *name)).on_disabled_hover_text(*why);
+                    }
                 });
                 ui.end_row();
             });
@@ -1422,7 +1427,13 @@ impl CydLabApp {
         let board_name = self.profiles.get(&board).map(|p| p.name.clone()).unwrap_or_else(|| board.clone());
         let cat_profile = self.catalog.profile_for(&board).cloned();
         let show_broken = self.devices[i].gallery_broken;
-        let entries: Vec<crate::catalog::Entry> = cat_profile.as_ref().map(|p| self.catalog.entries_for(&p.id, show_broken).into_iter().cloned().collect()).unwrap_or_default();
+        // (heading before this entry, entry), in gallery order.
+        let grouped: Vec<(Option<&'static str>, crate::catalog::Entry)> = cat_profile
+            .as_ref()
+            .map(|p| self.catalog.grouped(&p.id, show_broken).into_iter().flat_map(|(h, v)| v.into_iter().enumerate().map(move |(k, e)| ((k == 0).then_some(h), e.clone()))).collect())
+            .unwrap_or_default();
+        let headings: Vec<Option<&'static str>> = grouped.iter().map(|(h, _)| *h).collect();
+        let entries: Vec<crate::catalog::Entry> = grouped.into_iter().map(|(_, e)| e).collect();
         let hidden = cat_profile.as_ref().map(|p| self.catalog.hidden_broken(&p.id)).unwrap_or(0);
         let mut thumbs = Vec::new();
         for e in &entries {
@@ -1474,7 +1485,12 @@ impl CydLabApp {
                     return;
                 };
                 egui::ScrollArea::vertical().max_height(470.0).auto_shrink([false, true]).show(ui, |ui| {
-                    for (e, thumb) in entries.iter().zip(&thumbs) {
+                    for ((e, thumb), heading) in entries.iter().zip(&thumbs).zip(&headings) {
+                        if let Some(h) = heading {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(*h).heading().strong());
+                            ui.add_space(2.0);
+                        }
                         ui.horizontal(|ui| {
                             let size = Vec2::new(60.0, 80.0);
                             match thumb {
@@ -1514,6 +1530,9 @@ impl CydLabApp {
                                     }
                                 });
                                 ui.label(&e.description);
+                                if let Some(f) = e.first_setup.as_ref().map(|f| f.summary()).filter(|t| !t.is_empty()) {
+                                    ui.label(RichText::new(format!("First Wi-Fi setup: {f}")).small());
+                                }
                                 if !e.emulator_notes.is_empty() {
                                     ui.label(RichText::new(format!("In the emulator: {}", e.emulator_notes)).small().weak());
                                 }
@@ -1541,6 +1560,12 @@ impl CydLabApp {
                                         let tip = if e.pinned() { "Download, check the SHA-256 the catalogue lists, erase the flash and write it. The device boots it straight away." } else { "Download from the web installer, erase the flash and write it (this entry has no pinned SHA-256)." };
                                         if ui.add_enabled(!busy, egui::Button::new(RichText::new("Install").strong())).on_hover_text(tip).clicked() {
                                             install = Some(e.clone());
+                                        }
+                                        if let Some(text) = crate::catalog::Entry::template_text(&e.config) {
+                                            if ui.button("Copy config").on_hover_text("Copy the ESPHome config this image was built from, to paste as a new device in Home Assistant's ESPHome add-on").clicked() {
+                                                ui.ctx().copy_text(text.to_string());
+                                                saved = Some(format!("{} config copied to the clipboard", e.name));
+                                            }
                                         }
                                         if let Some(u) = e.manifest_url() {
                                             if ui.small_button("Use manifest…").on_hover_text(format!("Put {u} into \"Install from web\" (skips the catalogue's SHA-256 check)")).clicked() {
@@ -1611,7 +1636,14 @@ impl CydLabApp {
         if let Some(e) = install {
             let cache = self.paths.root.join("cache").join("firmware");
             let w = self.waker.clone();
-            self.devices[i].start_catalog_install(e, cache, w);
+            let d = &mut self.devices[i];
+            d.setup_card = (!e.steps.is_empty()).then(|| e.id.clone());
+            if let Some(f) = &e.first_setup {
+                if !f.hotspot.is_empty() {
+                    d.hotspot_form = (String::new(), f.password.clone(), f.page_ip().unwrap_or_else(|| crate::hotspot::GUEST_AP_IP.to_string()));
+                }
+            }
+            d.start_catalog_install(e, cache, w);
         }
         if !open {
             self.devices[i].gallery_open = false;
@@ -2053,7 +2085,26 @@ impl CydLabApp {
         let wifi_on = self.devices[i].dev.meta.network.wifi;
         let mut job = None;
         let mut restart = false;
+        let card = self.devices[i].setup_card.as_ref().and_then(|id| self.catalog.entries.iter().find(|e| &e.id == id)).map(|e| (e.name.clone(), e.steps.clone()));
         let d = &mut self.devices[i];
+        if let Some((name, steps)) = card {
+            let mut close = false;
+            egui::Frame::new().fill(Color32::from_rgb(28, 52, 72)).inner_margin(8.0).corner_radius(4.0).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Next steps for {name}")).strong().color(Color32::WHITE));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        close = ui.small_button("✕").on_hover_text("Hide these steps").clicked();
+                    });
+                });
+                for (k, st) in steps.iter().enumerate() {
+                    ui.label(RichText::new(format!("{}. {st}", k + 1)).small().color(Color32::from_gray(230)));
+                }
+            });
+            if close {
+                d.setup_card = None;
+            }
+        }
         let serial = d.backend.capabilities().serial_tcp.filter(|_| alive);
         let waiting = d.improv.state == Some(State::Ready) && d.improv.busy != Some("provision") && !matches!(d.improv.outcome, Some(Ok(_)));
         let send_tip = if !wifi_on {
@@ -2835,3 +2886,12 @@ fn url_port(url: &str) -> u16 {
 fn free_local_port() -> Option<u16> {
     std::net::TcpListener::bind(("127.0.0.1", 0)).ok().and_then(|l| l.local_addr().ok()).map(|a| a.port())
 }
+
+/// Board variants the New device dialog lists as "Coming soon" (the engine needs a board
+/// model for each first).
+const COMING_SOON_BOARDS: &[(&str, &str)] = &[
+    ("ESP32-2432S028R two-USB (USB-C + micro-USB)", "The newer 2.8\" board with two USB ports has an ST7789 panel; the emulator only models the ILI9341 so far."),
+    ("ESP32-2432S024R / 2432S024C (2.4\")", "Needs an engine board model (R = resistive touch, C = capacitive)."),
+    ("ESP32-2432S032R / 2432S032C (3.2\")", "Needs an engine board model (R = resistive touch, C = capacitive)."),
+    ("ESP32-3248S035R / 3248S035C (3.5\")", "Needs an engine board model (ST7796 panel; R = resistive touch, C = capacitive)."),
+];
