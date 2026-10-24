@@ -35,12 +35,27 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
     };
-    let options = eframe::NativeOptions {
+    let options = |renderer: eframe::Renderer| eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("cyd-lab — emulated Cheap Yellow Display boards")
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([800.0, 500.0]),
+        renderer,
         ..Default::default()
     };
-    eframe::run_native("cyd-lab", options, Box::new(move |cc| Ok(Box::new(app::CydLabApp::new(cc, paths)))))
+    let run = |renderer, paths: app::Paths| eframe::run_native("cyd-lab", options(renderer), Box::new(move |cc| Ok(Box::new(app::CydLabApp::new(cc, paths)))));
+    #[cfg(windows)]
+    {
+        // DirectX 12 (or WARP) first; plain OpenGL if that cannot start.
+        let first = run(eframe::Renderer::Wgpu, paths);
+        if let Err(e) = &first {
+            eprintln!("cyd-lab: wgpu renderer failed ({e}); retrying with OpenGL");
+            if let Ok(p) = app::Paths::discover() {
+                return run(eframe::Renderer::Glow, p);
+            }
+        }
+        first
+    }
+    #[cfg(not(windows))]
+    run(eframe::Renderer::Glow, paths)
 }

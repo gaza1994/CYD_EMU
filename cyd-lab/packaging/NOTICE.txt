@@ -1,0 +1,37 @@
+cyd-lab Windows release: notices
+================================
+
+cyd-lab (cyd-lab.exe, arduino\tools\*.exe, arduino\examples)
+  MIT License, Copyright (c) 2026 Gareth Johnstone. See cyd-lab-LICENSE.txt.
+
+esp32sim (esp32sim.exe), the ESP32 emulator engine
+  MIT License, Copyright (c) 2026 Joakim Eriksson (@joakimeriksson),
+  Alice (@aliceisjustplaying) and Mattia Fiumara (@mfiumara).
+  See esp32sim-LICENSE.txt. Upstream: https://github.com/mikroverk/esp32sim
+  This build is from the cyd-2432s028r branch, which adds:
+    - the ESP32-2432S028R board (ILI9341 display, XPT2046 touch), RFC 2217
+      serial over TCP (--serial-tcp) and flash persistence, by Gareth Johnstone;
+    - inbound TCP port forwarding (--hostfwd), from the upstream pull request
+      by Matt Van Horn (@mvanhorn);
+    - flash persistence review work by its upstream contributors.
+  Other esp32sim contributors, per its git history: jumperly, Mako
+  (imakoshan), Ryuta Suzuki (@oroppas), Michael Rose. All contributions are
+  under the project's MIT licence.
+
+Espressif ESP32 mask ROM (esp-rom-elfs)
+  NOT included in this zip. On first run cyd-lab downloads Espressif's
+  esp-rom-elfs release 20260528 from github.com/espressif/esp-rom-elfs
+  (Apache License 2.0) and checks its SHA-256 before use.
+
+Arduino platform files written by "Set up Arduino IDE"
+  platform.txt is generated from the user's installed "esp32 by Espressif
+  Systems" Arduino core (LGPL-2.1 / Apache-2.0, see that package); cyd-lab
+  copies the recipes it needs and adds its own discovery and monitor lines.
+
+Third-party Rust crates
+  Listed with their licences in third-party-cyd-lab.txt and
+  third-party-esp32sim.txt (all permissive: MIT, Apache-2.0, BSD, Zlib,
+  ISC, Unicode-3.0, BSL-1.0, OFL/UFL for the bundled egui fonts, and
+  CDLA-Permissive-2.0 for the webpki-roots CA list). One crate, option-ext
+  0.2.0, is MPL-2.0; it is used unmodified and its source is available at
+  https://crates.io/crates/option-ext.
