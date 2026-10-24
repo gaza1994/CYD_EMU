@@ -182,7 +182,12 @@ impl SpiMem {
             let erase_addr = if has_mosi && addr_bits < 24 {
                 self.w_bytes(((24 - addr_bits) / 8) as usize).iter().fold(addr, |a, &b| (a << 8) | u32::from(b))
             } else { addr };
+            // No command phase, an address and a read: a continuous-mode read, the flash still in
+            // the read its mode bits kept (the classic ROM's SPIRead after its 0xbb/0xeb set-up,
+            // which the download ROM verifies every FLASH_DATA block with).
+            let cmdless_read = user & (1 << 31) == 0 && has_addr && has_miso;
             match c {
+                _ if cmdless_read => { let d = rd(addr, miso_bytes); self.set_w_bytes(&d); }
                 0x03 | 0x0b | 0x3b | 0x6b | 0xbb | 0xeb => { let d = rd(addr, miso_bytes); self.set_w_bytes(&d); }
                 0x9f => { let j = self.jedec; self.set_w_bytes(&j); }
                 0x05 => { let s = self.status; self.set_w_bytes(&[s as u8]); }
