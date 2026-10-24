@@ -20,8 +20,12 @@ target, and it also builds and runs on Linux.
    **Retry**, or **I already have the ROM ELFs** to pick a folder.
 3. **+ New device** > ESP32-2432S028R > **Create**, then **Power on**. A new board has blank
    flash and loops on `invalid header`, the same as a real erased chip.
-4. Drag a firmware `.bin` onto the window, or use **Install from web** with a manifest URL.
-   cyd-lab picks the offset from the image: merged/factory (bootloader at 0x1000 and
+4. Press **Install firmware...** and pick a firmware from the gallery (openHASP, NerdMiner,
+   Bruce, Marauder, CYD-Klipper, ...). One click downloads it, checks its SHA-256, writes it
+   at the right offsets and boots it. See [Install firmware gallery](#install-firmware-gallery).
+   You can also drag your own firmware `.bin` onto the window, or use **Install from web**
+   with a manifest URL.
+   For a dropped file, cyd-lab picks the offset from the image: merged/factory (bootloader at 0x1000 and
    partitions at 0x8000 inside the file) at 0x0, a merged image that starts at the
    bootloader at 0x1000, a bootloader at 0x1000, a partition table at 0x8000, and an app
    image at the device's first app partition (0x10000 by default). It asks first when it
@@ -57,6 +61,7 @@ fall back to OpenGL if that fails.
 | Engine feature detection (`--help`, binary scan as a fallback), shown in Settings and as badges | |
 | PNG fallback (`--tft-png`), console with a 5000-line ring buffer | |
 | [Install from web installer](#install-from-web-installer): ESP Web Tools manifests (URL or file), tested with openHASP | Improv Wi-Fi provisioning |
+| [Install firmware gallery](#install-firmware-gallery): bundled, verified catalogue per board, SHA-256 checked one-click installs (openHASP and NerdMiner tested end to end), config templates | Catalogue refresh from the web is off by default; the gallery only lists boards in the catalogue |
 | First run: bundled engine, pinned ROM download with progress/error/retry, portable mode, drag-and-drop `.bin` with offset guessing, **Set up Arduino IDE**, **Use with...** | Exe not code-signed (SmartScreen) |
 | [Arduino IDE 2 / arduino-cli](#arduino-ide-2--arduino-cli-no-driver) over the network: discovery, upload, monitor (arduino-cli on Linux) | Arduino IDE 2 on Windows not yet run; the package index isn't hosted anywhere yet |
 
@@ -253,6 +258,68 @@ What cyd-lab does (`combridge.rs`, `cfg(windows)`):
 Unit tests cover the command lines, detection in a fake folder tree, `setupc list` parsing
 and the missing-component messages. The UAC prompt, `setupc` and hub4com themselves
 have not been run.
+
+## Install firmware gallery
+
+**Install firmware...** (first button on the Firmware row) opens a gallery of ready-made
+firmware for the selected device's board. The list comes from a curated catalogue,
+`assets/catalog/cyd-firmware.toml` (schema 1), built into the exe, so it works offline
+and nothing is fetched until you press Install. Every entry was boot-tested in the
+emulator. Each card shows:
+
+- name, version, licence and a homepage link;
+- a status badge: **works**, **partial**, **broken** or **untested** in the emulator.
+  Hover for what was seen, and open **Notes** for the details;
+- **needs ...** badges for hardware the emulator doesn't model (SD card, Bluetooth, an LED
+  strip, RF/IR/NRF24 add-on modules). The firmware may boot, but those features won't work;
+- a thumbnail of its screen in the emulator (hover for full size), or "no screen picture"
+  for firmware that leaves the TFT blank by design (WLED, MicroPython).
+
+Entries marked **broken** (they don't boot in the emulator, e.g. CircuitPython today) are
+hidden. Tick **Show entries that don't boot in the emulator** to list them. Firmware the
+catalogue knows about but can't install (no CYD build, or no downloadable image) sits
+under **Not in the list**, with links.
+
+**Install** powers the device off if needed, then:
+
+1. downloads every part. Sources can be a direct URL, a GitHub release asset, a file inside
+   a release zip (openHASP's `sunton.zip`), or an ESP Web Tools manifest;
+2. checks each file's size and **SHA-256** against the catalogue. On a mismatch it tries the
+   entry's mirror, and if that fails too it stops without touching the flash;
+3. patches what needs patching. WLED's bootloader is built for 8 MB, so cyd-lab sets its
+   flash-size field to 4 MB and recomputes the image's appended SHA-256 (the catalogue's
+   `patch_flash_size_mb`);
+4. erases the flash, writes each part at its offset, and powers the device on. The console
+   logs every step ("catalogue: ... SHA-256 OK", "wrote N bytes at 0x0").
+
+For manifest-based entries the gallery also offers **Use manifest...**, which fills in the
+**Install from web** field so you can install the live, unpinned manifest yourself. If a
+manifest's files have changed since the catalogue was made, Install refuses (hash
+mismatch) and suggests exactly that. Verified downloads are cached by hash in
+`cache/firmware/`, so a reinstall is instant and works offline.
+
+**Config templates** (the ESPHome starter YAML for the classic CYD, and the Tasmota
+template and `display.ini`) have **Copy** and **Save...** buttons instead of Install.
+Compile the ESPHome config yourself (`esphome compile`), then drop the resulting
+`firmware.factory.bin` onto the window.
+
+Tested end to end in the GUI: **openHASP 0.7.0-rc13**, where the zip member's hash
+matched, 1,776,320 bytes were written at 0x0 and it boots to the `HASP-xxxxxx` AP/QR
+setup screen. Also **NerdMiner v2 1.8.3**, where the factory image (2,224,128 bytes) went
+at 0x0 and it boots to its "WAITING CONFIG" screen with the NerdMinerAP QR. The source,
+hash, cache, zip-member, reflag and filtering logic is covered by unit tests.
+
+**Catalogue updates (off by default).** Settings > Firmware catalogue > **Check a URL for
+catalogue updates** adds a **Check for updates** button to the gallery. It downloads the
+TOML from the URL you set (raw GitHub or any `https://` URL), checks the schema version,
+parses and validates every entry, and saves it as `catalog/cyd-firmware.toml` in the data
+folder. cyd-lab only uses that copy while the setting is on, and only if its `updated` date
+isn't older than the built-in one. Hashes still come from the catalogue, so a refreshed
+catalogue is trusted as much as the server you point it at.
+
+Maintainers: `tools/catalog_assets.py` copies the TOML and templates from the catalogue
+workspace into `assets/catalog/`, makes 120x160 thumbnails (64 colours, blank screens
+skipped) and regenerates `src/catalog_assets.rs`.
 
 ## Install from web installer
 
@@ -492,6 +559,8 @@ wrong network / wrong password banners for both.
   devices\<id>\flash.bin      raw flash image (size from the profile)
   devices\<id>\screen.png     last --tft-png
   devices\<id>\web\           empty --web-dir
+  cache\firmware\<sha256>.bin catalogue downloads, verified, named by hash (safe to delete)
+  catalog\cyd-firmware.toml   refreshed catalogue (only with Settings > Firmware catalogue)
 ```
 
 ## Build and run
@@ -557,7 +626,11 @@ lifecycles against fake engine scripts (graceful stop, kill after the grace peri
 relay started and stopped with the engine), web-installer manifests (real openHASP/ESPHome-style
 manifests, erase rules, relative part URLs, a local manifest end to end), `running.json`
 (round trip, stale writer), the discovery's port JSON and sync diff, and the monitor's address
-parsing, Telnet framing and a two-way bridge. The esptool, web-installer and Arduino flows were
+parsing, Telnet framing and a two-way bridge, and the firmware catalogue (the bundled TOML parses
+and validates, profile filtering and hidden broken entries, every source resolves, globbing,
+SHA-256 checking and the download cache, zip members, the WLED bootloader 8 to 4 MB reflag
+checked byte for byte against the catalogue's own tool, and refresh validation), and Wi-Fi
+password masking in logged command lines. The esptool, web-installer and Arduino flows were
 tested by hand under Xvfb.
 
 ## What the engine needs next

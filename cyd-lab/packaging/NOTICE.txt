@@ -39,6 +39,19 @@ ESP-IDF second-stage bootloader and Arduino-ESP32 default partition table
   is a list of partition offsets and sizes, compiled with gen_esp32part.
   Both are included unmodified.
 
+Firmware catalogue (built into cyd-lab.exe)
+  The list of firmware (names, descriptions, download URLs and SHA-256 hashes)
+  is cyd-lab's own, MIT. No firmware binaries are included; the gallery
+  downloads them from each project's own release on demand. Each project
+  keeps its own licence, which the gallery shows (MIT, GPL-3.0, AGPL-3.0,
+  EUPL-1.2, ...). The thumbnails are pictures of each firmware's screen as
+  drawn in the emulator, shown only to identify the firmware; the artwork
+  belongs to the respective projects (openHASP, NerdMiner, Bruce, ESP32
+  Marauder, CYD-Klipper, the ESP32-Cheap-Yellow-Display examples, the CYD
+  Weather Dashboard and the ESP32 CYD Weather Station). The ESPHome starter config is cyd-lab's
+  own (MIT). The Tasmota display.ini and template notes follow the
+  community template at templates.blakadder.com (sunton_ESP32-2432S028).
+
 Third-party Rust crates
   Listed with their licences in third-party-cyd-lab.txt and
   third-party-esp32sim.txt (all permissive: MIT, Apache-2.0, BSD, Zlib,
