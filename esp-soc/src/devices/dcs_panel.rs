@@ -23,6 +23,9 @@ pub struct DcsPanel {
     cmd: u8, args: [u8; 4], argn: u8,
     x0: u16, x1: u16, y0: u16, y1: u16, xc: u16, yc: u16,
     pixel_hi: Option<u8>,
+    /// ILI9488 over SPI: COLMOD 0x66 sends 3 bytes a pixel (6 bits of each channel in the top of
+    /// the byte); it has no 16-bit SPI mode (datasheet 4.7.2.2). The second byte is kept here.
+    rgb666: bool, pixel_mid: Option<u8>,
     /// RAMWR commands seen
     pub frames: u64,
     pub pixels_written: u64,
@@ -40,7 +43,7 @@ impl DcsPanel {
     pub fn new(cols: usize, rows: usize) -> Self {
         DcsPanel { cols, rows, gram: vec![0; cols * rows], madctl: 0, colmod: 0x66, inverted: false, sleeping: true, on: false, dc: false,
                    little_endian: false, ramctrl: false, gate_reversed: false, source_reversed: false, dfc: false, cmd: 0, args: [0; 4], argn: 0, x0: 0, x1: cols as u16 - 1, y0: 0, y1: rows as u16 - 1, xc: 0, yc: 0,
-                   pixel_hi: None, frames: 0, pixels_written: 0, pixels_out_of_range: 0, resets: 0, madctl_writes: Vec::new() }
+                   pixel_hi: None, rgb666: false, pixel_mid: None, frames: 0, pixels_written: 0, pixels_out_of_range: 0, resets: 0, madctl_writes: Vec::new() }
     }
     /// ST7735: 132 × 162 of RAM behind the 0.96" and 1.8" modules.
     pub fn st7735() -> Self { Self::new(132, 162) }
@@ -49,18 +52,34 @@ impl DcsPanel {
     /// ILI9341: 240 × 320 of RAM behind the 2.4" and 2.8" modules. Its B0h is the RGB interface
     /// control, not RAMCTRL, so pixels always arrive high byte first.
     pub fn ili9341() -> Self { let mut p = Self::new(240, 320); p.dfc = true; p }
+    /// ILI9342: the ILI9341's landscape sibling, 320 × 240 of RAM (the M5Stack Core's 2.0").
+    pub fn ili9342() -> Self { let mut p = Self::new(320, 240); p.dfc = true; p }
+    /// ST7796S: 320 × 480 of RAM behind the 3.5" modules; its B6h has the ILI9341's GS/SS bits.
+    pub fn st7796() -> Self { let mut p = Self::new(320, 480); p.dfc = true; p }
+    /// ILI9488: 320 × 480 of RAM, 18-bit pixels over SPI (see `rgb666`).
+    pub fn ili9488() -> Self { let mut p = Self::new(320, 480); p.dfc = true; p.rgb666 = true; p }
+    /// GC9A01: 240 × 240 of RAM behind the 1.28" round modules.
+    pub fn gc9a01() -> Self { Self::new(240, 240) }
+    /// A controller by its lower-case part name, as board profiles name it.
+    pub fn by_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "st7735" => Self::st7735(), "st7789" => Self::st7789(), "ili9341" => Self::ili9341(), "ili9342" => Self::ili9342(),
+            "st7796" => Self::st7796(), "ili9488" => Self::ili9488(), "gc9a01" => Self::gc9a01(),
+            _ => return None,
+        })
+    }
 
     /// A hardware or software reset: every register back to power-on, the RAM kept (as on silicon).
     pub fn reset(&mut self) {
-        let (gram, resets, dc, ramctrl, dfc, writes) = (std::mem::take(&mut self.gram), self.resets + 1, self.dc, self.ramctrl, self.dfc, std::mem::take(&mut self.madctl_writes));
+        let (gram, resets, dc, ramctrl, dfc, rgb666, writes) = (std::mem::take(&mut self.gram), self.resets + 1, self.dc, self.ramctrl, self.dfc, self.rgb666, std::mem::take(&mut self.madctl_writes));
         *self = Self::new(self.cols, self.rows);
-        self.gram = gram; self.resets = resets; self.dc = dc; self.ramctrl = ramctrl; self.dfc = dfc; self.madctl_writes = writes;
+        self.gram = gram; self.resets = resets; self.dc = dc; self.ramctrl = ramctrl; self.dfc = dfc; self.rgb666 = rgb666; self.madctl_writes = writes;
     }
 
     /// One byte from the SPI master, a command or data depending on `dc`.
     pub fn byte(&mut self, b: u8) {
         if !self.dc {
-            self.cmd = b; self.argn = 0; self.pixel_hi = None;
+            self.cmd = b; self.argn = 0; self.pixel_hi = None; self.pixel_mid = None;
             match b {
                 0x01 => self.reset(),
                 0x11 => self.sleeping = false, 0x10 => self.sleeping = true,
@@ -84,6 +103,14 @@ impl DcsPanel {
             0x3a => self.colmod = b,
             0xb6 if self.dfc => { if self.argn == 1 { self.gate_reversed = b & 0x40 != 0; self.source_reversed = b & 0x20 != 0; } self.argn = self.argn.saturating_add(1); }
             0xb0 if self.ramctrl => { if self.argn == 1 { self.little_endian = b & 0x08 != 0; } self.argn = self.argn.saturating_add(1); }
+            0x2c if self.rgb666 && self.colmod & 7 == 6 => match (self.pixel_hi, self.pixel_mid) {
+                (None, _) => self.pixel_hi = Some(b),
+                (Some(_), None) => self.pixel_mid = Some(b),
+                (Some(r), Some(g)) => {
+                    self.pixel_hi = None; self.pixel_mid = None;
+                    self.write_pixel(u16::from(r >> 3) << 11 | u16::from(g >> 2) << 5 | u16::from(b >> 3));
+                }
+            },
             0x2c => match self.pixel_hi.take() {
                 None => self.pixel_hi = Some(b),
                 Some(first) => self.write_pixel(if self.little_endian { u16::from_le_bytes([first, b]) } else { u16::from_be_bytes([first, b]) }),
@@ -148,6 +175,16 @@ mod tests {
         cmd(&mut p, 0x36, &[0x20]);                       // MV: the column counter walks rows
         cmd(&mut p, 0x2a, &[0, 1, 0, 1]); cmd(&mut p, 0x2b, &[0, 2, 0, 2]); cmd(&mut p, 0x2c, &[0, 9]);
         assert_eq!(p.gram[3 + 2], 9, "row 1, col 2");
+    }
+
+    #[test]
+    fn ili9488_takes_three_byte_pixels_over_spi() {
+        let mut p = DcsPanel::by_name("ili9488").unwrap();
+        cmd(&mut p, 0x11, &[]); cmd(&mut p, 0x3a, &[0x66]);
+        cmd(&mut p, 0x2c, &[0xf8, 0xfc, 0xf8, 0x08, 0x04, 0x00]);
+        assert_eq!((p.gram[0], p.gram[1], p.pixels_written), (0xffff, 0x0820, 2));
+        assert_eq!((p.cols, p.rows), (320, 480));
+        assert!(DcsPanel::by_name("ili9999").is_none());
     }
 
     #[test]
