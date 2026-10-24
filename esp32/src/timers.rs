@@ -10,11 +10,18 @@ pub struct ClassicTimer {
     pub timer: TimerGroup,
     lact: Timer,
     lact_rtc: u32,
+    boot_cali: bool,
 }
 
+/// The eFuse RC 8 MHz trim (`EFUSE_RD_CK8M_FREQ`) and the RTC calibration the download-mode ROM
+/// leaves in TIMG0 RTCCALICFG1 (value at bit 7): esptool reads both back and takes
+/// value * 15625 * trim / 40 as the ROM's crystal, which has to come out at 40 MHz.
+pub const CK8M_FREQ: u32 = 80;
+const BOOT_CALI_VALUE: u32 = 40_000_000 * 40 / 15625 / CK8M_FREQ;
 impl ClassicTimer {
-    pub fn new(_group: usize) -> Self {
-        Self { timer: TimerGroup::new(), lact: Timer::default(), lact_rtc: 0 }
+    pub fn new(group: usize) -> Self {
+        // Only until firmware configures a calibration of its own through RTCCALICFG.
+        Self { timer: TimerGroup::new(), lact: Timer::default(), lact_rtc: 0, boot_cali: group == 0 }
     }
 
     fn irq_bits(&self) -> u64 {
@@ -47,6 +54,7 @@ impl Device for ClassicTimer {
     fn read(&mut self, off: u32) -> u32 {
         match off {
             0x00..=0x47 => self.timer.t[(off / 0x24) as usize].read(off % 0x24),
+            0x6c if self.boot_cali => BOOT_CALI_VALUE << 7,
             0x70 => self.lact.config,
             0x74 => self.lact_rtc,
             0x78..=0x94 => self.lact.read(off - 0x74),
@@ -65,6 +73,7 @@ impl Device for ClassicTimer {
             0x78..=0x94 => self.lact.write(off - 0x74, value, u64::MAX),
             0x98 => self.timer.int_ena = value,
             0xa4 => self.timer.int_raw &= !value,
+            0x68 => { self.boot_cali = false; self.timer.write(off, value) }
             _ => self.timer.write(off, value),
         }
         WriteEffect::NONE

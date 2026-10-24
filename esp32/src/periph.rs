@@ -656,8 +656,11 @@ impl ClassicEfuse {
         r.write(0x0c, 1 << 15); // ECO1+
         r.write(0x14, 1 << 20); // Revision 2; the loaded ECO3 ROM is selected independently.
         // IDF v5.5.4 register/soc/efuse_reg.h:169,177-183: EFUSE_BLK0_RDATA4_REG EFUSE_RD_ADC_VREF
-        // [12:8]. 0x10 is nominal 1100 mV Vref, sign-magnitude negative zero.
-        r.write(0x10, 0x10 << 8);
+        // [12:8]. 0x10 is nominal 1100 mV Vref, sign-magnitude negative zero. EFUSE_RD_CK8M_FREQ
+        // [7:0] is the factory RC 8 MHz trim; esptool's ROM crystal estimate (esptool v5.6
+        // targets/esp32.py get_rom_cal_crystal_freq) multiplies it by the ROM's boot calibration in
+        // TIMG0 RTCCALICFG1 (timers.rs), and a zero turns `--baud` into CHANGE_BAUDRATE 0.
+        r.write(0x10, 0x10 << 8 | crate::timers::CK8M_FREQ);
         Self { ram: r, cmd: 0 }
     }
 }
