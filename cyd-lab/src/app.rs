@@ -1949,6 +1949,7 @@ impl CydLabApp {
     }
 
     fn console_ui(&mut self, ui: &mut egui::Ui, i: usize) {
+        let wifi_defaults = self.settings.wifi.clone();
         let d = &mut self.devices[i];
         let mut send = false;
         ui.horizontal(|ui| {
@@ -1966,7 +1967,15 @@ impl CydLabApp {
             }
         });
         let mut use_ssid = None;
-        if let Some(b) = d.wifi_watch.banner.clone() {
+        // Wi-Fi settings changed since power-on: the banner describes the old access point.
+        let now = d.dev.meta.network.effective(&wifi_defaults);
+        let pending = d.wifi_watch.banner.is_some() && (now != d.wifi_ap || !d.dev.meta.network.wifi);
+        if pending {
+            egui::Frame::new().fill(Color32::from_rgb(40, 70, 100)).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.label(RichText::new(format!("Wi-Fi changed to \"{}\". Power off and on to apply it.", now.ssid)).color(Color32::WHITE));
+            });
+        } else if let Some(b) = d.wifi_watch.banner.clone() {
             egui::Frame::new().fill(Color32::from_rgb(90, 60, 10)).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
