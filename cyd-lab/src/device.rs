@@ -64,6 +64,33 @@ pub struct DeviceMeta {
     /// The popped-out screen window (position, zoom), remembered per device.
     #[serde(default)]
     pub screen_window: ScreenWindow,
+    /// The setup checklist shown after a catalogue install (`[guide]`), kept until closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide: Option<Guide>,
+}
+
+/// The setup checklist after installing a catalogue firmware. Most steps tick themselves
+/// from what the device does; what was done by hand is remembered here.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Guide {
+    pub name: String,
+    pub improv: bool,
+    pub home_assistant: bool,
+    /// Bundled ESPHome config ("Copy config"), if any.
+    pub config: String,
+    /// How this firmware expects the board to be held (only suggested).
+    pub rotation: Option<u16>,
+    pub notes: Vec<String>,
+    /// "Added to Home Assistant" ticked by hand (when no API client shows in the log).
+    pub ha_manual: bool,
+    pub config_copied: bool,
+    /// Wi-Fi details were accepted by the firmware (Improv) at some point.
+    pub wifi_sent: bool,
+    /// The firmware was seen on Wi-Fi at some point.
+    pub wifi_connected: bool,
+    /// Home Assistant was seen connecting at some point.
+    pub ha_seen: bool,
 }
 
 /// Where the device's screen window was ("Pop out"), in points, and how it was shown.
@@ -171,6 +198,7 @@ impl DeviceStore {
             created: now,
             network: crate::network::DeviceNetwork::for_new_device(wifi),
             screen_window: ScreenWindow::default(),
+            guide: None,
         };
         let dev = Device { id, dir, meta };
         write_blank_flash(&dev.flash_path(), profile.flash.size_bytes())?;
@@ -391,6 +419,28 @@ mod tests {
         let (all, errs) = store.list().unwrap();
         assert!(errs.is_empty());
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn setup_checklist_survives_a_restart() {
+        let (_t, store, profile) = store();
+        let mut dev = store.create("Panel", &profile).unwrap();
+        assert!(store.load(&dev.id).unwrap().meta.guide.is_none());
+        dev.meta.guide = Some(Guide {
+            name: "ESPHome".into(),
+            improv: true,
+            home_assistant: true,
+            rotation: Some(90),
+            notes: vec!["Hold BOOT".into()],
+            ha_manual: true,
+            wifi_sent: true,
+            ..Default::default()
+        });
+        store.update_meta(&dev).unwrap();
+        assert_eq!(store.load(&dev.id).unwrap().meta.guide, dev.meta.guide);
+        dev.meta.guide = None;
+        store.update_meta(&dev).unwrap();
+        assert!(store.load(&dev.id).unwrap().meta.guide.is_none());
     }
 
     #[test]

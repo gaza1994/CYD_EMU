@@ -409,9 +409,74 @@ pub fn sniff_console(line: &str) -> Option<State> {
     None
 }
 
+/// A clue about first-time Wi-Fi setup in the firmware's own serial output. Read passively:
+/// nothing is sent to the board for it (a real board on a PC gets no bytes unless a tool
+/// writes them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clue {
+    /// The firmware has Improv Wi-Fi over serial (ESPHome's `improv_serial` config dump, …).
+    Improv,
+    /// The firmware is waiting to be given a Wi-Fi network (fallback/setup access point,
+    /// WiFiManager portal, no network configured, …).
+    Waiting,
+}
+
+/// Look for a setup clue in one console line (ANSI codes already stripped).
+pub fn sniff_setup(line: &str) -> Option<Clue> {
+    let l = line.to_ascii_lowercase();
+    // A firmware complaining about bytes it got is not a clue (only happens if a tool wrote).
+    if l.contains("not found") || l.contains("unknown command") {
+        return None;
+    }
+    const WAITING: &[&str] = &[
+        // ESPHome (wifi component)
+        "starting fallback ap",
+        "no valid network config",
+        // WLED
+        "opening access point",
+        // openHASP
+        "temporary access point",
+        // Tasmota
+        "wifimanager active",
+        // tzapu/WiFiManager and forks (NerdMiner, many Arduino sketches)
+        "startap with ssid",
+        "starting config portal",
+        "config portal running",
+        "configportal",
+        // generic
+        "waiting for wi-fi setup",
+        "waiting for wifi setup",
+        "waiting for wi-fi: send",
+        "provisioning mode",
+        "smartconfig",
+    ];
+    if WAITING.iter().any(|k| l.contains(k)) {
+        return Some(Clue::Waiting);
+    }
+    if l.contains("improv serial") || l.contains("[improv_serial") || l.contains("improv wi-fi") || l.contains("improv wifi") {
+        return Some(Clue::Improv);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_clues_from_real_log_lines() {
+        assert_eq!(sniff_setup("[C][improv_serial:026]: Improv Serial:"), Some(Clue::Improv));
+        assert_eq!(sniff_setup("[I][wifi:1123]: Starting fallback AP!"), Some(Clue::Waiting));
+        assert_eq!(sniff_setup("[W][wifi:640]: No valid network config (selected_sta_index_=-1, sta_.size()=0)"), Some(Clue::Waiting));
+        assert_eq!(sniff_setup("Opening access point WLED-AP"), Some(Clue::Waiting));
+        assert_eq!(sniff_setup("WIFI: Temporary Access Point HASP-d43f84 password: haspadmin"), Some(Clue::Waiting));
+        assert_eq!(sniff_setup("00:00:03.123 WIF: WifiManager active for 3 minutes"), Some(Clue::Waiting));
+        assert_eq!(sniff_setup("*wm:StartAP with SSID:  NerdMinerAP"), Some(Clue::Waiting));
+        assert_eq!(sniff_setup("[wifi] connected to HomeNet"), None);
+        assert_eq!(sniff_setup("[C][wifi:440]: Local MAC: 24:0A:C4:01:02:03"), None);
+        // What firmware without Improv prints when a tool sends it a packet.
+        assert_eq!(sniff_setup("IMPROV\x01\x03 Command not found"), None);
+    }
 
     #[test]
     fn request_state_matches_esp_web_tools() {

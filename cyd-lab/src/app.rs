@@ -456,25 +456,14 @@ struct DeviceView {
     /// After installing a firmware with a first-setup guide (the Home Assistant entry):
     /// its id, shown as a step card until dismissed.
     /// The setup checklist after installing a catalogue firmware that needs setting up.
-    guide: Option<Guide>,
     /// The last ESPHome API client the firmware logged as connected.
     api_client: Option<String>,
 }
 
-/// The setup checklist after installing a catalogue firmware (ticks itself from real state).
-struct Guide {
-    name: String,
-    improv: bool,
-    home_assistant: bool,
-    /// Bundled ESPHome config ("Copy config"), if any.
-    config: String,
-    /// How this firmware expects the board to be held (only suggested).
-    rotation: Option<u16>,
-    notes: Vec<String>,
-    /// "Added to Home Assistant" ticked by hand (when no API client shows in the log).
-    ha_manual: bool,
-    config_copied: bool,
-}
+use crate::device::Guide;
+
+/// Room kept under the gallery's list for its footer (checkbox and hint lines).
+const GALLERY_FOOTER: f32 = 84.0;
 
 /// Largest whole-number zoom (screen pixels per panel pixel) at which a `view`-sized
 /// picture fits in `avail` points; at least 1 (then it scrolls off rather than shrink).
@@ -724,9 +713,10 @@ struct ImprovUi {
     info: Vec<String>,
     url: Option<String>,
     outcome: Option<Result<String, String>>,
-    /// Automatic "request current state" after power-on.
-    probe_at: Option<Instant>,
-    probes_left: u8,
+    /// Passive clues from the firmware's own log (nothing is ever sent unasked): it has
+    /// Improv over serial / it is waiting for a Wi-Fi network.
+    capable: bool,
+    waiting_log: bool,
 }
 
 /// Firmware queued for flash.bin. Applied once the engine is stopped (it owns the file
@@ -833,7 +823,6 @@ impl DeviceView {
             hotspot_open_at: None,
             hotspot_form: (String::new(), String::new(), crate::hotspot::GUEST_AP_IP.to_string()),
             ap: ApUi::default(),
-            guide: None,
             api_client: None,
         }
     }
@@ -921,10 +910,6 @@ impl DeviceView {
 
     fn poll_improv(&mut self) {
         use crate::improv::Event;
-        let running = matches!(self.backend.state(), RunState::Running(_));
-        if !running {
-            self.improv.probe_at = None;
-        }
         if let Some(rx) = &self.improv.rx {
             let evs: Vec<Event> = rx.try_iter().collect();
             for ev in evs {
@@ -950,15 +935,6 @@ impl DeviceView {
                     }
                 }
             }
-        }
-        // Stop probing once the firmware answered (or a session is running).
-        if self.improv.state.is_some() {
-            self.improv.probe_at = None;
-        }
-        if self.improv.busy.is_none() && self.improv.probe_at.is_some_and(|t| Instant::now() >= t) {
-            self.improv.probes_left = self.improv.probes_left.saturating_sub(1);
-            self.improv.probe_at = (self.improv.probes_left > 0).then(|| Instant::now() + Duration::from_secs(9));
-            self.start_improv(crate::improv::Job::Probe);
         }
     }
 
@@ -1067,6 +1043,12 @@ impl DeviceView {
             }
             if let Some(st) = crate::improv::sniff_console(&line) {
                 self.improv.state = Some(st);
+                self.improv.capable = true;
+            }
+            match crate::improv::sniff_setup(&line) {
+                Some(crate::improv::Clue::Improv) => self.improv.capable = true,
+                Some(crate::improv::Clue::Waiting) => self.improv.waiting_log = true,
+                None => {}
             }
             if let Some(ssid) = crate::hotspot::sniff_ssid(&line) {
                 crate::hotspot::remember(&mut self.hotspot_ssids, ssid);
@@ -1565,18 +1547,13 @@ impl CydLabApp {
             }
             r
         });
-        let bridged = cfg!(windows) && self.settings.engine.com_bridge && self.devices[i].dev.meta.com_port.is_some();
         let hotspot_ok = self.engine_features().ap_client;
         let d = &mut self.devices[i];
         d.improv = ImprovUi::default();
         d.hotspot_ssids.clear();
         d.ap.new_run();
-        if r.is_ok() && boot == BootMode::Normal && !bridged {
-            // Auto-detect Improv: "request current state" once the firmware has booted.
-            // Each try briefly takes the serial port, so not while a COM bridge relays it.
-            d.improv.probe_at = Some(Instant::now() + Duration::from_secs(6));
-            d.improv.probes_left = 2;
-        }
+        // No automatic Improv probe: a real board on a PC gets no bytes unless a tool or the
+        // user sends them. "Waiting for setup" is read from its log and its hotspot instead.
         d.hotspot_open_at = (r.is_ok() && hotspot_ok && d.hotspot.is_some()).then(|| Instant::now() + Duration::from_secs(10));
         d.wifi_ap = d.dev.meta.network.effective(&self.settings.wifi);
         d.wifi_watch = Default::default();
@@ -1723,7 +1700,7 @@ impl CydLabApp {
                 d.lab(format!("device hotspot: joined; opening {url} (the page at {} on the device's hotspot)", d.ap.bound.as_ref().map(|b| b.1.clone()).unwrap_or_default()));
                 ctx.open_url(egui::OpenUrl::new_tab(url));
             }
-            if d.improv.busy.is_some() || d.improv.probe_at.is_some() || d.hotspot_open_at.is_some() {
+            if d.improv.busy.is_some() || d.hotspot_open_at.is_some() {
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
             d.release_due_touch(ctx);
@@ -1888,10 +1865,13 @@ impl CydLabApp {
         let refresh_on = self.settings.catalog.refresh && !self.settings.catalog.url.trim().is_empty();
         let refreshing = self.catalog_job.is_some();
         let (updated, note) = (self.catalog.updated.clone(), self.catalog_note.clone());
+        // Tall by default: most of the window, so the list shows as many entries as fit.
+        let tall = (ctx.content_rect().height() - 60.0).max(360.0);
         egui::Window::new(format!("Install firmware on {dev_name}"))
             .id(egui::Id::unique(("gallery", i)))
             .collapsible(false)
-            .default_size([600.0, 620.0])
+            .resizable(true)
+            .default_size([600.0, tall])
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -1922,7 +1902,9 @@ impl CydLabApp {
                     ui.label(format!("The catalogue has no firmware for this board ({board}). Use \"Install from web\" with the firmware's manifest URL, or drop your own .bin files on the window."));
                     return;
                 };
-                egui::ScrollArea::vertical().max_height(470.0).auto_shrink([false, true]).show(ui, |ui| {
+                // The list takes whatever height the window has, less the footer below it.
+                let list_h = (ui.available_height() - GALLERY_FOOTER).max(160.0);
+                egui::ScrollArea::vertical().max_height(list_h).min_scrolled_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
                     for ((e, thumb), heading) in entries.iter().zip(&thumbs).zip(&headings) {
                         if let Some(h) = heading {
                             ui.add_space(4.0);
@@ -2082,16 +2064,16 @@ impl CydLabApp {
             let others: Vec<_> = self.devices.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, o)| o.dev.meta.network.clone()).collect();
             let d = &mut self.devices[i];
             let improv = e.first_setup.as_ref().is_some_and(|f| f.improv);
-            d.guide = (e.home_assistant || improv || !e.steps.is_empty() || e.view_rotation.is_some()).then(|| Guide {
+            d.dev.meta.guide = (e.home_assistant || improv || !e.steps.is_empty() || e.view_rotation.is_some()).then(|| Guide {
                 name: e.name.clone(),
                 improv,
                 home_assistant: e.home_assistant,
                 config: e.config.clone(),
                 rotation: e.view_rotation,
                 notes: e.steps.clone(),
-                ha_manual: false,
-                config_copied: false,
+                ..Default::default()
             });
+            let _ = self.store.update_meta(&d.dev);
             if e.home_assistant {
                 // Home Assistant has to reach the device: publish the ESPHome API and OTA
                 // ports on the network (free PC ports picked), so "Add to Home Assistant" works.
@@ -2625,9 +2607,10 @@ impl CydLabApp {
     /// The setup checklist after a catalogue install: compact, dismissable, and each step
     /// ticks itself from what the device actually did.
     fn guide_ui(&mut self, ui: &mut egui::Ui, i: usize, alive: bool) {
-        if self.devices[i].guide.is_none() {
+        let Some(mut g) = self.devices[i].dev.meta.guide.clone() else {
             return;
-        }
+        };
+        let before = g.clone();
         let firewall_seen = self.settings.ui.firewall_note_seen;
         let mut dismiss_firewall = false;
         let mut publish = false;
@@ -2635,17 +2618,20 @@ impl CydLabApp {
         let mut rotate = None;
         let wifi_on = self.devices[i].dev.meta.network.wifi;
         let d = &mut self.devices[i];
-        let g = d.guide.as_mut().unwrap();
         let n = &d.dev.meta.network;
         let api = n.forwards.iter().find(|f| f.guest == 6053).map(|f| f.host);
         let ota = n.forwards.iter().find(|f| f.label.contains("OTA")).map(|f| f.host);
         let published = api.is_some() && n.wifi && n.lan;
         let firmware_done = !d.flash_blank && d.pending_flash.is_none() && d.web_job.is_none();
         let installing = d.pending_flash.is_some() || d.web_job.is_some();
-        let wifi_connected = d.wifi_watch.connected;
-        let wifi_done = matches!(d.improv.outcome, Some(Ok(_))) || wifi_connected;
+        // Remembered in device.toml, so a finished step stays ticked after a restart.
+        g.wifi_connected |= d.wifi_watch.connected;
+        g.wifi_sent |= matches!(d.improv.outcome, Some(Ok(_)));
+        let wifi_connected = g.wifi_connected;
+        let wifi_done = g.wifi_sent || wifi_connected;
         let ha_client = d.api_client.clone();
-        let ha_done = g.ha_manual || ha_client.as_deref().is_some_and(|c| c.contains("Home Assistant"));
+        g.ha_seen |= ha_client.as_deref().is_some_and(|c| c.contains("Home Assistant"));
+        let ha_done = g.ha_manual || g.ha_seen;
         let mut close = false;
         let green = Color32::from_rgb(110, 200, 130);
         let tick = |ui: &mut egui::Ui, done: bool, text: &str| {
@@ -2736,8 +2722,10 @@ impl CydLabApp {
             }
         });
         ui.add_space(4.0);
-        if close {
-            d.guide = None;
+        let after = (!close).then_some(g);
+        if after != Some(before) {
+            d.dev.meta.guide = after;
+            let _ = self.store.update_meta(&d.dev);
         }
         if send_wifi {
             let wifi = d.dev.meta.network.effective(&self.settings.wifi);
@@ -2776,7 +2764,12 @@ impl CydLabApp {
         let mut restart = false;
         let d = &mut self.devices[i];
         let serial = d.backend.capabilities().serial_tcp.filter(|_| alive);
-        let waiting = d.improv.state == Some(State::Ready) && d.improv.busy != Some("provision") && !matches!(d.improv.outcome, Some(Ok(_)));
+        // Passive: the firmware said so (Improv state it printed, or a setup line in its log), or
+        // it put up an access point (named in the log, or seen by the engine's phone).
+        let seen_ap = d.ap.status.as_ref().and_then(|s| s.phone.as_ref()).and_then(|p| p.hotspots.first()).map(|h| h.ssid.clone()).or_else(|| d.hotspot_ssids.last().cloned());
+        let connected = d.wifi_watch.connected || matches!(d.improv.outcome, Some(Ok(_)));
+        let improv_ready = d.improv.state == Some(State::Ready);
+        let waiting = alive && !connected && d.improv.busy != Some("provision") && (improv_ready || d.improv.waiting_log || seen_ap.is_some());
         let send_tip = if !wifi_on {
             "Wi-Fi is off for this device (Network section)".to_string()
         } else {
@@ -2788,9 +2781,17 @@ impl CydLabApp {
             egui::Frame::new().fill(Color32::from_rgb(90, 60, 10)).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("This firmware is waiting for Wi-Fi setup:").color(Color32::WHITE));
-                    if ui.add_enabled(send_enabled, egui::Button::new("Send Wi-Fi details")).on_hover_text(&send_tip).clicked() {
+                    let lead = match &seen_ap {
+                        Some(ap) => format!("This firmware is waiting for Wi-Fi setup (it opened the hotspot \"{ap}\"):"),
+                        None => "This firmware is waiting for Wi-Fi setup:".to_string(),
+                    };
+                    ui.label(RichText::new(lead).color(Color32::WHITE));
+                    let improv_tip = if improv_ready || d.improv.capable { send_tip.clone() } else { format!("{send_tip}\n\nIts log doesn't say it supports Improv: if it doesn't, it ignores this (or prints an error) and you set it up through its hotspot instead.") };
+                    if ui.add_enabled(send_enabled, egui::Button::new("Send Wi-Fi details")).on_hover_text(improv_tip).clicked() {
                         job = Some(provision.clone());
+                    }
+                    if seen_ap.is_some() {
+                        ui.label(RichText::new("or join it under Device hotspot below").small().color(Color32::from_gray(220)));
                     }
                 });
             });
@@ -2802,7 +2803,7 @@ impl CydLabApp {
             }
             if ui
                 .add_enabled(serial.is_some() && d.improv.busy.is_none(), egui::Button::new(RichText::new("Check").small()))
-                .on_hover_text("Asks the firmware over serial whether it supports Wi-Fi setup (Improv) and what state it is in. Briefly takes the serial port: a connected tool is disconnected.")
+                .on_hover_text("Asks the firmware over serial whether it supports Wi-Fi setup (Improv) and what state it is in. Sends bytes to the board (firmware without Improv may print an error). Briefly takes the serial port: a connected tool is disconnected.")
                 .clicked()
             {
                 job = Some(crate::improv::Job::Probe);
@@ -2812,9 +2813,10 @@ impl CydLabApp {
                 (Some("provision"), None) => "sending…".into(),
                 (Some(_), _) => "asking the firmware…".into(),
                 (None, Some(s)) => format!("firmware: {}", s.label()),
-                (None, None) if alive && d.improv.probe_at.is_some() => "checking after boot…".into(),
-                (None, None) if alive => "no Improv answer (the firmware may use a hotspot or its own menu instead)".into(),
-                (None, None) => "power on to check".into(),
+                (None, None) if alive && d.improv.capable => "its log says it supports Improv (nothing sent yet)".into(),
+                (None, None) if alive && connected => "on Wi-Fi".into(),
+                (None, None) if alive => "nothing is sent until you ask (Check sends an Improv request)".into(),
+                (None, None) => "power on first".into(),
             };
             if d.improv.busy.is_some() {
                 ui.spinner();

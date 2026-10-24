@@ -1250,6 +1250,7 @@ mod tests {
                 created: 0,
                 network: Default::default(),
                 screen_window: Default::default(),
+                guide: None,
             },
         };
         (profile, device)

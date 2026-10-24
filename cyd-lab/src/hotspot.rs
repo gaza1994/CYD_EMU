@@ -57,7 +57,7 @@ impl Plan {
 /// `Starting AccessPoint` lines are too varied, so only quoted names are taken there).
 pub fn sniff_ssid(line: &str) -> Option<String> {
     let lower = line.to_ascii_lowercase();
-    for key in ["ap ssid:", "softap ssid:", "softap ssid =", "starting ap:", "ap started:", "access point:", "hotspot:", "wifimanager ap:"] {
+    for key in ["ap ssid:", "softap ssid:", "softap ssid =", "starting ap:", "ap started:", "access point:", "hotspot:", "wifimanager ap:", "temporary access point", "opening access point"] {
         if let Some(at) = lower.find(key) {
             let rest = line[at + key.len()..].trim();
             let name = if let Some(q) = rest.strip_prefix('\'') {
