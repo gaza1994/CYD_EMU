@@ -2658,7 +2658,7 @@ impl CydLabApp {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("Set up {}", g.name)).strong().color(Color32::WHITE));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    close = ui.small_button("✕").on_hover_text("Hide this checklist").clicked();
+                    close = ui.small_button("×").on_hover_text("Hide this checklist").clicked();
                 });
             });
             ui.horizontal(|ui| {
@@ -3624,6 +3624,17 @@ impl Drop for CydLabApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symbol_fonts_are_bundled() {
+        // The checklist ticks (✔ ○), ⚠ and friends come from egui's emoji fallback fonts,
+        // which egui 0.37 only ships with its `monochrome_emoji_fonts` feature: without it
+        // they draw as empty boxes.
+        let defs = egui::FontDefinitions::default();
+        let prop = &defs.families[&egui::FontFamily::Proportional];
+        assert!(prop.iter().any(|f| f == "NotoEmoji-Regular"), "{prop:?}");
+        assert!(prop.iter().any(|f| f == "emoji-icon-font"), "{prop:?}");
+    }
 
     #[test]
     fn screen_zoom_is_a_whole_number_that_fits() {
