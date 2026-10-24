@@ -198,6 +198,9 @@ fn network_help_ui(ui: &mut egui::Ui, ip: &str, n: &crate::network::DeviceNetwor
     }
     ui.separator();
     ui.label(RichText::new("Windows: the first time a device with published ports powers on, Windows Firewall asks about esp32sim. Tick Private networks and click Allow, or other machines can't connect.").small().weak());
+    if mdns && n.lan {
+        ui.label(RichText::new("Discovery: esp32sim answers mDNS (UDP 5353) on this PC's network for the device, so Home Assistant finds it and name.local resolves. The same firewall rule covers it; a firewall that blocks UDP 5353 for esp32sim stops discovery (adding by IP and port still works).").small().weak());
+    }
     add
 }
 
@@ -2591,7 +2594,7 @@ impl CydLabApp {
                 });
                 if published && cfg!(windows) && !firewall_seen {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Windows Firewall asks about esp32sim the first time: allow it on Private networks so Home Assistant can connect.").small().color(Color32::from_rgb(240, 200, 120)));
+                        ui.label(RichText::new("Windows Firewall asks about esp32sim the first time: allow it on Private networks so Home Assistant can connect and discover it (TCP for the ports, UDP 5353 for mDNS).").small().color(Color32::from_rgb(240, 200, 120)));
                         if ui.small_button("Got it").clicked() {
                             dismiss_firewall = true;
                         }
@@ -2960,8 +2963,8 @@ impl CydLabApp {
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(format!("This PC: {}", ip.map(|i| i.to_string()).unwrap_or_else(|| "no network address found".into()))).small());
-                    if features.mdns_relay {
-                        ui.label(RichText::new("mDNS: relayed, so name.local and discovery work.").small().weak());
+                    if features.mdns_relay && d.dev.meta.network.lan && d.dev.meta.network.wifi {
+                        ui.label(RichText::new("mDNS: relayed on this PC's network (UDP 5353), so name.local and Home Assistant discovery work; allow esp32sim in the firewall.").small().weak());
                     }
                 });
             });
