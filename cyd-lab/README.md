@@ -61,7 +61,9 @@ fall back to OpenGL if that fails.
 | Engine feature detection (`--help`, binary scan as a fallback), shown in Settings and as badges | |
 | PNG fallback (`--tft-png`), console with a 5000-line ring buffer | |
 | [Install from web installer](#install-from-web-installer): ESP Web Tools manifests (URL or file), tested with openHASP | |
-| [Wi-Fi setup](#wi-fi-setup-improv-and-device-hotspots): Improv over serial (**Send Wi-Fi details**), auto-detected after boot; tested with WLED and the bundled ESPHome HA image | **Device hotspot** (join a firmware's own setup AP): UI ready, greyed out until the engine has `--ap-client`/`--ap-fwd` |
+| [Wi-Fi setup](#wi-fi-setup-improv-and-device-hotspots): Improv over serial (**Send Wi-Fi details**), auto-detected after boot; tested with WLED and the bundled ESPHome HA image | |
+| **Device hotspot** (join a firmware's own setup AP, live over the engine's control channel, page via a Host-rewriting proxy): openHASP and NerdMiner portals tested end to end | Hidden when the engine lacks `--ap-client`/`--ap-fwd` |
+| Every engine board in **New device** (from `esp32sim --list-boards`), profiles can point at a `--board-config` TOML | Only the 2432S028R boards have catalogue entries (both 2.8" variants share them) |
 | [Install firmware gallery](#install-firmware-gallery): bundled, verified catalogue per board, SHA-256 checked one-click installs (openHASP and NerdMiner tested end to end), config templates | Catalogue refresh from the web is off by default; the gallery only lists boards in the catalogue |
 | First run: bundled engine, pinned ROM download with progress/error/retry, portable mode, drag-and-drop `.bin` with offset guessing, **Set up Arduino IDE**, **Use with...** | Exe not code-signed (SmartScreen) |
 | [Arduino IDE 2 / arduino-cli](#arduino-ide-2--arduino-cli-no-driver) over the network: discovery, upload, monitor (arduino-cli on Linux) | Arduino IDE 2 on Windows not yet run; the package index isn't hosted anywhere yet |
@@ -160,6 +162,8 @@ sleeps when nothing happens.
 | --- | --- | --- |
 | `--chip esp32` | profile `chip` | |
 | `--board <name>` | profile `[engine] board` | `cyd-2432s028r`, `tdisplay` |
+| `--board-config <file.toml>` | profile `[engine] board_config` (relative to the profiles folder), instead of `board` | a classic board the engine has no built-in model for |
+| `--list-boards` | read at startup: each engine board not already covered by a profile becomes a **New device** entry (`esp32-<model>`) | |
 | `--boot rom` | always | runs the real mask ROM, so straps and download mode behave like hardware |
 | `--rom <rom_dir>/<rom>` | Settings ROM dir + profile `[engine] rom` | `esp32_rev300_rom.elf`; left out if no ROM dir is set |
 | `--flash-file <device>/flash.bin` | device, engine has `--flash-file` | read at start, written back on a clean quit; the "flash write-back" badge |
@@ -404,12 +408,21 @@ hotspot with a phone. In cyd-lab:
   about 30 s, reports `http://10.0.2.15`) and the bundled ESPHome HA image (about 4 s).
   ESPHome Web can't finish (Bluetooth crash in the emulator).
 - **Device hotspot.** Firmware that starts its own setup AP (openHASP `HASP-xxxxxx`,
-  NerdMinerAP, WLED-AP, `cyd-panel-xxxxxx`, ...) is listed when its log names the AP. Pick
-  it, enter the password from the card, and **Connect & open setup page** restarts the
-  device with the engine joining that AP and the setup page forwarded to
-  `http://127.0.0.1:PORT/`, which opens in your browser. This needs the engine's
-  `--ap-client`/`--ap-fwd`, so until `esp32sim --help` lists them the section is greyed out
-  with "needs newer engine".
+  NerdMinerAP, WLED-AP, `cyd-panel-xxxxxx`, ...). Opening the section makes the engine's
+  virtual phone scan (`{"t":"ap_client"}` on the `--web` channel) and lists what's on the
+  air (polled with `{"t":"ap_status"}` every 2 s while the section is open), plus any AP
+  name the firmware logged. **Use** fills the form, with the password from the catalogue
+  when the name matches a firmware's hotspot (openHASP `haspadmin`, NerdMiner
+  `MineYourCoins`); otherwise type the one on the device's screen. **Connect & open setup
+  page** joins it at run time (no restart), forwards the page to an ephemeral
+  `127.0.0.1` port and opens it in your browser once the phone has a lease. The browser
+  goes through a small local proxy that sends `Host: 192.168.4.1` and rewrites redirects,
+  the way a phone would see it (NerdMiner's WiFiManager redirects any other host to
+  itself). Without the live link the same button restarts the device joined to the
+  hotspot (`--ap-client`/`--ap-fwd`). The section is hidden when the engine lacks them.
+  Tested end to end: openHASP (`POST /api/config/wifi/`) and NerdMiner (`/wifisave`), both
+  200 through the proxy (`cargo test e2e_setup_portal -- --ignored`, see the test for the
+  environment variables).
 
 ## Arduino IDE 2 / arduino-cli (no driver)
 
@@ -557,9 +570,10 @@ can reach the internet through this PC, and nothing changes on your real Wi-Fi.
   OTA tools connect to the port the firmware listens on, so OTA forwards keep PC port =
   firmware port; for a second device set it in the firmware too (ESPHome
   `ota: port: 3233`, Arduino `ArduinoOTA.setPort(3233)`).
-- **mDNS**: when the engine has `--mdns-relay` (detected from `--help`), cyd-lab passes
-  `--mdns-relay auto` so `name.local` and Home Assistant discovery work. The current engine
-  build doesn't have it yet: connect by IP.
+- **mDNS**: when the engine has `--mdns-relay` (detected from `--help`) and the device is
+  published on the LAN, cyd-lab passes `--mdns-relay auto` so `name.local` and Home
+  Assistant discovery work. That answers on UDP 5353, so the firewall needs to allow it as
+  well as the TCP ports.
 - **Windows Firewall**: the first time a device with published ports powers on, Windows
   asks about esp32sim. Tick *Private networks* and Allow, or other machines can't connect.
 - **Wi-Fi banner**: the console watches the firmware's Wi-Fi log (ESP-IDF `wifi:` reason
@@ -706,12 +720,14 @@ Ctrl-C/close), saving even when the log pipe is closed, `--serial-tcp` (RFC2217)
 4. **A save-on-Job-close story for Windows**: if cyd-lab crashes, the Job object kills the
    engine before it can save. A periodic or on-write flush of `--flash-file` would cover it.
 5. Optional: `--capabilities` with machine-readable output.
-6. **`--ap-client ssid=..,psk=..` and `--ap-fwd tcp:127.0.0.1:HP-IP:PORT`**: join the
-   firmware's own SoftAP as a client and forward its setup page (cyd-lab's Device hotspot
-   is waiting for these), and ideally a structured "AP started: SSID" event.
-7. **More board models** for the New device "Coming soon" list: the two-USB 2432S028R
-   (ST7789), 2432S024R/C, 2432S032R/C and 3248S035R/C (ST7796, capacitive GT911 touch).
-8. **Bluetooth** (ESPHome Web and Marauder crash or degrade without it).
+6. **Push `ap_status`** when the phone's state or the hotspot list changes, instead of
+   cyd-lab polling every 2 s.
+7. **Release a held touch when the `--web` client disconnects**, so a dropped link can't
+   leave a finger down on the device.
+8. **An event when a client connects to a forwarded port** (for example `{"t":"fwd",
+   "port":6053,"peer":"192.168.1.20"}`), so "Home Assistant connected" doesn't depend on
+   the firmware's log.
+9. **Bluetooth** (ESPHome Web and Marauder crash or degrade without it).
 
 ## License
 
