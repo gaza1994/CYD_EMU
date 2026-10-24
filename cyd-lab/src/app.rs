@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
@@ -55,6 +55,47 @@ pub struct AppSettings {
     pub wifi: crate::network::WifiDetails,
     /// Optional online refresh of the firmware catalogue (off by default).
     pub catalog: crate::catalog::CatalogSettings,
+    /// Text size and one-time notes.
+    pub ui: UiSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiSettings {
+    /// Text size on top of the system's display scale (Settings, or Ctrl +/-, Ctrl 0).
+    pub text_scale: f32,
+    /// The Windows Firewall note after publishing ports was dismissed.
+    pub firewall_note_seen: bool,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        UiSettings { text_scale: 1.0, firewall_note_seen: false }
+    }
+}
+
+/// Bigger, roomier text than egui's defaults (body 13 pt), and lighter grey labels so they
+/// stay readable on the dark theme. Sizes are in points: the system display scale and the
+/// Text size setting multiply them.
+pub fn apply_style(ctx: &egui::Context) {
+    use egui::{FontFamily, FontId, TextStyle};
+    ctx.all_styles_mut(|s| {
+        s.text_styles = [
+            (TextStyle::Heading, FontId::new(21.0, FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(15.5, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(15.0, FontFamily::Proportional)),
+            (TextStyle::Small, FontId::new(13.0, FontFamily::Proportional)),
+            (TextStyle::Monospace, FontId::new(14.0, FontFamily::Monospace)),
+        ]
+        .into();
+        s.spacing.item_spacing = egui::vec2(9.0, 6.0);
+        s.spacing.button_padding = egui::vec2(8.0, 4.0);
+        s.spacing.interact_size.y = 24.0;
+        if s.visuals.dark_mode {
+            s.visuals.weak_text_color = Some(Color32::from_gray(165));
+            s.visuals.override_text_color = None;
+        }
+    });
 }
 
 impl AppSettings {
@@ -274,11 +315,21 @@ struct DeviceView {
     boot_latched: bool,
     /// GPIO0 level last sent over the live link (BOOT pressed).
     boot_pin_low: bool,
+    /// The panel's last frame from the live link. Cleared at power-on (a real panel starts
+    /// dark) and kept untouched while the link reconnects.
     screen: Option<TextureHandle>,
     screen_size: (usize, usize),
-    screen_from_png: bool,
-    png_checked: Option<Instant>,
-    png_mtime: Option<SystemTime>,
+    /// The live link dropped while running and is reconnecting.
+    link_lost: bool,
+    /// The pointer's panel pixel over the screen (shown in the strip under it).
+    hover_px: Option<(u16, u16)>,
+    /// Main-panel zoom: 0 = largest whole number that fits.
+    main_zoom: u8,
+    /// The pop-out window: position to open at and size to ask for (fixed while open, so
+    /// egui only sends the OS a command when they change).
+    pop_pos0: Option<egui::Pos2>,
+    pop_size: Vec2,
+    pop_moved: Option<Instant>,
     link_up: bool,
     link_note: String,
     touch_down: Option<(u16, u16)>,
@@ -288,7 +339,6 @@ struct DeviceView {
     touch_release_due: Option<(u16, u16, std::time::Instant)>,
     touch_note: String,
     serial_input: String,
-    rename_buf: String,
     import_offset: String,
     import_path: String,
     /// "Install from web installer": manifest URL or local manifest.json.
@@ -318,7 +368,7 @@ struct DeviceView {
     improv: ImprovUi,
     /// Access point names the firmware announced in this run (its setup hotspot).
     hotspot_ssids: Vec<String>,
-    /// "Device hotspot": join this network at the next power-on (needs a newer engine).
+    /// "Device hotspot": join this network at the next power-on (engines with --ap-client).
     hotspot: Option<crate::hotspot::Plan>,
     /// Open the hotspot's setup page in the browser once the restarted run is up.
     hotspot_open_at: Option<Instant>,
@@ -326,7 +376,261 @@ struct DeviceView {
     hotspot_form: (String, String, String),
     /// After installing a firmware with a first-setup guide (the Home Assistant entry):
     /// its id, shown as a step card until dismissed.
-    setup_card: Option<String>,
+    /// The setup checklist after installing a catalogue firmware that needs setting up.
+    guide: Option<Guide>,
+    /// The last ESPHome API client the firmware logged as connected.
+    api_client: Option<String>,
+}
+
+/// The setup checklist after installing a catalogue firmware (ticks itself from real state).
+struct Guide {
+    name: String,
+    improv: bool,
+    home_assistant: bool,
+    /// Bundled ESPHome config ("Copy config"), if any.
+    config: String,
+    /// How this firmware expects the board to be held (only suggested).
+    rotation: Option<u16>,
+    notes: Vec<String>,
+    /// "Added to Home Assistant" ticked by hand (when no API client shows in the log).
+    ha_manual: bool,
+    config_copied: bool,
+}
+
+/// Largest whole-number zoom (screen pixels per panel pixel) at which a `view`-sized
+/// picture fits in `avail` points; at least 1 (then it scrolls off rather than shrink).
+fn fit_zoom(avail: Vec2, view: (usize, usize), ppp: f32) -> u32 {
+    let zx = avail.x * ppp / view.0.max(1) as f32;
+    let zy = avail.y * ppp / view.1.max(1) as f32;
+    (zx.min(zy).floor().max(1.0) as u32).min(8)
+}
+
+fn rotation_label(r: u16) -> &'static str {
+    match r {
+        90 => "turned right",
+        180 => "upside down",
+        270 => "turned left",
+        _ => "upright",
+    }
+}
+
+/// Fit / 1x / 2x / 3x (0 = fit).
+fn zoom_combo(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, zoom: &mut u8) {
+    let label = |z: u8| if z == 0 { "Fit".to_string() } else { format!("{z}x") };
+    egui::ComboBox::from_id_salt(id).width(56.0).selected_text(label(*zoom)).show_ui(ui, |ui| {
+        for z in [0u8, 1, 2, 3, 4] {
+            ui.selectable_value(zoom, z, label(z));
+        }
+    })
+    .response
+    .on_hover_text("Whole-number zoom, so every panel pixel is the same size. 1x = one screen pixel per panel pixel.");
+}
+
+impl DeviceView {
+    /// The panel's size: the live frame's, else the profile's.
+    fn panel_dims(&self, profile: Option<&Profile>) -> (usize, usize) {
+        if self.screen.is_some() {
+            return self.screen_size;
+        }
+        profile.and_then(|p| p.panel_size()).map(|(w, h)| (w as usize, h as usize)).unwrap_or((240, 320))
+    }
+
+    /// What the screen shows right now, in words (for the strip and the pop-out title), and
+    /// a colour when it is not simply live.
+    fn screen_status(&self, powered: bool, running: bool, live_link: bool) -> (String, Option<Color32>) {
+        let orange = Color32::from_rgb(240, 170, 60);
+        if !powered {
+            ("Powered off".into(), None)
+        } else if !running {
+            ("Powering off…".into(), None)
+        } else if !live_link {
+            ("No live screen: Live link is off in Settings".into(), Some(orange))
+        } else if self.link_up && self.screen.is_some() {
+            ("Live".into(), None)
+        } else if self.link_up {
+            ("Waiting for the first frame".into(), None)
+        } else if self.link_lost {
+            ("Link lost, reconnecting…".into(), Some(orange))
+        } else {
+            ("Connecting to the engine…".into(), None)
+        }
+    }
+
+    /// The emulated panel, pixel for pixel at a whole-number zoom (in physical screen
+    /// pixels), and the mouse as a finger. Nothing is ever drawn over it: a real panel shows
+    /// only what the firmware draws, so state goes in the strip below (`screen_strip`).
+    fn screen_view(&mut self, ui: &mut egui::Ui, panel: (usize, usize), zoom: u32, powered: bool) {
+        let (panel_w, panel_h) = panel;
+        let rot = self.dev.meta.view_rotation;
+        let (vw, vh) = rotated_size(rot, panel_w, panel_h);
+        let ppp = ui.ctx().pixels_per_point();
+        let size = Vec2::new(vw as f32, vh as f32) * zoom.max(1) as f32 / ppp;
+        let (alloc, resp) = ui.allocate_exact_size(size + Vec2::splat(2.0), Sense::click_and_drag());
+        // On the physical pixel grid, so each panel pixel is exactly zoom×zoom pixels.
+        let min = alloc.min + Vec2::splat(1.0);
+        let rect = Rect::from_min_size(egui::pos2((min.x * ppp).round() / ppp, (min.y * ppp).round() / ppp), size);
+        let painter = ui.painter();
+        // Bezel outside the panel, then the panel: dark until the firmware draws.
+        painter.rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_gray(90)), egui::StrokeKind::Outside);
+        painter.rect_filled(rect, 0.0, Color32::BLACK);
+        if let (true, Some(tex)) = (powered, &self.screen) {
+            let mut mesh = egui::Mesh::with_texture(tex.id());
+            let corners = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()];
+            let uvs = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+            for (pos, (u, v)) in corners.iter().zip(uvs) {
+                let (pu, pv) = view_to_panel_norm(rot, u, v);
+                mesh.vertices.push(egui::epaint::Vertex { pos: *pos, uv: Pos2::new(pu, pv), color: Color32::WHITE });
+            }
+            mesh.add_triangle(0, 1, 2);
+            mesh.add_triangle(0, 2, 3);
+            painter.add(egui::Shape::mesh(mesh));
+        }
+
+        // --- touch: mouse on the screen = finger on the panel
+        let pointer = resp.interact_pointer_pos().or(resp.hover_pos());
+        // Losing focus mid-press (Alt+Tab, another window popping up) never delivers the
+        // button-up: let go then, rather than leave the finger on the panel.
+        let focused = ui.input(|i| i.viewport().focused != Some(false));
+        let now = Instant::now();
+        if resp.is_pointer_button_down_on() && focused {
+            if let Some((x, y)) = pointer.and_then(|p| view_to_panel_px(rot, panel_w, panel_h, rect, p)) {
+                if self.touch_down != Some((x, y)) {
+                    self.touch_release_due = None;
+                    if self.touch_down.is_none() {
+                        self.touch_since = Some(now);
+                    }
+                    self.touch_down = Some((x, y));
+                    self.touch_note = match self.backend.touch(x, y, true) {
+                        Ok(()) => format!("touch ({x}, {y})"),
+                        Err(e) => format!("touch ({x}, {y}) not delivered: {e}"),
+                    };
+                }
+            }
+        } else if let Some((x, y)) = self.touch_down.take() {
+            // The engine samples the panel at its own pace, so a press+release inside one
+            // frame would be missed: every touch is held >= MIN_TOUCH_HOLD (see poll_backends).
+            let since = self.touch_since.take().unwrap_or(now);
+            self.touch_release_due = Some((x, y, if focused { since + MIN_TOUCH_HOLD } else { now }));
+        } else if resp.clicked() && self.touch_release_due.is_none() {
+            // Down and up landed in the same frame: synthesise the press now.
+            if let Some((x, y)) = pointer.and_then(|p| view_to_panel_px(rot, panel_w, panel_h, rect, p)) {
+                self.touch_note = match self.backend.touch(x, y, true) {
+                    Ok(()) => format!("touch ({x}, {y})"),
+                    Err(e) => format!("touch ({x}, {y}) not delivered: {e}"),
+                };
+                self.touch_release_due = Some((x, y, now + MIN_TOUCH_HOLD));
+            }
+        }
+        self.hover_px = resp.hover_pos().and_then(|p| view_to_panel_px(rot, panel_w, panel_h, rect, p));
+    }
+
+    /// Release a touch whose minimum hold is over (for every device, each frame).
+    fn release_due_touch(&mut self, ctx: &egui::Context) {
+        if let Some((x, y, due)) = self.touch_release_due {
+            let now = Instant::now();
+            if now >= due {
+                self.touch_release_due = None;
+                self.touch_note = match self.backend.touch(x, y, false) {
+                    Ok(()) => format!("release ({x}, {y})"),
+                    Err(e) => format!("release ({x}, {y}) not delivered: {e}"),
+                };
+            } else {
+                ctx.request_repaint_after(due - now);
+            }
+        }
+    }
+
+    /// The line under the screen: what it shows (live / off / link lost), zoom, touch, and
+    /// the panel pixel under the mouse.
+    fn screen_strip(&self, ui: &mut egui::Ui, powered: bool, running: bool, live_link: bool, zoom: u32) {
+        let (status, colour) = self.screen_status(powered, running, live_link);
+        ui.horizontal_wrapped(|ui| {
+            let mut t = RichText::new(&status);
+            if let Some(c) = colour {
+                t = t.color(c).strong();
+            }
+            let r = ui.label(t);
+            if self.link_lost && powered {
+                r.on_hover_text(format!("{}\nThe screen keeps the last frame it got until the link is back.", self.link_note));
+            }
+            if self.link_lost && powered && self.screen.is_some() {
+                ui.label(RichText::new("(last frame kept)").small().weak());
+            }
+            if zoom > 0 {
+                ui.label(RichText::new(format!("· {zoom}x")).small().weak());
+            }
+            if let Some((x, y)) = self.hover_px {
+                ui.label(RichText::new(format!("· panel ({x}, {y})")).small().weak());
+            }
+        });
+        if !self.touch_note.is_empty() && powered {
+            ui.label(RichText::new(&self.touch_note).small().weak());
+        }
+    }
+}
+
+const INTERNAL_IP_TIP: &str = "10.0.2.15 is the device's internal emulator address: only the emulator can reach it. Home Assistant and your browser use this PC's address and the published ports instead.";
+
+#[derive(Clone, Copy)]
+enum DevAction {
+    Rename,
+    Duplicate,
+    Delete,
+}
+
+/// Rename / Duplicate / Delete (device header and the device list's right-click menu).
+fn device_menu(ui: &mut egui::Ui) -> Option<DevAction> {
+    let mut a = None;
+    if ui.button("Rename…").clicked() {
+        a = Some(DevAction::Rename);
+    }
+    if ui.button("Duplicate").clicked() {
+        a = Some(DevAction::Duplicate);
+    }
+    ui.separator();
+    if ui.button(RichText::new("Delete…").color(Color32::from_rgb(255, 140, 130))).clicked() {
+        a = Some(DevAction::Delete);
+    }
+    if a.is_some() {
+        ui.close();
+    }
+    a
+}
+
+/// "Add to Home Assistant": the host and port to type into the ESPHome integration, big,
+/// each with a Copy button.
+fn ha_box(ui: &mut egui::Ui, api_port: Option<u16>) {
+    let host = cached_lan_ip().map(|ip| ip.to_string());
+    egui::Frame::new().fill(Color32::from_rgb(16, 28, 40)).stroke(Stroke::new(1.0, Color32::from_rgb(70, 110, 150))).inner_margin(8.0).corner_radius(4.0).show(ui, |ui| {
+        ui.label(RichText::new("In Home Assistant: Settings > Devices & services > Add integration > ESPHome, then enter:").small());
+        egui::Grid::new("ha-box").num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
+            let row = |ui: &mut egui::Ui, k: &str, v: Option<String>| {
+                ui.label(k);
+                match v {
+                    Some(v) => {
+                        ui.label(RichText::new(&v).monospace().size(20.0).strong().color(Color32::WHITE));
+                        if ui.button("Copy").clicked() {
+                            ui.ctx().copy_text(v);
+                        }
+                    }
+                    None => {
+                        ui.label(RichText::new("—").size(20.0));
+                        ui.label("");
+                    }
+                }
+                ui.end_row();
+            };
+            row(ui, "Host", host.clone());
+            row(ui, "Port", api_port.map(|p| p.to_string()));
+        });
+        if host.is_none() {
+            ui.label(RichText::new("No network address found for this PC: is it connected to your network?").small().color(Color32::from_rgb(240, 170, 60)));
+        }
+        if api_port.is_none() {
+            ui.label(RichText::new("Publish the ESPHome ports first (above).").small().weak());
+        }
+        ui.label(RichText::new("The device itself shows 10.0.2.15: that is its internal emulator address, not reachable from Home Assistant.").small().weak()).on_hover_text(INTERNAL_IP_TIP);
+    });
 }
 
 /// Improv Wi-Fi state for one device (see `crate::improv`).
@@ -409,7 +713,6 @@ impl DeviceView {
     fn new(dev: Device, waker: Waker) -> DeviceView {
         let flash_blank = flash_is_blank(&dev.flash_path());
         DeviceView {
-            rename_buf: dev.meta.name.clone(),
             dev,
             backend: Box::new(ProcessBackend::new(waker)),
             console: VecDeque::new(),
@@ -418,9 +721,12 @@ impl DeviceView {
             boot_pin_low: false,
             screen: None,
             screen_size: (0, 0),
-            screen_from_png: false,
-            png_checked: None,
-            png_mtime: None,
+            link_lost: false,
+            hover_px: None,
+            main_zoom: 0,
+            pop_pos0: None,
+            pop_size: Vec2::ZERO,
+            pop_moved: None,
             link_up: false,
             link_note: String::new(),
             touch_down: None,
@@ -447,7 +753,8 @@ impl DeviceView {
             hotspot: None,
             hotspot_open_at: None,
             hotspot_form: (String::new(), String::new(), crate::hotspot::GUEST_AP_IP.to_string()),
-            setup_card: None,
+            guide: None,
+            api_client: None,
         }
     }
 
@@ -675,6 +982,9 @@ impl DeviceView {
         }
         let line = strip_ansi(&line);
         if stream != Stream::Lab {
+            if let Some(c) = crate::network::api_client_connected(&line) {
+                self.api_client = Some(c);
+            }
             if let Some(st) = crate::improv::sniff_console(&line) {
                 self.improv.state = Some(st);
             }
@@ -715,6 +1025,10 @@ pub struct CydLabApp {
     selected: Option<usize>,
     new_device: Option<NewDeviceDialog>,
     confirm_delete: Option<String>,
+    /// Rename dialog: device id and the name being typed.
+    rename: Option<(String, String)>,
+    /// The zoom factor last applied/saved (Ctrl +/-/0 change egui's directly).
+    text_scale: f32,
     status: String,
     waker: Waker,
     /// What `running.json` last said (rewritten only when this changes).
@@ -737,6 +1051,9 @@ impl CydLabApp {
         let ctx = cc.egui_ctx.clone();
         let waker: Waker = Arc::new(move || ctx.request_repaint());
         let (settings, settings_err) = AppSettings::load(&paths.settings);
+        apply_style(&cc.egui_ctx);
+        let text_scale = if (0.5..=3.0).contains(&settings.ui.text_scale) { settings.ui.text_scale } else { 1.0 };
+        cc.egui_ctx.set_zoom_factor(text_scale);
         let profiles = ProfileLibrary::load(Some(&paths.profiles));
         let store = DeviceStore::open(&paths.devices).expect("device store");
         let mut status = String::new();
@@ -769,6 +1086,8 @@ impl CydLabApp {
             selected,
             new_device: None,
             confirm_delete: None,
+            rename: None,
+            text_scale,
             status,
             waker,
             running_written: None,
@@ -1173,6 +1492,14 @@ impl CydLabApp {
         d.wifi_ap = d.dev.meta.network.effective(&self.settings.wifi);
         d.wifi_watch = Default::default();
         d.link_up = false;
+        d.link_lost = false;
+        // A real panel starts dark: never show the previous run's last frame.
+        d.screen = None;
+        d.api_client = None;
+        d.touch_down = None;
+        d.touch_since = None;
+        d.touch_release_due = None;
+        d.touch_note.clear();
         d.link_note = if self.settings.engine.live_link { "connecting to engine --web…".into() } else { "live link disabled in Settings".into() };
         if let Err(e) = r {
             d.lab(format!("power on failed: {e:#}"));
@@ -1210,6 +1537,10 @@ impl CydLabApp {
         });
         let d = &mut self.devices[i];
         d.link_up = false;
+        d.link_lost = false;
+        d.screen = None; // power-cycled: the panel lost power too
+        d.touch_down = None;
+        d.touch_release_due = None;
         if let Err(e) = r {
             d.lab(format!("reset failed: {e:#}"));
         }
@@ -1239,17 +1570,28 @@ impl CydLabApp {
                     EngineEvent::Exited(_) => {
                         d.flash_blank = flash_is_blank(&d.dev.flash_path());
                         d.link_up = false;
+                        d.link_lost = false;
                         d.touch_down = None;
                         d.touch_since = None;
                         d.touch_release_due = None;
                     }
                     EngineEvent::LinkUp => {
                         d.link_up = true;
+                        d.link_lost = false;
                         d.link_note = "live link connected".into();
                     }
                     EngineEvent::LinkDown(why) => {
                         d.link_up = false;
+                        // Never leave the finger down: the release is queued and sent as
+                        // soon as the link is back (the link also re-sends it itself).
+                        let held = d.touch_down.take().or(d.touch_release_due.take().map(|(x, y, _)| (x, y)));
+                        if let Some((x, y)) = held {
+                            let _ = d.backend.touch(x, y, false);
+                            d.touch_since = None;
+                            d.touch_note = format!("released ({x}, {y}): link dropped");
+                        }
                         if matches!(d.backend.state(), RunState::Running(_)) {
+                            d.link_lost = true;
                             d.link_note = why.clone();
                             d.lab(format!("live link: {why}"));
                         } else {
@@ -1270,32 +1612,14 @@ impl CydLabApp {
             if d.improv.busy.is_some() || d.improv.probe_at.is_some() || d.hotspot_open_at.is_some() {
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
+            d.release_due_touch(ctx);
             if let Some(f) = d.backend.take_frame() {
                 let img = egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &f.rgba);
                 match &mut d.screen {
-                    Some(t) if d.screen_size == (f.width, f.height) && !d.screen_from_png => t.set(img, TextureOptions::NEAREST),
+                    Some(t) if d.screen_size == (f.width, f.height) => t.set(img, TextureOptions::NEAREST),
                     _ => d.screen = Some(ctx.load_texture(format!("screen-{}", d.dev.id), img, TextureOptions::NEAREST)),
                 }
                 d.screen_size = (f.width, f.height);
-                d.screen_from_png = false;
-            }
-            // Fallback: the engine's --tft-png snapshot (written at the end of a run).
-            if !d.link_up && d.png_checked.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
-                d.png_checked = Some(Instant::now());
-                let path = d.dev.screen_path();
-                if let Ok(m) = std::fs::metadata(&path).and_then(|m| m.modified()) {
-                    if Some(m) != d.png_mtime && (d.screen.is_none() || d.screen_from_png) {
-                        d.png_mtime = Some(m);
-                        if let Ok(img) = image::open(&path) {
-                            let rgba = img.to_rgba8();
-                            let size = [rgba.width() as usize, rgba.height() as usize];
-                            let ci = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                            d.screen = Some(ctx.load_texture(format!("png-{}", d.dev.id), ci, TextureOptions::LINEAR));
-                            d.screen_size = (size[0], size[1]);
-                            d.screen_from_png = true;
-                        }
-                    }
-                }
             }
             any_running |= matches!(d.backend.state(), RunState::Running(_) | RunState::Stopping);
         }
@@ -1638,16 +1962,37 @@ impl CydLabApp {
         if let Some(e) = install {
             let cache = self.paths.root.join("cache").join("firmware");
             let w = self.waker.clone();
+            let others: Vec<_> = self.devices.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, o)| o.dev.meta.network.clone()).collect();
             let d = &mut self.devices[i];
-            d.setup_card = (!e.steps.is_empty()).then(|| e.id.clone());
+            let improv = e.first_setup.as_ref().is_some_and(|f| f.improv);
+            d.guide = (e.home_assistant || improv || !e.steps.is_empty() || e.view_rotation.is_some()).then(|| Guide {
+                name: e.name.clone(),
+                improv,
+                home_assistant: e.home_assistant,
+                config: e.config.clone(),
+                rotation: e.view_rotation,
+                notes: e.steps.clone(),
+                ha_manual: false,
+                config_copied: false,
+            });
+            if e.home_assistant {
+                // Home Assistant has to reach the device: publish the ESPHome API and OTA
+                // ports on the network (free PC ports picked), so "Add to Home Assistant" works.
+                let n = &mut d.dev.meta.network;
+                let added = n.add_preset_free(&crate::network::PRESETS[0], &others, &|p| bind_is_free("0.0.0.0", p));
+                if added > 0 || !n.lan || !n.wifi {
+                    n.wifi = true;
+                    n.lan = true;
+                    let _ = self.store.update_meta(&d.dev);
+                    let ports: Vec<String> = d.dev.meta.network.forwards.iter().map(|f| format!("{} {}", f.label, f.host)).collect();
+                    d.lab(format!("published for Home Assistant on the network: {}", ports.join(", ")));
+                }
+            }
+            // The view's rotation is how the board is held: only suggested (setup checklist).
             if let Some(f) = &e.first_setup {
                 if !f.hotspot.is_empty() {
                     d.hotspot_form = (String::new(), f.password.clone(), f.page_ip().unwrap_or_else(|| crate::hotspot::GUEST_AP_IP.to_string()));
                 }
-            }
-            if let Some(r) = e.view_rotation.filter(|r| *r != d.dev.meta.view_rotation) {
-                d.dev.meta.view_rotation = r;
-                let _ = self.store.update_meta(&d.dev);
             }
             d.start_catalog_install(e, cache, w);
         }
@@ -1662,6 +2007,20 @@ impl CydLabApp {
         let mut save = false;
         let mut reload_profiles = false;
         egui::Window::new("Settings").collapsible(false).default_width(520.0).open(&mut open).show(ctx, |ui| {
+            ui.heading("Appearance");
+            ui.horizontal(|ui| {
+                ui.label("Text size");
+                let r = ui.add(egui::Slider::new(&mut draft.ui.text_scale, 0.8..=1.8).step_by(0.05).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+                // Applied when let go: resizing everything mid-drag moves the slider away.
+                if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                    ui.ctx().set_zoom_factor(draft.ui.text_scale);
+                }
+                if ui.button("Reset").clicked() {
+                    ui.ctx().set_zoom_factor(1.0);
+                }
+                ui.label(RichText::new("also Ctrl + / Ctrl − / Ctrl 0 · on top of the system's display scale").small().weak());
+            });
+            ui.separator();
             let e = &mut draft.engine;
             ui.heading("Engine");
             egui::Grid::new("settings").num_columns(3).spacing([8.0, 6.0]).show(ui, |ui| {
@@ -1774,7 +2133,7 @@ impl CydLabApp {
             self.profiles = ProfileLibrary::load(Some(&self.paths.profiles));
         }
         if save {
-            let draft = self.settings_draft.take().unwrap();
+            let mut draft = self.settings_draft.take().unwrap();
             match draft.save(&self.paths.settings) {
                 Ok(()) => self.status = format!("Settings saved to {}", self.paths.settings.display()),
                 Err(e) => self.status = format!("Saving settings failed: {e:#}"),
@@ -1784,6 +2143,7 @@ impl CydLabApp {
                 self.catalog = c;
                 self.catalog_note = note.unwrap_or_default();
             }
+            draft.ui = self.settings.ui.clone();
             self.settings = draft;
         } else if !open {
             self.settings_draft = None;
@@ -1797,15 +2157,23 @@ impl CydLabApp {
             return;
         };
         let mut decision = None;
+        let running = !matches!(self.devices[i].backend.state(), RunState::Stopped);
         egui::Modal::new(egui::Id::unique("confirm-delete")).show(ctx, |ui| {
-            ui.heading("Delete device?");
-            ui.label(format!("\"{}\" and its folder will be removed:\n{}\nThis deletes its flash image and cannot be undone.", self.devices[i].dev.meta.name, self.devices[i].dev.dir.display()));
-            ui.add_space(8.0);
+            ui.set_max_width(460.0);
+            ui.heading(format!("Delete \"{}\"?", self.devices[i].dev.meta.name));
+            ui.add_space(4.0);
+            ui.label("This removes its flash, settings and folder. It cannot be undone.");
+            ui.label(RichText::new(self.devices[i].dev.dir.display().to_string()).monospace().weak());
+            if running {
+                ui.label(RichText::new("It is running: it is powered off first.").color(Color32::from_rgb(240, 170, 60)));
+            }
+            ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if ui.button(RichText::new("Delete").color(Color32::LIGHT_RED)).clicked() {
+                let del = egui::Button::new(RichText::new("Delete device").strong().color(Color32::WHITE)).fill(Color32::from_rgb(170, 40, 40));
+                if ui.add(del).clicked() {
                     decision = Some(true);
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                     decision = Some(false);
                 }
             });
@@ -1826,6 +2194,38 @@ impl CydLabApp {
         }
     }
 
+    fn rename_modal(&mut self, ctx: &egui::Context) {
+        let Some((id, mut buf)) = self.rename.take() else { return };
+        let Some(i) = self.devices.iter().position(|d| d.dev.id == id) else { return };
+        let mut decision = None;
+        egui::Modal::new(egui::Id::unique("rename-device")).show(ctx, |ui| {
+            ui.heading("Rename device");
+            let r = ui.add(egui::TextEdit::singleline(&mut buf).desired_width(280.0));
+            r.request_focus();
+            let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.label(RichText::new("Only the name changes: its folder, flash and ports stay.").small().weak());
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!buf.trim().is_empty(), egui::Button::new("Rename")).clicked() || (enter && !buf.trim().is_empty()) {
+                    decision = Some(true);
+                }
+                if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    decision = Some(false);
+                }
+            });
+        });
+        match decision {
+            Some(true) => {
+                let d = &mut self.devices[i];
+                if let Err(e) = self.store.rename(&mut d.dev, buf.trim()) {
+                    self.status = format!("Rename failed: {e:#}");
+                }
+            }
+            Some(false) => {}
+            None => self.rename = Some((id, buf)),
+        }
+    }
+
     // --- panels -----------------------------------------------------------
 
     fn device_list(&mut self, ui: &mut egui::Ui) {
@@ -1840,6 +2240,7 @@ impl CydLabApp {
         if self.devices.is_empty() {
             ui.label(RichText::new("No devices yet. Click + New to unbox one.").weak());
         }
+        let mut action = None;
         egui::ScrollArea::vertical().show(ui, |ui| {
             for (i, d) in self.devices.iter().enumerate() {
                 let (color, state) = status_of(d.backend.state(), d.backend.chip_status());
@@ -1856,8 +2257,38 @@ impl CydLabApp {
                 if resp.clicked() {
                     self.selected = Some(i);
                 }
+                resp.context_menu(|ui| {
+                    if let Some(a) = device_menu(ui) {
+                        action = Some((i, a));
+                    }
+                });
             }
         });
+        if let Some((i, a)) = action {
+            self.device_action(i, a);
+        }
+    }
+
+    fn device_action(&mut self, i: usize, a: DevAction) {
+        match a {
+            DevAction::Rename => self.rename = Some((self.devices[i].dev.id.clone(), self.devices[i].dev.meta.name.clone())),
+            DevAction::Delete => self.confirm_delete = Some(self.devices[i].dev.id.clone()),
+            DevAction::Duplicate => {
+                let src = self.devices[i].dev.clone();
+                let running = !matches!(self.devices[i].backend.state(), RunState::Stopped);
+                let name = format!("{} copy", src.meta.name);
+                match self.store.duplicate(&src, &name) {
+                    Ok(dev) => {
+                        let mut view = DeviceView::new(dev, self.waker.clone());
+                        view.lab(format!("duplicated from \"{}\" (flash, settings; new MAC and ports){}", src.meta.name, if running { ": the flash as last saved, since that device is running" } else { "" }));
+                        self.status = format!("Duplicated {} as {}", src.meta.name, view.dev.meta.name);
+                        self.devices.push(view);
+                        self.selected = Some(self.devices.len() - 1);
+                    }
+                    Err(e) => self.status = format!("Duplicate failed: {e:#}"),
+                }
+            }
+        }
     }
 
     fn open_new_device(&mut self) {
@@ -1874,6 +2305,7 @@ impl CydLabApp {
         let features = self.engine_features();
 
         // --- header
+        let mut action = None;
         ui.horizontal(|ui| {
             let d = &mut self.devices[i];
             let (color, s) = status_of(state, d.backend.chip_status());
@@ -1881,7 +2313,23 @@ impl CydLabApp {
             ui.painter().circle_filled(r.center(), 7.0, color);
             ui.heading(&d.dev.meta.name);
             ui.label(RichText::new(s).weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let del = egui::Button::new(RichText::new("Delete…").color(Color32::from_rgb(255, 140, 130)));
+                if ui.add(del).on_hover_text("Delete this device: its flash, settings and folder (asks first)").clicked() {
+                    action = Some(DevAction::Delete);
+                }
+                if ui.button("Duplicate").on_hover_text("A copy with the same flash and settings, a new MAC address and its own ports").clicked() {
+                    action = Some(DevAction::Duplicate);
+                }
+                if ui.button("Rename…").clicked() {
+                    action = Some(DevAction::Rename);
+                }
+            });
         });
+        if let Some(a) = action {
+            self.device_action(i, a);
+            return;
+        }
         let d = &self.devices[i];
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(profile.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| format!("unknown profile {}", d.dev.meta.profile))).strong());
@@ -1891,39 +2339,27 @@ impl CydLabApp {
             ui.label(format!("MAC {}", d.dev.meta.mac.as_deref().unwrap_or("-")));
         });
         let caps = d.backend.capabilities();
+        let live_link = self.settings.engine.live_link;
+        // What this engine gives the device (only what it has: nothing about what it lacks).
         ui.horizontal_wrapped(|ui| {
             let chip = |ui: &mut egui::Ui, on: bool, text: &str, tip: &str| {
-                let c = if on { Color32::from_rgb(90, 190, 110) } else { Color32::from_gray(120) };
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                 if on {
+                    let c = Color32::from_rgb(110, 200, 130);
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                     ui.painter().circle_filled(rect.center(), 3.5, c);
-                } else {
-                    ui.painter().circle_stroke(rect.center(), 3.0, egui::Stroke::new(1.0, c));
+                    ui.label(RichText::new(text).small().color(c)).on_hover_text(tip);
                 }
-                ui.label(RichText::new(text).small().color(c)).on_hover_text(tip);
             };
-            ui.label(RichText::new("Engine:").small().weak());
-            chip(ui, caps.live_screen, "live screen", "TFT frames over the engine's --web WebSocket");
+            chip(ui, caps.live_screen || (!alive && live_link), "live screen", "TFT frames over the engine's --web WebSocket");
             chip(ui, caps.touch, "touch", "Mouse clicks on the screen are sent as panel touches");
-            chip(ui, caps.png_snapshot, "PNG snapshot", "--tft-png: display saved when a run ends");
-            let (wb, wb_tip) = if alive {
-                (caps.flash_writeback, if caps.flash_writeback { "This run uses --flash-file: firmware writes are saved to flash.bin when you power off" } else { "This run uses --flash-image: firmware writes are lost at power-off" })
+            if alive {
+                chip(ui, caps.flash_writeback, "flash saved", "This run uses --flash-file: firmware writes are saved to flash.bin when you power off");
+                chip(ui, caps.serial_tcp.is_some(), "serial bridge", "UART0 served as RFC 2217 over TCP (--serial-tcp)");
             } else {
-                (features.flash_file, if features.flash_file { "Engine supports --flash-file: firmware writes persist across power cycles" } else { "This engine build has no --flash-file: firmware writes are lost at power-off" })
-            };
-            chip(ui, wb, "flash write-back", wb_tip);
-            let (sb, sb_tip) = if alive {
-                (caps.serial_tcp.is_some(), "UART0 served as RFC 2217 over TCP (--serial-tcp)")
-            } else {
-                (features.serial_tcp, if features.serial_tcp { "Engine supports --serial-tcp (RFC 2217, DTR/RTS auto-reset)" } else { "This engine build has no --serial-tcp yet" })
-            };
-            chip(ui, sb, "serial bridge", sb_tip);
+                chip(ui, features.flash_file, "flash saved", "Firmware writes persist across power cycles (--flash-file)");
+                chip(ui, features.serial_tcp, "serial bridge", "UART0 can be served as RFC 2217 (DTR/RTS auto-reset) for esptool and other tools");
+            }
         });
-        self.serial_bridge_ui(ui, i, alive, &features);
-        self.network_ui(ui, i, alive, &features);
-        self.wifi_setup_ui(ui, i, alive, &features);
-        ui.separator();
-
         // --- controls
         let mut power_toggle = false;
         let mut en = false;
@@ -1967,8 +2403,6 @@ impl CydLabApp {
         // --- firmware
         let mut erase = false;
         let mut import = false;
-        let mut delete = false;
-        let mut rename = false;
         let mut pick_bin = false;
         let mut web_install = false;
         let busy = self.devices[i].pending_flash.is_some() || self.devices[i].web_job.is_some();
@@ -1988,8 +2422,9 @@ impl CydLabApp {
             if busy {
                 ui.spinner();
             }
-            ui.label(RichText::new("…or drop a .bin / manifest.json onto this window").weak());
+            ui.label(RichText::new("or drop a .bin on the window").weak());
         });
+        egui::CollapsingHeader::new("More: install from a web flasher, write at an offset").id_salt(("more", i)).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             let d = &mut self.devices[i];
             ui.label(RichText::new("Install from web:").strong()).on_hover_text("ESP Web Tools manifest: the JSON behind an \"Install\" / \"Connect\" button on a web flasher page (openHASP, WLED, ESPHome projects, ...). cyd-lab downloads the ESP32 build's parts and writes them into flash.bin, as the browser would over Web Serial. On the flasher page, look for manifest.json in the page source or the browser's network tab.");
@@ -2006,7 +2441,6 @@ impl CydLabApp {
                 }
             });
         });
-        egui::CollapsingHeader::new(RichText::new("More: write at an offset, rename, delete").small()).id_salt(("more", i)).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 let d = &mut self.devices[i];
                 let size = d.dev.flash_size().map(|s| format!("{} MB", s / (1024 * 1024))).unwrap_or_else(|_| "missing".into());
@@ -2020,17 +2454,6 @@ impl CydLabApp {
                 }
                 if ui.add_enabled(!busy, egui::Button::new("Write")).clicked() {
                     import = true;
-                }
-            });
-            ui.horizontal(|ui| {
-                let d = &mut self.devices[i];
-                ui.add(egui::TextEdit::singleline(&mut d.rename_buf).desired_width(160.0));
-                if ui.button("Rename").clicked() {
-                    rename = true;
-                }
-                ui.separator();
-                if ui.button(RichText::new("Delete device…").color(Color32::LIGHT_RED)).clicked() {
-                    delete = true;
                 }
             });
         });
@@ -2061,26 +2484,166 @@ impl CydLabApp {
                 Err(e) => d.lab(format!("write failed: {e:#}")),
             }
         }
-        if rename {
-            let d = &mut self.devices[i];
-            let name = d.rename_buf.clone();
-            if let Err(e) = self.store.rename(&mut d.dev, &name) {
-                self.status = format!("Rename failed: {e:#}");
-            }
-        }
-        if delete {
-            self.confirm_delete = Some(self.devices[i].dev.id.clone());
-        }
+        self.serial_bridge_ui(ui, i, alive, &features);
+        self.network_ui(ui, i, alive, &features);
+        self.wifi_setup_ui(ui, i, alive, &features);
         ui.separator();
 
-        // --- screen + console
+        // --- screen | setup checklist + console. Helpers never go on the screen itself.
         let avail = ui.available_size();
         ui.horizontal_top(|ui| {
             ui.set_min_height(avail.y);
             ui.vertical(|ui| self.screen_ui(ui, i, profile.as_ref()));
             ui.separator();
-            ui.vertical(|ui| self.console_ui(ui, i));
+            ui.vertical(|ui| {
+                self.guide_ui(ui, i, alive);
+                self.console_ui(ui, i);
+            });
         });
+    }
+
+    /// The setup checklist after a catalogue install: compact, dismissable, and each step
+    /// ticks itself from what the device actually did.
+    fn guide_ui(&mut self, ui: &mut egui::Ui, i: usize, alive: bool) {
+        if self.devices[i].guide.is_none() {
+            return;
+        }
+        let firewall_seen = self.settings.ui.firewall_note_seen;
+        let mut dismiss_firewall = false;
+        let mut publish = false;
+        let mut send_wifi = false;
+        let mut rotate = None;
+        let wifi_on = self.devices[i].dev.meta.network.wifi;
+        let d = &mut self.devices[i];
+        let g = d.guide.as_mut().unwrap();
+        let n = &d.dev.meta.network;
+        let api = n.forwards.iter().find(|f| f.guest == 6053).map(|f| f.host);
+        let ota = n.forwards.iter().find(|f| f.label.contains("OTA")).map(|f| f.host);
+        let published = api.is_some() && n.wifi && n.lan;
+        let firmware_done = !d.flash_blank && d.pending_flash.is_none() && d.web_job.is_none();
+        let installing = d.pending_flash.is_some() || d.web_job.is_some();
+        let wifi_connected = d.wifi_watch.connected;
+        let wifi_done = matches!(d.improv.outcome, Some(Ok(_))) || wifi_connected;
+        let ha_client = d.api_client.clone();
+        let ha_done = g.ha_manual || ha_client.as_deref().is_some_and(|c| c.contains("Home Assistant"));
+        let mut close = false;
+        let green = Color32::from_rgb(110, 200, 130);
+        let tick = |ui: &mut egui::Ui, done: bool, text: &str| {
+            let (sym, c) = if done { ("✔", green) } else { ("○", Color32::from_gray(170)) };
+            ui.label(RichText::new(sym).color(c).strong());
+            ui.label(if done { RichText::new(text).color(Color32::from_gray(200)) } else { RichText::new(text).strong() });
+        };
+        egui::Frame::new().fill(Color32::from_rgb(24, 40, 56)).inner_margin(8.0).corner_radius(4.0).show(ui, |ui| {
+            ui.set_width(ui.available_width().min(560.0));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Set up {}", g.name)).strong().color(Color32::WHITE));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    close = ui.small_button("✕").on_hover_text("Hide this checklist").clicked();
+                });
+            });
+            ui.horizontal(|ui| {
+                tick(ui, firmware_done, "Firmware installed");
+                if installing {
+                    ui.spinner();
+                }
+            });
+            if g.improv {
+                ui.horizontal_wrapped(|ui| {
+                    tick(ui, wifi_done, if wifi_connected { "Wi-Fi connected" } else { "Wi-Fi sent" });
+                    if !wifi_done {
+                        let can = alive && wifi_on && d.improv.busy.is_none() && d.backend.capabilities().serial_tcp.is_some();
+                        if ui.add_enabled(can, egui::Button::new("Send Wi-Fi details")).on_disabled_hover_text("Power the device on first; Wi-Fi must be on under Network").clicked() {
+                            send_wifi = true;
+                        }
+                        if d.improv.busy == Some("provision") {
+                            ui.spinner();
+                        }
+                    }
+                });
+            }
+            if g.home_assistant {
+                ui.horizontal_wrapped(|ui| {
+                    tick(ui, published, "Ports published");
+                    match (published, api) {
+                        (true, Some(p)) => {
+                            ui.label(RichText::new(format!("API {p}{}", ota.map(|o| format!(", OTA {o}")).unwrap_or_default())).small().weak());
+                        }
+                        _ => {
+                            if ui.button("Publish ESPHome ports").on_hover_text("ESPHome API (6053) and OTA (3232) on this PC's network, on free ports").clicked() {
+                                publish = true;
+                            }
+                        }
+                    }
+                });
+                if published && cfg!(windows) && !firewall_seen {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Windows Firewall asks about esp32sim the first time: allow it on Private networks so Home Assistant can connect.").small().color(Color32::from_rgb(240, 200, 120)));
+                        if ui.small_button("Got it").clicked() {
+                            dismiss_firewall = true;
+                        }
+                    });
+                }
+                ui.horizontal_wrapped(|ui| {
+                    tick(ui, ha_done, "Add to Home Assistant");
+                    if let Some(c) = &ha_client {
+                        ui.label(RichText::new(format!("{c} connected")).small().color(green));
+                    }
+                });
+                if !ha_done {
+                    ha_box(ui, api);
+                    ui.checkbox(&mut g.ha_manual, "I've added it");
+                }
+            }
+            if let Some(text) = (!g.config.is_empty()).then(|| crate::catalog::Entry::template_text(&g.config)).flatten() {
+                ui.horizontal_wrapped(|ui| {
+                    tick(ui, g.config_copied, "Customise");
+                    if ui.button("Copy config").on_hover_text("The ESPHome config this firmware was built from: paste it as a new device in the ESPHome add-on, change it, and install over the air to the OTA port above.").clicked() {
+                        ui.ctx().copy_text(text.to_string());
+                        g.config_copied = true;
+                    }
+                });
+            }
+            if let Some(r) = g.rotation.filter(|r| *r != d.dev.meta.view_rotation) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("This firmware draws for the board held sideways.").small().weak());
+                    if ui.small_button(format!("Hold it {}", rotation_label(r).replace("turned", "turned"))).on_hover_text("Turns the view only (Screen > Held)").clicked() {
+                        rotate = Some(r);
+                    }
+                });
+            }
+            for note in &g.notes {
+                ui.label(RichText::new(format!("• {note}")).small().weak());
+            }
+        });
+        ui.add_space(4.0);
+        if close {
+            d.guide = None;
+        }
+        if send_wifi {
+            let wifi = d.dev.meta.network.effective(&self.settings.wifi);
+            d.start_improv(crate::improv::Job::Provision { ssid: wifi.ssid, password: wifi.password });
+        }
+        if let Some(r) = rotate {
+            d.dev.meta.view_rotation = r;
+            d.pop_size = Vec2::ZERO;
+            let _ = self.store.update_meta(&d.dev);
+        }
+        if publish {
+            let others: Vec<_> = self.devices.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, o)| o.dev.meta.network.clone()).collect();
+            let d = &mut self.devices[i];
+            let n = &mut d.dev.meta.network;
+            n.add_preset_free(&crate::network::PRESETS[0], &others, &|p| bind_is_free("0.0.0.0", p));
+            n.wifi = true;
+            n.lan = true;
+            let _ = self.store.update_meta(&d.dev);
+            if alive {
+                d.lab("ESPHome ports published: they apply at the next power-on.");
+            }
+        }
+        if dismiss_firewall {
+            self.settings.ui.firewall_note_seen = true;
+            let _ = self.settings.save(&self.paths.settings);
+        }
     }
 
     /// Wi-Fi setup for firmware that asks for it: Improv over serial ("Send Wi-Fi details")
@@ -2091,26 +2654,7 @@ impl CydLabApp {
         let wifi_on = self.devices[i].dev.meta.network.wifi;
         let mut job = None;
         let mut restart = false;
-        let card = self.devices[i].setup_card.as_ref().and_then(|id| self.catalog.entries.iter().find(|e| &e.id == id)).map(|e| (e.name.clone(), e.steps.clone()));
         let d = &mut self.devices[i];
-        if let Some((name, steps)) = card {
-            let mut close = false;
-            egui::Frame::new().fill(Color32::from_rgb(28, 52, 72)).inner_margin(8.0).corner_radius(4.0).show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(format!("Next steps for {name}")).strong().color(Color32::WHITE));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        close = ui.small_button("Hide").on_hover_text("Hide these steps").clicked();
-                    });
-                });
-                for (k, st) in steps.iter().enumerate() {
-                    ui.label(RichText::new(format!("{}. {st}", k + 1)).small().color(Color32::from_gray(230)));
-                }
-            });
-            if close {
-                d.setup_card = None;
-            }
-        }
         let serial = d.backend.capabilities().serial_tcp.filter(|_| alive);
         let waiting = d.improv.state == Some(State::Ready) && d.improv.busy != Some("provision") && !matches!(d.improv.outcome, Some(Ok(_)));
         let send_tip = if !wifi_on {
@@ -2167,7 +2711,8 @@ impl CydLabApp {
                     ui.label(RichText::new(format!("  Done: {m}")).small().color(Color32::LIGHT_GREEN));
                     if d.improv.url.is_none() {
                         if let Some((hp, _)) = forwards.iter().find(|(_, g)| *g == 6053) {
-                            ui.label(RichText::new(format!("Home Assistant: add the ESPHome integration with this PC's IP and port {hp}")).small());
+                            let host = cached_lan_ip().map(|ip| ip.to_string()).unwrap_or_else(|| "this PC's IP".into());
+                            ui.label(RichText::new(format!("Home Assistant: add the ESPHome integration with host {host}, port {hp}")).small());
                         }
                     }
                     if let Some(url) = d.improv.url.clone() {
@@ -2176,7 +2721,7 @@ impl CydLabApp {
                                 ui.hyperlink_to(RichText::new(format!("open {local}")).small(), local).on_hover_text(format!("The firmware reported {url} (its address on the emulated network), published on this PC."));
                             }
                             None => {
-                                ui.label(RichText::new(format!("(it reported {url}, its address inside the emulator: publish port {} under Network to open it here)", url_port(&url))).small().weak());
+                                ui.label(RichText::new(format!("(it reported {url}, its address inside the emulator: publish port {} under Network to open it here)", url_port(&url))).small().weak()).on_hover_text(INTERNAL_IP_TIP);
                             }
                         }
                     }
@@ -2191,68 +2736,66 @@ impl CydLabApp {
             ui.label(RichText::new(format!("  firmware error: {}", crate::improv::error_label(err))).small().weak());
         }
 
-        // Device hotspot (needs the engine's --ap-client/--ap-fwd).
-        let hs_state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("hotspot", i)), false);
-        hs_state
-            .show_header(ui, |ui| {
-                let t = match (&d.hotspot, d.hotspot_ssids.len()) {
-                    (Some(p), _) if features.ap_client => format!("Device hotspot: joined \"{}\" → {}", p.ssid, p.url()),
-                    (_, 0) => "Device hotspot".to_string(),
-                    (_, n) => format!("Device hotspot: firmware announced {n} network{}", if n == 1 { "" } else { "s" }),
-                };
-                ui.label(RichText::new(t).small());
-                if !features.ap_client {
-                    ui.label(RichText::new("needs newer engine").small().color(Color32::from_rgb(230, 180, 60)))
-                        .on_hover_text("Joining the firmware's own setup hotspot needs an engine with --ap-client and --ap-fwd (being added). Until then use Send Wi-Fi details if the firmware supports it, or set its Wi-Fi another way.");
-                }
-            })
-            .body(|ui| {
-                ui.label(RichText::new("Many firmwares start their own Wi-Fi network for first setup (openHASP HASP-xxxxxx, Tasmota tasmota-xxxxxx, WLED-AP, ESPHome's fallback hotspot) with a setup page at 192.168.4.1. cyd-lab can join it for you and open that page here.").small().weak());
-                ui.add_enabled_ui(features.ap_client, |ui| {
-                    let (ssid, pw, ip) = &mut d.hotspot_form;
-                    if ssid.is_empty() {
-                        if let Some(first) = d.hotspot_ssids.first() {
-                            *ssid = first.clone();
+        // Device hotspot: only with an engine that can join it (--ap-client/--ap-fwd).
+        if features.ap_client {
+            let hs_state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("hotspot", i)), false);
+            hs_state
+                .show_header(ui, |ui| {
+                    let t = match (&d.hotspot, d.hotspot_ssids.len()) {
+                        (Some(p), _) => format!("Device hotspot: joined \"{}\" → {}", p.ssid, p.url()),
+                        (_, 0) => "Device hotspot".to_string(),
+                        (_, n) => format!("Device hotspot: firmware announced {n} network{}", if n == 1 { "" } else { "s" }),
+                    };
+                    ui.label(RichText::new(t).small());
+                })
+                .body(|ui| {
+                    ui.label(RichText::new("Many firmwares start their own Wi-Fi network for first setup (openHASP HASP-xxxxxx, Tasmota tasmota-xxxxxx, WLED-AP, ESPHome's fallback hotspot) with a setup page at 192.168.4.1. cyd-lab can join it for you and open that page here.").small().weak());
+                    {
+                        let (ssid, pw, ip) = &mut d.hotspot_form;
+                        if ssid.is_empty() {
+                            if let Some(first) = d.hotspot_ssids.first() {
+                                *ssid = first.clone();
+                            }
                         }
-                    }
-                    egui::Grid::new(("hs-grid", i)).num_columns(2).show(ui, |ui| {
-                        ui.label(RichText::new("Network").small());
-                        ui.horizontal(|ui| {
-                            ui.add(egui::TextEdit::singleline(ssid).desired_width(170.0).hint_text("e.g. HASP-1A2B3C"));
-                            if !d.hotspot_ssids.is_empty() {
-                                egui::ComboBox::from_id_salt(("hs-seen", i)).selected_text(RichText::new("seen").small()).show_ui(ui, |ui| {
-                                    for s in &d.hotspot_ssids {
-                                        if ui.selectable_label(ssid == s, s).clicked() {
-                                            *ssid = s.clone();
+                        egui::Grid::new(("hs-grid", i)).num_columns(2).show(ui, |ui| {
+                            ui.label(RichText::new("Network").small());
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(ssid).desired_width(170.0).hint_text("e.g. HASP-1A2B3C"));
+                                if !d.hotspot_ssids.is_empty() {
+                                    egui::ComboBox::from_id_salt(("hs-seen", i)).selected_text(RichText::new("seen").small()).show_ui(ui, |ui| {
+                                        for s in &d.hotspot_ssids {
+                                            if ui.selectable_label(ssid == s, s).clicked() {
+                                                *ssid = s.clone();
+                                            }
                                         }
-                                    }
-                                });
+                                    });
+                                }
+                            });
+                            ui.end_row();
+                            ui.label(RichText::new("Password").small());
+                            ui.add(egui::TextEdit::singleline(pw).password(true).desired_width(170.0).hint_text("blank if open"));
+                            ui.end_row();
+                            ui.label(RichText::new("Page at").small());
+                            ui.add(egui::TextEdit::singleline(ip).desired_width(110.0)).on_hover_text("192.168.4.1 for most firmwares, 4.3.2.1 for WLED");
+                            ui.end_row();
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(!ssid.trim().is_empty(), egui::Button::new("Connect & open setup page")).on_hover_text("Restarts the device joined to that network and opens its setup page in your browser (served on 127.0.0.1 only).").clicked() {
+                                let host_port = d.hotspot.as_ref().map(|p| p.host_port).filter(|&p| bind_is_free("127.0.0.1", p)).or_else(free_local_port).unwrap_or(18480);
+                                d.hotspot = Some(crate::hotspot::Plan { ssid: ssid.trim().to_string(), password: pw.clone(), host_port, guest_ip: ip.trim().to_string(), guest_port: 80 });
+                                restart = true;
+                            }
+                            if d.hotspot.is_some() && ui.button("Leave hotspot").on_hover_text("Back to the normal Wi-Fi at the next power-on").clicked() {
+                                d.hotspot = None;
+                                d.hotspot_open_at = None;
                             }
                         });
-                        ui.end_row();
-                        ui.label(RichText::new("Password").small());
-                        ui.add(egui::TextEdit::singleline(pw).password(true).desired_width(170.0).hint_text("blank if open"));
-                        ui.end_row();
-                        ui.label(RichText::new("Page at").small());
-                        ui.add(egui::TextEdit::singleline(ip).desired_width(110.0)).on_hover_text("192.168.4.1 for most firmwares, 4.3.2.1 for WLED");
-                        ui.end_row();
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(!ssid.trim().is_empty(), egui::Button::new("Connect & open setup page")).on_hover_text("Restarts the device joined to that network and opens its setup page in your browser (served on 127.0.0.1 only).").clicked() {
-                            let host_port = d.hotspot.as_ref().map(|p| p.host_port).filter(|&p| bind_is_free("127.0.0.1", p)).or_else(free_local_port).unwrap_or(18480);
-                            d.hotspot = Some(crate::hotspot::Plan { ssid: ssid.trim().to_string(), password: pw.clone(), host_port, guest_ip: ip.trim().to_string(), guest_port: 80 });
-                            restart = true;
-                        }
-                        if d.hotspot.is_some() && ui.button("Leave hotspot").on_hover_text("Back to the normal Wi-Fi at the next power-on").clicked() {
-                            d.hotspot = None;
-                            d.hotspot_open_at = None;
-                        }
-                    });
+                    }
+                    if d.hotspot_ssids.is_empty() {
+                        ui.label(RichText::new("No hotspot announced in this run's log yet.").small().weak());
+                    }
                 });
-                if d.hotspot_ssids.is_empty() {
-                    ui.label(RichText::new("No hotspot announced in this run's log yet.").small().weak());
-                }
-            });
+        }
         if let Some(j) = job {
             d.start_improv(j);
         }
@@ -2403,12 +2946,14 @@ impl CydLabApp {
                 });
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(format!("This PC: {}", ip.map(|i| i.to_string()).unwrap_or_else(|| "no network address found".into()))).small());
-                    let mdns = if features.mdns_relay { "mDNS: relayed, so name.local and discovery work." } else { "mDNS: not available with this engine build; connect by IP." };
-                    ui.label(RichText::new(mdns).small().weak());
+                    if features.mdns_relay {
+                        ui.label(RichText::new("mDNS: relayed, so name.local and discovery work.").small().weak());
+                    }
                 });
             });
         if let Some(k) = add_preset {
-            d.dev.meta.network.add_preset(&crate::network::PRESETS[k], &others);
+            let addr = if d.dev.meta.network.lan { "0.0.0.0" } else { "127.0.0.1" };
+            d.dev.meta.network.add_preset_free(&crate::network::PRESETS[k], &others, &|p| bind_is_free(addr, p));
             save = true;
             if alive {
                 d.lab(format!("{} ports added: they apply at the next power-on.", crate::network::PRESETS[k].name));
@@ -2431,6 +2976,10 @@ impl CydLabApp {
 
     fn serial_bridge_ui(&mut self, ui: &mut egui::Ui, i: usize, alive: bool, features: &EngineFeatures) {
         let live_port = self.devices[i].backend.capabilities().serial_tcp.filter(|_| alive);
+        // Without the engine's serial bridge there is nothing to set up here.
+        if live_port.is_none() && !features.serial_tcp {
+            return;
+        }
         let others: Vec<u16> = self.devices.iter().enumerate().filter(|(j, _)| *j != i).filter_map(|(_, d)| d.dev.meta.serial_tcp_port).collect();
         let mut save = false;
         let net_ip = cached_lan_ip().map(|i| i.to_string()).unwrap_or_else(|| "this PC's IP".into());
@@ -2483,7 +3032,7 @@ impl CydLabApp {
             let note = match (alive, live_port.is_some(), features.serial_tcp) {
                 (true, true, _) => "live".to_string(),
                 (true, false, true) => "not enabled for this run (no free port?)".to_string(),
-                (_, _, false) => "engine has no --serial-tcp yet: URL is reserved, not served".to_string(),
+                (true, false, false) | (false, _, false) => "not served by this run".to_string(),
                 (false, _, true) => "served at power-on".to_string(),
             };
             ui.label(RichText::new(note).small().weak());
@@ -2492,7 +3041,8 @@ impl CydLabApp {
             }
         });
         if let Some(k) = net_preset {
-            d.dev.meta.network.add_preset(&crate::network::PRESETS[k], &net_others);
+            let addr = if d.dev.meta.network.lan { "0.0.0.0" } else { "127.0.0.1" };
+            d.dev.meta.network.add_preset_free(&crate::network::PRESETS[k], &net_others, &|p| bind_is_free(addr, p));
             save = true;
             if alive {
                 d.lab(format!("{} ports added: they apply at the next power-on.", crate::network::PRESETS[k].name));
@@ -2506,126 +3056,151 @@ impl CydLabApp {
     }
 
     fn screen_ui(&mut self, ui: &mut egui::Ui, i: usize, profile: Option<&Profile>) {
-        let running = matches!(self.devices[i].backend.state(), RunState::Running(_));
+        let state = self.devices[i].backend.state();
+        let running = matches!(state, RunState::Running(_));
+        let powered = matches!(state, RunState::Running(_) | RunState::Stopping);
         let live_link = self.settings.engine.live_link;
         let d = &mut self.devices[i];
-        let (pw, ph) = profile.and_then(|p| p.panel_size()).map(|(w, h)| (w as usize, h as usize)).unwrap_or((240, 320));
-        let (panel_w, panel_h) = if d.screen.is_some() && !d.screen_from_png { d.screen_size } else { (pw, ph) };
-        ui.horizontal(|ui| {
+        let panel = d.panel_dims(profile);
+        let mut pop = false;
+        let mut dock = false;
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Screen").strong());
+            ui.label("Held:");
             let mut rot = d.dev.meta.view_rotation;
-            egui::ComboBox::from_id_salt(("rot", &d.dev.id)).width(60.0).selected_text(format!("{rot}°")).show_ui(ui, |ui| {
-                for r in [0u16, 90, 180, 270] {
-                    ui.selectable_value(&mut rot, r, format!("{r}°"));
-                }
-            });
+            egui::ComboBox::from_id_salt(("rot", &d.dev.id))
+                .width(110.0)
+                .selected_text(rotation_label(rot))
+                .show_ui(ui, |ui| {
+                    for r in [0u16, 90, 180, 270] {
+                        ui.selectable_value(&mut rot, r, rotation_label(r));
+                    }
+                })
+                .response
+                .on_hover_text("How you hold the board. This turns the view (and touch with it); the firmware's picture is unchanged.");
             if rot != d.dev.meta.view_rotation {
                 d.dev.meta.view_rotation = rot;
+                d.pop_size = Vec2::ZERO;
                 let _ = self.store.update_meta(&d.dev);
             }
-            if d.flash_blank && d.pending_flash.is_none() {
-                ui.label(RichText::new("Blank flash: press Install firmware..., or drop a .bin here").color(Color32::from_rgb(240, 190, 40)));
+            if d.dev.meta.screen_window.popped {
+                if ui.button("Dock").on_hover_text("Bring the screen back into this window").clicked() {
+                    dock = true;
+                }
+            } else {
+                ui.label("Zoom:");
+                zoom_combo(ui, ("mzoom", &d.dev.id), &mut d.main_zoom);
+                if ui.button("Pop out").on_hover_text("Show the screen in its own window you can move about").clicked() {
+                    pop = true;
+                }
             }
         });
-        let rot = d.dev.meta.view_rotation;
-        let (vw, vh) = rotated_size(rot, panel_w, panel_h);
-        let scale = ((ui.available_height() - 90.0) / vh as f32).clamp(0.5, 2.0);
-        let scale = (scale * 4.0).floor() / 4.0;
-        let size = Vec2::new(vw as f32 * scale, vh as f32 * scale);
-        let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 0.0, Color32::from_gray(12));
-
-        match &d.screen {
-            Some(tex) if !d.screen_from_png => {
-                let mut mesh = egui::Mesh::with_texture(tex.id());
-                let corners = [rect.left_top(), rect.right_top(), rect.right_bottom(), rect.left_bottom()];
-                let uvs = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
-                for (pos, (u, v)) in corners.iter().zip(uvs) {
-                    let (pu, pv) = view_to_panel_norm(rot, u, v);
-                    mesh.vertices.push(egui::epaint::Vertex { pos: *pos, uv: Pos2::new(pu, pv), color: Color32::WHITE });
-                }
-                mesh.add_triangle(0, 1, 2);
-                mesh.add_triangle(0, 2, 3);
-                painter.add(egui::Shape::mesh(mesh));
-            }
-            Some(tex) => {
-                // PNG snapshot: shown as written by the engine, fitted to the area.
-                let (w, h) = d.screen_size;
-                let s = (rect.width() / w as f32).min(rect.height() / h as f32);
-                let r = Rect::from_center_size(rect.center(), Vec2::new(w as f32 * s, h as f32 * s));
-                painter.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
-            }
-            None => {
-                let msg = if !running {
-                    format!("{panel_w}×{panel_h} panel\n\npowered off")
-                } else if !live_link {
-                    format!("{panel_w}×{panel_h} panel\n\nlive link disabled\n(Settings > Live link)")
-                } else {
-                    format!("{panel_w}×{panel_h} panel\n\nwaiting for the first frame\nfrom the engine…")
-                };
-                painter.text(rect.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(14.0), Color32::from_gray(150));
-            }
+        if d.flash_blank && d.pending_flash.is_none() {
+            ui.label(RichText::new("Blank flash: press Install firmware…, or drop a .bin on the window").color(Color32::from_rgb(240, 190, 40)));
         }
-        painter.rect_stroke(rect, 0.0, Stroke::new(1.0, Color32::from_gray(90)), egui::StrokeKind::Outside);
-
-        // --- touch: mouse on the screen = finger on the panel
-        let pointer = resp.interact_pointer_pos().or(resp.hover_pos());
-        // The engine samples the panel at its own pace, so a press+release inside one
-        // frame (a fast click, or xdotool) would be missed: hold every touch >= MIN_TOUCH_HOLD.
-        let now = std::time::Instant::now();
-        if resp.is_pointer_button_down_on() {
-            if let Some((x, y)) = pointer.and_then(|p| view_to_panel_px(rot, panel_w, panel_h, rect, p)) {
-                if d.touch_down != Some((x, y)) {
-                    d.touch_release_due = None;
-                    if d.touch_down.is_none() {
-                        d.touch_since = Some(now);
-                    }
-                    d.touch_down = Some((x, y));
-                    d.touch_note = match d.backend.touch(x, y, true) {
-                        Ok(()) => format!("touch ({x}, {y})"),
-                        Err(e) => format!("touch ({x}, {y}) not delivered: {e}"),
-                    };
-                }
-            }
-        } else if let Some((x, y)) = d.touch_down.take() {
-            let since = d.touch_since.take().unwrap_or(now);
-            d.touch_release_due = Some((x, y, since + MIN_TOUCH_HOLD));
-        } else if resp.clicked() && d.touch_release_due.is_none() {
-            // Down and up landed in the same frame: synthesise the press now.
-            if let Some((x, y)) = pointer.and_then(|p| view_to_panel_px(rot, panel_w, panel_h, rect, p)) {
-                d.touch_note = match d.backend.touch(x, y, true) {
-                    Ok(()) => format!("touch ({x}, {y})"),
-                    Err(e) => format!("touch ({x}, {y}) not delivered: {e}"),
-                };
-                d.touch_release_due = Some((x, y, now + MIN_TOUCH_HOLD));
-            }
-        }
-        if let Some((x, y, due)) = d.touch_release_due {
-            if now >= due {
-                d.touch_release_due = None;
-                d.touch_note = match d.backend.touch(x, y, false) {
-                    Ok(()) => format!("release ({x}, {y})"),
-                    Err(e) => format!("release ({x}, {y}) not delivered: {e}"),
-                };
-            } else {
-                ui.ctx().request_repaint_after(due - now);
-            }
-        }
-        if let Some((x, y)) = resp.hover_pos().and_then(|p| view_to_panel_px(rot, panel_w, panel_h, rect, p)) {
-            resp.on_hover_text_at_pointer(format!("panel ({x}, {y})"));
-        }
-
-        let source = if d.screen.is_some() && !d.screen_from_png {
-            "live (engine --web)"
-        } else if d.screen_from_png {
-            "last --tft-png snapshot"
+        if d.dev.meta.screen_window.popped {
+            ui.label(RichText::new("The screen is in its own window.").weak());
+            d.screen_strip(ui, powered, running, live_link, 0);
         } else {
-            "placeholder"
-        };
-        ui.label(RichText::new(format!("{source} · {}", if d.link_up { "link up" } else { d.link_note.as_str() })).small().weak());
-        if !d.touch_note.is_empty() {
-            ui.label(RichText::new(&d.touch_note).small().weak());
+            let (vw, vh) = rotated_size(d.dev.meta.view_rotation, panel.0, panel.1);
+            let ppp = ui.ctx().pixels_per_point();
+            let strip = ui.text_style_height(&egui::TextStyle::Small) * 2.0 + 16.0;
+            let avail = Vec2::new(ui.available_width().min(ui.ctx().content_rect().width() * 0.55), ui.available_height() - strip);
+            let fit = fit_zoom(avail, (vw, vh), ppp);
+            let zoom = if d.main_zoom == 0 { fit } else { d.main_zoom as u32 };
+            d.screen_view(ui, panel, zoom, powered);
+            d.screen_strip(ui, powered, running, live_link, zoom);
+        }
+        if pop || dock {
+            d.dev.meta.screen_window.popped = pop;
+            d.pop_pos0 = None;
+            d.pop_size = Vec2::ZERO;
+            let _ = self.store.update_meta(&d.dev);
+        }
+    }
+
+    /// One device's screen in its own OS window (egui viewport). Closing it docks it again.
+    fn screen_window(&mut self, ctx: &egui::Context, i: usize, profile: Option<&Profile>) {
+        let state = self.devices[i].backend.state();
+        let running = matches!(state, RunState::Running(_));
+        let powered = matches!(state, RunState::Running(_) | RunState::Stopping);
+        let live_link = self.settings.engine.live_link;
+        let d = &mut self.devices[i];
+        let panel = d.panel_dims(profile);
+        let (vw, vh) = rotated_size(d.dev.meta.view_rotation, panel.0, panel.1);
+        let ppp = ctx.pixels_per_point();
+        let sw = d.dev.meta.screen_window.clone();
+        if d.pop_size == Vec2::ZERO {
+            let z = if sw.zoom == 0 { 2.0 } else { sw.zoom as f32 };
+            let strip = 110.0;
+            d.pop_size = Vec2::new((vw as f32 * z / ppp).max(300.0) + 24.0, vh as f32 * z / ppp + strip);
+        }
+        if d.pop_pos0.is_none() {
+            d.pop_pos0 = Some(sw.pos.map(|p| egui::pos2(p[0], p[1])).unwrap_or(egui::pos2(120.0, 120.0)));
+        }
+        let (status, _) = d.screen_status(powered, running, live_link);
+        let title = if status == "Live" { format!("{} – screen", d.dev.meta.name) } else { format!("{} – screen – {status}", d.dev.meta.name) };
+        let builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_inner_size(d.pop_size)
+            .with_min_inner_size([200.0, 160.0])
+            .with_position(d.pop_pos0.unwrap())
+            .with_window_level(if sw.always_on_top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal });
+        let vid = egui::ViewportId::from_hash_of(("screen", &d.dev.id));
+        let mut changed = false;
+        let mut dock = false;
+        ctx.show_viewport_immediate(vid, builder, |ui, _class| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let sw = &mut d.dev.meta.screen_window;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Zoom:");
+                    let before = sw.zoom;
+                    zoom_combo(ui, ("pzoom", vid), &mut sw.zoom);
+                    if sw.zoom != before {
+                        changed = true;
+                    }
+                    if ui.checkbox(&mut sw.always_on_top, "Always on top").changed() {
+                        changed = true;
+                    }
+                    if ui.button("Dock").on_hover_text("Put the screen back in the main window").clicked() {
+                        dock = true;
+                    }
+                });
+                let strip = ui.text_style_height(&egui::TextStyle::Small) * 2.0 + 16.0;
+                let avail = ui.available_size() - Vec2::new(0.0, strip);
+                let ppp = ui.ctx().pixels_per_point();
+                let zoom = if sw.zoom == 0 { fit_zoom(avail, (vw, vh), ppp) } else { sw.zoom as u32 };
+                d.screen_view(ui, panel, zoom, powered);
+                d.screen_strip(ui, powered, running, live_link, zoom);
+            });
+            let (close, outer) = ui.input(|i| (i.viewport().close_requested(), i.viewport().outer_rect));
+            if close {
+                dock = true;
+            }
+            if let Some(r) = outer {
+                let p = [r.min.x, r.min.y];
+                if d.dev.meta.screen_window.pos != Some(p) {
+                    d.dev.meta.screen_window.pos = Some(p);
+                    d.pop_moved = Some(Instant::now());
+                }
+            }
+        });
+        if changed {
+            d.pop_size = Vec2::ZERO; // re-measure for the new zoom
+        }
+        if d.pop_moved.is_some_and(|t| t.elapsed() > Duration::from_secs(1)) {
+            d.pop_moved = None;
+            changed = true;
+        } else if d.pop_moved.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+        if dock {
+            d.dev.meta.screen_window.popped = false;
+            d.pop_pos0 = None;
+            changed = true;
+        }
+        if changed {
+            let _ = self.store.update_meta(&d.dev);
         }
     }
 
@@ -2773,7 +3348,7 @@ impl eframe::App for CydLabApp {
 
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("cyd-lab").strong().size(16.0));
+                ui.label(RichText::new("cyd-lab").strong().size(20.0));
                 ui.label(RichText::new(env!("CARGO_PKG_VERSION")).weak());
                 ui.separator();
                 if ui.button("+ New device").clicked() {
@@ -2794,7 +3369,7 @@ impl eframe::App for CydLabApp {
                 }
             });
         });
-        egui::Panel::left("devices").default_size(230.0).show(ui, |ui| self.device_list(ui));
+        egui::Panel::left("devices").default_size(240.0).show(ui, |ui| self.device_list(ui));
         egui::CentralPanel::default_margins().show(ui, |ui| match self.selected {
             _ if !self.rom_ready => self.first_run_ui(ui),
             Some(i) if i < self.devices.len() => self.device_panel(ui, i),
@@ -2817,6 +3392,25 @@ impl eframe::App for CydLabApp {
         self.arduino_window(&ctx);
         self.settings_window(&ctx);
         self.delete_modal(&ctx);
+        self.rename_modal(&ctx);
+
+        // Popped-out screens, each in its own OS window.
+        for i in 0..self.devices.len() {
+            if self.devices[i].dev.meta.screen_window.popped {
+                let profile = self.profile_for(i);
+                self.screen_window(&ctx, i, profile.as_ref());
+            }
+        }
+        // Text size: Ctrl +/- and Ctrl 0 change the zoom directly; keep it for next time.
+        let z = ctx.zoom_factor();
+        if (z - self.text_scale).abs() > 0.001 {
+            self.text_scale = z;
+            self.settings.ui.text_scale = (z * 100.0).round() / 100.0;
+            if let Some(d) = &mut self.settings_draft {
+                d.ui.text_scale = self.settings.ui.text_scale;
+            }
+            let _ = self.settings.save(&self.paths.settings);
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -2833,6 +3427,16 @@ impl Drop for CydLabApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_zoom_is_a_whole_number_that_fits() {
+        // 320x240 view in 700x500 points at 100%: 2x (3x would be 960 wide).
+        assert_eq!(fit_zoom(Vec2::new(700.0, 500.0), (320, 240), 1.0), 2);
+        // At 150% display scale the same area has 1050x750 physical pixels: 3x.
+        assert_eq!(fit_zoom(Vec2::new(700.0, 500.0), (320, 240), 1.5), 3);
+        // Too small: still 1x (never shrunk below the panel's own pixels).
+        assert_eq!(fit_zoom(Vec2::new(100.0, 100.0), (240, 320), 1.0), 1);
+    }
 
     #[test]
     fn serial_bridge_helpers() {
