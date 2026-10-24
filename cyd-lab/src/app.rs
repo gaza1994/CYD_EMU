@@ -53,6 +53,8 @@ pub struct AppSettings {
     /// Wi-Fi details given to new devices ("Use these Wi-Fi details for new devices").
     /// Plain text in settings.toml.
     pub wifi: crate::network::WifiDetails,
+    /// Optional online refresh of the firmware catalogue (off by default).
+    pub catalog: crate::catalog::CatalogSettings,
 }
 
 impl AppSettings {
@@ -295,6 +297,11 @@ struct DeviceView {
     web_erase: bool,
     /// A download in progress (manifest + parts), run on a thread.
     web_job: Option<std::sync::mpsc::Receiver<WebMsg>>,
+    /// Log prefix for the job above ("web install" or "catalogue").
+    job_label: &'static str,
+    /// The "Install firmware" gallery is open, and shows broken entries too.
+    gallery_open: bool,
+    gallery_broken: bool,
     /// Firmware waiting to be written: the device is powered off first if needed.
     pending_flash: Option<PendingFlash>,
     /// A dropped/picked .bin whose offset the user must confirm.
@@ -395,6 +402,9 @@ impl DeviceView {
             import_path: String::new(),
             web_manifest: String::new(),
             web_erase: true,
+            job_label: "web install",
+            gallery_open: false,
+            gallery_broken: false,
             web_job: None,
             pending_flash: None,
             drop_ask: None,
@@ -415,6 +425,7 @@ impl DeviceView {
         };
         let (tx, rx) = std::sync::mpsc::channel();
         self.web_job = Some(rx);
+        self.job_label = "web install";
         std::thread::spawn(move || {
             let w = waker.clone();
             let t = tx.clone();
@@ -427,10 +438,34 @@ impl DeviceView {
         });
     }
 
+    /// Start a one-click catalogue install: download, verify the pinned SHA-256s, then write
+    /// like a web install (erase first, power on after).
+    fn start_catalog_install(&mut self, e: crate::catalog::Entry, cache: PathBuf, waker: Waker) {
+        let size = match self.dev.flash_size() {
+            Ok(s) => s,
+            Err(err) => return self.lab(format!("catalogue: {err:#}")),
+        };
+        self.lab(format!("catalogue: installing {} {}", e.name, e.version));
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.web_job = Some(rx);
+        self.job_label = "catalogue";
+        std::thread::spawn(move || {
+            let w = waker.clone();
+            let t = tx.clone();
+            let r = crate::catalog::prepare(&e, size, Some(cache), &mut |l| {
+                let _ = t.send(WebMsg::Line(l));
+                w();
+            });
+            let _ = tx.send(WebMsg::Done(r.map_err(|e| format!("{e:#}"))));
+            waker();
+        });
+    }
+
     /// Queue downloaded parts for flash.bin (written once the device is off, then it boots).
     fn finish_web_install(&mut self, p: crate::webinstall::Prepared) {
         if p.erase {
-            self.lab(if p.prompt_erase { "web install: will erase flash first (\"erase first\" ticked)" } else { "web install: will erase flash first (a new install always erases)" });
+            let l = if p.prompt_erase { "will erase flash first (\"erase first\" ticked)" } else { "will erase flash first (a new install always erases)" };
+            self.lab(format!("{}: {l}", self.job_label));
         } else {
             self.lab("web install: not erasing (manifest leaves it to you, \"erase first\" unticked)");
         }
@@ -585,6 +620,11 @@ pub struct CydLabApp {
     rom_progress: (u64, Option<u64>),
     rom_error: Option<String>,
     arduino_report: Option<crate::arduino_setup::Report>,
+    /// The firmware catalogue (bundled, or a refreshed copy) and its thumbnails.
+    catalog: crate::catalog::Catalog,
+    catalog_note: String,
+    catalog_job: Option<std::sync::mpsc::Receiver<Result<crate::catalog::Catalog, String>>>,
+    thumbs: std::collections::HashMap<String, TextureHandle>,
 }
 
 impl CydLabApp {
@@ -612,6 +652,8 @@ impl CydLabApp {
             status = format!("Profile errors: {}", profiles.errors.join("; "));
         }
         let selected = if devices.is_empty() { None } else { Some(0) };
+        let (catalog, catalog_note) = crate::catalog::load(&paths.root, &settings.catalog);
+        let catalog_note = catalog_note.unwrap_or_default();
         let mut app = CydLabApp {
             paths,
             settings,
@@ -630,6 +672,10 @@ impl CydLabApp {
             rom_progress: (0, None),
             rom_error: None,
             arduino_report: None,
+            catalog,
+            catalog_note,
+            catalog_job: None,
+            thumbs: Default::default(),
         };
         app.rom_ready = app.check_rom();
         if !app.rom_ready {
@@ -1056,12 +1102,12 @@ impl CydLabApp {
                 let msgs: Vec<WebMsg> = rx.try_iter().collect();
                 for m in msgs {
                     match m {
-                        WebMsg::Line(l) => d.lab(format!("web install: {l}")),
+                        WebMsg::Line(l) => d.lab(format!("{}: {l}", d.job_label)),
                         WebMsg::Done(r) => {
                             d.web_job = None;
                             match r {
                                 Ok(p) => d.finish_web_install(p),
-                                Err(e) => d.lab(format!("web install failed: {e}")),
+                                Err(e) => d.lab(format!("{} failed: {e}", d.job_label)),
                             }
                         }
                     }
@@ -1215,6 +1261,232 @@ impl CydLabApp {
         }
     }
 
+    fn thumb(&mut self, ctx: &egui::Context, id: &str, png: &[u8]) -> Option<TextureHandle> {
+        if let Some(t) = self.thumbs.get(id) {
+            return Some(t.clone());
+        }
+        let img = image::load_from_memory(png).ok()?.to_rgba8();
+        let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+        let t = ctx.load_texture(format!("thumb-{id}"), ci, TextureOptions::LINEAR);
+        self.thumbs.insert(id.to_string(), t.clone());
+        Some(t)
+    }
+
+    /// "Install firmware": the catalogue entries for the selected device's board.
+    fn gallery_window(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.selected.filter(|&i| i < self.devices.len() && self.devices[i].gallery_open) else { return };
+        if let Some(rx) = &self.catalog_job {
+            if let Ok(r) = rx.try_recv() {
+                self.catalog_job = None;
+                match r {
+                    Ok(c) => {
+                        self.catalog_note = format!("catalogue refreshed: {} entries, updated {}", c.entries.len(), c.updated);
+                        self.catalog = c;
+                    }
+                    Err(e) => self.catalog_note = format!("catalogue refresh failed (keeping the current one): {e}"),
+                }
+            }
+        }
+        let board = self.devices[i].dev.meta.profile.clone();
+        let board_name = self.profiles.get(&board).map(|p| p.name.clone()).unwrap_or_else(|| board.clone());
+        let cat_profile = self.catalog.profile_for(&board).cloned();
+        let show_broken = self.devices[i].gallery_broken;
+        let entries: Vec<crate::catalog::Entry> = cat_profile.as_ref().map(|p| self.catalog.entries_for(&p.id, show_broken).into_iter().cloned().collect()).unwrap_or_default();
+        let hidden = cat_profile.as_ref().map(|p| self.catalog.hidden_broken(&p.id)).unwrap_or(0);
+        let mut thumbs = Vec::new();
+        for e in &entries {
+            thumbs.push(e.thumbnail().and_then(|png| self.thumb(ctx, &e.id, png)));
+        }
+        let busy = self.devices[i].pending_flash.is_some() || self.devices[i].web_job.is_some();
+        let running = matches!(self.devices[i].backend.state(), RunState::Running(_) | RunState::Stopping);
+        let mut open = true;
+        let mut install: Option<crate::catalog::Entry> = None;
+        let mut use_web: Option<String> = None;
+        let mut saved: Option<String> = None;
+        let mut refresh = false;
+        let dev_name = self.devices[i].dev.meta.name.clone();
+        let refresh_on = self.settings.catalog.refresh && !self.settings.catalog.url.trim().is_empty();
+        let refreshing = self.catalog_job.is_some();
+        let (updated, note) = (self.catalog.updated.clone(), self.catalog_note.clone());
+        egui::Window::new(format!("Install firmware on {dev_name}"))
+            .id(egui::Id::unique(("gallery", i)))
+            .collapsible(false)
+            .default_size([600.0, 620.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("Board: {board_name}"));
+                    ui.label(RichText::new(format!("· catalogue {updated}")).weak());
+                    if refresh_on {
+                        if ui.add_enabled(!refreshing, egui::Button::new("Check for updates").small()).clicked() {
+                            refresh = true;
+                        }
+                        if refreshing {
+                            ui.spinner();
+                        }
+                    }
+                });
+                if !note.is_empty() {
+                    ui.label(RichText::new(&note).small().weak());
+                }
+                if busy {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Installing… (progress in the console)");
+                    });
+                } else if running {
+                    ui.label(RichText::new("The device is on: installing powers it off, writes the flash and powers it on again.").small().weak());
+                }
+                ui.separator();
+                let Some(cp) = &cat_profile else {
+                    ui.label(format!("The catalogue has no firmware for this board ({board}). Use \"Install from web\" with the firmware's manifest URL, or drop your own .bin files on the window."));
+                    return;
+                };
+                egui::ScrollArea::vertical().max_height(470.0).auto_shrink([false, true]).show(ui, |ui| {
+                    for (e, thumb) in entries.iter().zip(&thumbs) {
+                        ui.horizontal(|ui| {
+                            let size = Vec2::new(60.0, 80.0);
+                            match thumb {
+                                Some(t) => {
+                                    let sz = t.size_vec2();
+                                    let scale = (size.x / sz.x).min(size.y / sz.y);
+                                    ui.add(egui::Image::new((t.id(), sz * scale))).on_hover_ui(|ui| {
+                                        ui.add(egui::Image::new((t.id(), sz)));
+                                        ui.label("In the emulator");
+                                    });
+                                }
+                                None => {
+                                    let (r, _) = ui.allocate_exact_size(size, Sense::hover());
+                                    ui.painter().rect_filled(r, 3.0, Color32::from_gray(20));
+                                    let txt = if e.is_template() { "config" } else { "no screen\npicture" };
+                                    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, txt, egui::FontId::proportional(10.0), Color32::GRAY);
+                                }
+                            }
+                            ui.vertical(|ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new(&e.name).strong());
+                                    if !e.version.is_empty() {
+                                        ui.label(RichText::new(&e.version).weak());
+                                    }
+                                    let col = match e.emulator_status {
+                                        crate::catalog::Status::Works => Color32::from_rgb(60, 160, 80),
+                                        crate::catalog::Status::Partial => Color32::from_rgb(200, 140, 30),
+                                        crate::catalog::Status::Broken => Color32::from_rgb(190, 60, 60),
+                                        crate::catalog::Status::Untested => Color32::from_gray(110),
+                                    };
+                                    let badge = format!(" {} ", e.emulator_status.label());
+                                    ui.label(RichText::new(badge).small().color(Color32::WHITE).background_color(col))
+                                        .on_hover_text(format!("{}\n\n{}", e.emulator_status.help(), e.emulator_notes));
+                                    for need in e.needs() {
+                                        ui.label(RichText::new(format!(" needs {need} ")).small().color(Color32::BLACK).background_color(Color32::from_rgb(230, 200, 120)))
+                                            .on_hover_text("The emulator doesn't model this; those features won't work here.");
+                                    }
+                                });
+                                ui.label(&e.description);
+                                if !e.emulator_notes.is_empty() {
+                                    ui.label(RichText::new(format!("In the emulator: {}", e.emulator_notes)).small().weak());
+                                }
+                                ui.horizontal_wrapped(|ui| {
+                                    if e.is_template() {
+                                        if let Ok(crate::catalog::Spec::Template { files }) = e.spec() {
+                                            for f in files {
+                                                let short = f.rsplit('/').next().unwrap_or(&f).to_string();
+                                                let text = crate::catalog::Entry::template_text(&f).unwrap_or("");
+                                                if ui.button(format!("Copy {short}")).on_hover_text("Copy the file to the clipboard").clicked() {
+                                                    ui.ctx().copy_text(text.to_string());
+                                                    saved = Some(format!("{short} copied to the clipboard"));
+                                                }
+                                                if ui.small_button("Save…").clicked() {
+                                                    if let Some(path) = rfd::FileDialog::new().set_file_name(&short).save_file() {
+                                                        saved = Some(match std::fs::write(&path, text) {
+                                                            Ok(()) => format!("saved {}", path.display()),
+                                                            Err(err) => format!("saving {}: {err}", path.display()),
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        let tip = if e.pinned() { "Download, check the SHA-256 the catalogue lists, erase the flash and write it. The device boots it straight away." } else { "Download from the web installer, erase the flash and write it (this entry has no pinned SHA-256)." };
+                                        if ui.add_enabled(!busy, egui::Button::new(RichText::new("Install").strong())).on_hover_text(tip).clicked() {
+                                            install = Some(e.clone());
+                                        }
+                                        if let Some(u) = e.manifest_url() {
+                                            if ui.small_button("Use manifest…").on_hover_text(format!("Put {u} into \"Install from web\" (skips the catalogue's SHA-256 check)")).clicked() {
+                                                use_web = Some(u);
+                                            }
+                                        }
+                                    }
+                                    if !e.homepage.is_empty() {
+                                        ui.hyperlink_to(RichText::new("homepage").small(), &e.homepage);
+                                    }
+                                    if !e.licence.is_empty() {
+                                        ui.label(RichText::new(&e.licence).small().weak());
+                                    }
+                                });
+                                if !e.notes.trim().is_empty() {
+                                    egui::CollapsingHeader::new(RichText::new("Notes").small()).id_salt(("gnotes", &e.id)).show(ui, |ui| {
+                                        ui.label(RichText::new(e.notes.trim()).small());
+                                    });
+                                }
+                            });
+                        });
+                        ui.separator();
+                    }
+                    let unsup: Vec<_> = self.catalog.unsupported.iter().collect();
+                    if !unsup.is_empty() {
+                        egui::CollapsingHeader::new(RichText::new(format!("Not in the list ({})", unsup.len())).small()).id_salt("gunsup").show(ui, |ui| {
+                            for u in unsup {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new(format!("{}: {}", u.name, u.reason)).small());
+                                    if !u.homepage.is_empty() {
+                                        ui.hyperlink_to(RichText::new("link").small(), &u.homepage);
+                                    }
+                                });
+                            }
+                        });
+                    }
+                });
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    let d = &mut self.devices[i];
+                    let label = if hidden > 0 { format!("Show entries that don't boot in the emulator ({hidden})") } else { "Show entries that don't boot in the emulator".into() };
+                    ui.checkbox(&mut d.gallery_broken, label);
+                });
+                ui.label(RichText::new(format!("Something else? Paste its web flasher's manifest URL into \"Install from web\", or drop your own .bin files on the window. ({} profile: {})", cp.display, cp.name)).small().weak());
+                if let Some(m) = &saved {
+                    ui.label(RichText::new(m).small());
+                }
+            });
+        if let Some(m) = saved {
+            self.devices[i].lab(format!("catalogue: {m}"));
+        }
+        if refresh {
+            let url = self.settings.catalog.url.trim().to_string();
+            let root = self.paths.root.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let w = self.waker.clone();
+            self.catalog_job = Some(rx);
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::catalog::refresh(&url, &root).map_err(|e| format!("{e:#}")));
+                w();
+            });
+        }
+        if let Some(u) = use_web {
+            self.devices[i].web_manifest = u;
+            self.devices[i].gallery_open = false;
+            return;
+        }
+        if let Some(e) = install {
+            let cache = self.paths.root.join("cache").join("firmware");
+            let w = self.waker.clone();
+            self.devices[i].start_catalog_install(e, cache, w);
+        }
+        if !open {
+            self.devices[i].gallery_open = false;
+        }
+    }
+
     fn settings_window(&mut self, ctx: &egui::Context) {
         let Some(draft) = self.settings_draft.as_mut() else { return };
         let mut open = true;
@@ -1305,6 +1577,11 @@ impl CydLabApp {
                 ui.end_row();
             });
             ui.separator();
+            ui.heading("Firmware catalogue");
+            let c = &mut draft.catalog;
+            ui.checkbox(&mut c.refresh, "Check a URL for catalogue updates (off: use the catalogue built into cyd-lab)");
+            ui.add_enabled(c.refresh, egui::TextEdit::singleline(&mut c.url).desired_width(420.0).hint_text("https://raw.githubusercontent.com/<user>/cyd-lab/main/catalog/cyd-firmware.toml"));
+            ui.separator();
             ui.heading("Data");
             ui.label(format!("Data folder: {}", self.paths.root.display()));
             ui.label(format!("Devices: {}", self.paths.devices.display()));
@@ -1332,6 +1609,11 @@ impl CydLabApp {
             match draft.save(&self.paths.settings) {
                 Ok(()) => self.status = format!("Settings saved to {}", self.paths.settings.display()),
                 Err(e) => self.status = format!("Saving settings failed: {e:#}"),
+            }
+            if draft.catalog != self.settings.catalog {
+                let (c, note) = crate::catalog::load(&self.paths.root, &draft.catalog);
+                self.catalog = c;
+                self.catalog_note = note.unwrap_or_default();
             }
             self.settings = draft;
         } else if !open {
@@ -1523,6 +1805,9 @@ impl CydLabApp {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Firmware:").strong());
             ui.add_enabled_ui(!busy, |ui| {
+                if ui.button(RichText::new("Install firmware…").strong()).on_hover_text("Pick a ready-made firmware for this board (openHASP, NerdMiner, Bruce, …): cyd-lab downloads it, checks its SHA-256 and writes it in one click.").clicked() {
+                    self.devices[i].gallery_open = true;
+                }
                 if ui.button(RichText::new("Flash a .bin…").strong()).on_hover_text("Pick a firmware .bin. Merged/factory images go to 0x0, app images into the app partition; you are asked only when it is unclear. A running device is powered off, written and powered on again.").clicked() {
                     pick_bin = true;
                 }
@@ -1864,7 +2149,7 @@ impl CydLabApp {
                 d.dev.meta.view_rotation = rot;
                 let _ = self.store.update_meta(&d.dev);
             }            if d.flash_blank && d.pending_flash.is_none() {
-                ui.label(RichText::new("Blank flash: drop a .bin here or Install from web").color(Color32::from_rgb(240, 190, 40)));
+                ui.label(RichText::new("Blank flash: press Install firmware..., or drop a .bin here").color(Color32::from_rgb(240, 190, 40)));
             }
         });
         let rot = d.dev.meta.view_rotation;
@@ -1984,7 +2269,7 @@ impl CydLabApp {
                 ui.ctx().copy_text(text);
             }
             if let Some(cmd) = d.backend.last_command() {
-                ui.small_button("Command line").on_hover_text(cmd.clone()).clicked().then(|| ui.ctx().copy_text(cmd));
+                ui.small_button("Command line").on_hover_text(format!("{}\n\nClick to copy (includes the Wi-Fi password).", crate::engine::mask_secrets(&cmd))).clicked().then(|| ui.ctx().copy_text(cmd));
             }
         });
         let mut use_ssid = None;
@@ -2153,6 +2438,7 @@ impl eframe::App for CydLabApp {
 
         self.new_device_window(&ctx);
         self.drop_ask_window(&ctx);
+        self.gallery_window(&ctx);
         self.arduino_window(&ctx);
         self.settings_window(&ctx);
         self.delete_modal(&ctx);

@@ -32,6 +32,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 const MAX_DOWNLOAD: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // schema fields kept for display/debugging
 pub struct Catalog {
     pub schema_version: u32,
     #[serde(default)]
@@ -45,6 +46,7 @@ pub struct Catalog {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct CatProfile {
     pub id: String,
     pub name: String,

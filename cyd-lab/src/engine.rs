@@ -485,6 +485,29 @@ impl LaunchSpec {
             .collect::<Vec<_>>()
             .join(" ")
     }
+
+    /// `display()` with Wi-Fi passwords replaced by `***`, for the console log.
+    pub fn display_masked(&self) -> String {
+        mask_secrets(&self.display())
+    }
+}
+
+/// Hide `psk=...` values (in `--wifi ssid=..,psk=..`) from text shown on screen.
+pub fn mask_secrets(cmd: &str) -> String {
+    let mut out = String::with_capacity(cmd.len());
+    let mut rest = cmd;
+    let mut quoted = false;
+    while let Some(i) = rest.find("psk=") {
+        quoted ^= rest[..i].matches('"').count() % 2 == 1;
+        out.push_str(&rest[..i + 4]);
+        out.push_str("***");
+        let tail = &rest[i + 4..];
+        // A quoted argument (it contains spaces) ends at its closing quote.
+        let end = if quoted { tail.find([',', '"']) } else { tail.find([',', ' ']) }.unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn path_str(p: &Path) -> String {
@@ -825,7 +848,7 @@ impl Backend for ProcessBackend {
             let _ = std::fs::create_dir_all(dir);
         }
         self.last_command = Some(spec.display());
-        self.lab(format!("[cyd-lab] power on ({}): {}", if spec.boot == BootMode::Download { "BOOT held, download mode" } else { "normal boot" }, spec.display()));
+        self.lab(format!("[cyd-lab] power on ({}): {}", if spec.boot == BootMode::Download { "BOOT held, download mode" } else { "normal boot" }, spec.display_masked()));
         let mut child = cmd.spawn().with_context(|| format!("starting engine {:?} (set the path in Settings)", spec.program))?;
         #[cfg(windows)]
         winjob::assign(&child);
@@ -1234,6 +1257,15 @@ mod tests {
         p.psram_mb = 8;
         let spec = LaunchSpec::build(&p, &d, &EngineSettings::default(), &EngineFeatures::default(), BootMode::Normal, None, None);
         assert_eq!(value_of(&spec.args, "--psram-mb"), Some("8"));
+    }
+
+    #[test]
+    fn masks_wifi_password() {
+        assert_eq!(mask_secrets("x --wifi ssid=a,psk=s3cret --net nat"), "x --wifi ssid=a,psk=*** --net nat");
+        assert_eq!(mask_secrets("x \"--wifi ssid=a b,psk=p w\""), "x \"--wifi ssid=a b,psk=***\"");
+        assert_eq!(mask_secrets("--wifi ssid=a,psk=1,channel=6"), "--wifi ssid=a,psk=***,channel=6");
+        assert_eq!(mask_secrets("no secrets"), "no secrets");
+        assert_eq!(mask_secrets("\"--wifi ssid=x y,psk=a b\" --wifi ssid=z,psk=q --net nat"), "\"--wifi ssid=x y,psk=***\" --wifi ssid=z,psk=*** --net nat");
     }
 
     #[test]
