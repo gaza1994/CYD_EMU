@@ -61,6 +61,22 @@ pub struct DeviceMeta {
     /// Wi-Fi access point and published ports (`[network]`). Plain text, password included.
     #[serde(default)]
     pub network: crate::network::DeviceNetwork,
+    /// The popped-out screen window (position, zoom), remembered per device.
+    #[serde(default)]
+    pub screen_window: ScreenWindow,
+}
+
+/// Where the device's screen window was ("Pop out"), in points, and how it was shown.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScreenWindow {
+    /// Open in its own window (restored at the next start).
+    pub popped: bool,
+    /// Outer position of the window, if known.
+    pub pos: Option<[f32; 2]>,
+    /// Integer zoom, 0 = fit (the largest whole zoom that fits the window).
+    pub zoom: u8,
+    pub always_on_top: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -154,6 +170,7 @@ impl DeviceStore {
             view_rotation: profile.display.as_ref().map(|d| d.default_rotation).unwrap_or(0),
             created: now,
             network: crate::network::DeviceNetwork::for_new_device(wifi),
+            screen_window: ScreenWindow::default(),
         };
         let dev = Device { id, dir, meta };
         write_blank_flash(&dev.flash_path(), profile.flash.size_bytes())?;
@@ -168,6 +185,45 @@ impl DeviceStore {
         }
         dev.meta.name = new_name.to_string();
         dev.save()
+    }
+
+    /// Copy a device: same profile, settings and flash contents, but its own folder, MAC,
+    /// COM name and serial port, and published ports moved to free numbers on this PC.
+    /// `flash.bin` is copied as it is on disk (a running device saves it at power-off).
+    pub fn duplicate(&self, src: &Device, new_name: &str) -> Result<Device> {
+        let name = new_name.trim();
+        if name.is_empty() {
+            bail!("device name is empty");
+        }
+        let (existing, _) = self.list()?;
+        let id = unique_id(&slug(name), |c| self.root.join(c).exists());
+        let dir = self.root.join(&id);
+        fs::create_dir_all(&dir)?;
+        let now = now_secs();
+        let mut meta = src.meta.clone();
+        meta.name = name.to_string();
+        meta.created = now.max(src.meta.created + 1);
+        meta.mac = Some(generate_mac(&id, now));
+        let coms: Vec<String> = existing.iter().filter_map(|d| d.meta.com_port.clone()).collect();
+        meta.com_port = Some(next_com_port(&coms));
+        meta.serial_tcp_port = Some(next_serial_tcp_port(&existing.iter().filter_map(|d| d.meta.serial_tcp_port).collect::<Vec<_>>()));
+        meta.screen_window = ScreenWindow::default();
+        let mut used: Vec<u16> = existing.iter().flat_map(|d| d.meta.network.host_ports()).collect();
+        for f in &mut meta.network.forwards {
+            let h = (f.host..u16::MAX).find(|h| !used.contains(h)).unwrap_or(f.host);
+            if f.same_port {
+                f.guest = h;
+            }
+            f.host = h;
+            used.push(h);
+        }
+        let dev = Device { id, dir, meta };
+        let r = fs::copy(src.flash_path(), dev.flash_path()).with_context(|| format!("copying {}", src.flash_path().display())).and_then(|_| dev.save());
+        if let Err(e) = r {
+            let _ = fs::remove_dir_all(&dev.dir);
+            return Err(e);
+        }
+        Ok(dev)
     }
 
     pub fn update_meta(&self, dev: &Device) -> Result<()> {
@@ -347,6 +403,28 @@ mod tests {
         store.delete(&dev).unwrap();
         assert!(!dev.dir.exists());
         assert!(store.list().unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn duplicate_copies_flash_with_new_identity() {
+        let (_t, store, profile) = store();
+        let mut a = store.create("Panel", &profile).unwrap();
+        store.import_firmware(&a, 0x1000, &[0xE9, 1, 2, 3]).unwrap();
+        a.meta.network.forwards.push(crate::network::Forward { label: "ESPHome API".into(), host: 6053, guest: 6053, same_port: false });
+        a.meta.network.forwards.push(crate::network::Forward { label: "ESPHome OTA".into(), host: 3232, guest: 3232, same_port: true });
+        a.save().unwrap();
+        let b = store.duplicate(&a, "Panel copy").unwrap();
+        assert_eq!(b.id, "panel-copy");
+        assert_eq!(fs::read(a.flash_path()).unwrap(), fs::read(b.flash_path()).unwrap());
+        assert_ne!(a.meta.mac, b.meta.mac);
+        assert_ne!(a.meta.serial_tcp_port, b.meta.serial_tcp_port);
+        assert_ne!(a.meta.com_port, b.meta.com_port);
+        assert_eq!(b.meta.profile, a.meta.profile);
+        let hosts: Vec<(u16, u16)> = b.meta.network.forwards.iter().map(|f| (f.host, f.guest)).collect();
+        assert_eq!(hosts, vec![(6054, 6053), (3233, 3233)]);
+        let (all, _) = store.list().unwrap();
+        assert_eq!(all.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(), vec!["panel", "panel-copy"]);
+        assert!(store.duplicate(&a, " ").is_err());
     }
 
     #[test]

@@ -137,13 +137,18 @@ pub struct Entry {
     /// How the firmware gets onto Wi-Fi the first time.
     #[serde(default)]
     pub first_setup: Option<FirstSetup>,
-    /// Step card shown after installing it.
+    /// Extra notes for the setup checklist shown after installing it (optional).
     #[serde(default)]
     pub steps: Vec<String>,
+    /// Firmware Home Assistant talks to (ESPHome native API on 6053, OTA on 3232): installing
+    /// it publishes those ports and the setup checklist shows how to add it.
+    #[serde(default)]
+    pub home_assistant: bool,
     /// A bundled config behind this firmware (offered as "Copy config").
     #[serde(default)]
     pub config: String,
-    /// Screen view rotation to switch the device to on install (the firmware draws landscape).
+    /// How the board is meant to be held for this firmware (it draws landscape). Suggested
+    /// in the setup checklist; never switched silently.
     #[serde(default)]
     pub view_rotation: Option<u16>,
 }
@@ -752,7 +757,7 @@ mod tests {
         let names: Vec<&str> = g.iter().map(|(h, _)| *h).collect();
         assert_eq!(names, ["Home Assistant", "Tools & fun", "Programming", "Other / advanced"]);
         let ha = g[0].1[0];
-        assert!(ha.pinned() && ha.first_setup.as_ref().unwrap().improv && !ha.steps.is_empty());
+        assert!(ha.pinned() && ha.first_setup.as_ref().unwrap().improv && ha.home_assistant && ha.view_rotation == Some(270));
         assert!(Entry::template_text(&ha.config).unwrap().contains("improv_serial"));
         let ehw = c.entries.iter().find(|e| e.id == "esphome-web").unwrap();
         assert!(ehw.name.contains("no screen") && ehw.group_id() == "other");

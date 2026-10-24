@@ -9,9 +9,11 @@
 #   pinned      = true            listed first in its group
 #   first_setup = { improv = bool, hotspot = "SSID pattern", password = "...", page = "http://...",
 #                   note = "..." }  how the firmware gets onto Wi-Fi the first time
-#   steps       = ["...", ...]    a step card shown after installing it
+#   steps       = ["...", ...]    extra notes under the setup checklist shown after installing it
+#   home_assistant = true         Home Assistant talks to it (ESPHome API 6053 + OTA 3232): installing
+#                                 publishes those ports and the checklist shows how to add it
 #   config      = "file"          a bundled config the gallery offers to copy (Copy config)
-#   view_rotation = 0|90|180|270  screen view rotation set on install (firmware draws landscape)
+#   view_rotation = 0|90|180|270  how the board is meant to be held (suggested, never applied silently)
 # Extra source type: "bundled" (file = name under assets/firmware/, offset, sha256, size).
 
 [[entries]]
@@ -32,11 +34,7 @@ pinned = true
 config = "esphome/cyd-panel-2432s028r.yaml"
 view_rotation = 270
 first_setup = { improv = true, hotspot = "cyd-panel-xxxxxx", password = "", page = "http://192.168.4.1", note = "" }
-steps = [
-  "Send Wi-Fi details: once it has booted (a few seconds), press \"Send Wi-Fi details\" on the device panel. The screen then shows its IP.",
-  "Home Assistant: look under Settings > Devices & services > Discovered. If it is not there (discovery uses mDNS, which may not reach your network from the emulator), add the ESPHome integration with this PC's IP and the port published for the ESPHome API (Network > Use with… > ESPHome (API + OTA)).",
-  "To customise it: \"Copy config\", paste it as a new device in the ESPHome add-on (Device Builder), edit, then install over the air to this PC's IP and the published OTA port.",
-]
+home_assistant = true
 [entries.source]
 type = "bundled"
 file = "esphome-ha-cyd-2432s028r.factory.bin"
@@ -135,6 +133,7 @@ id = "esphome-web"
 name = "ESPHome Web (generic ESP32, no screen)"
 group = "other"
 description = "The generic image from web.esphome.io: no screen driver, so the display stays dark. Only for adopting a blank ESP32 into Home Assistant and then flashing your own config. For a CYD with a working screen use \"ESPHome for Home Assistant (with screen)\" above, or the \"ESPHome CYD starter YAML\" (Copy config)."
+home_assistant = true
 first_setup = { improv = true, hotspot = "esphome-web-xxxxxx", password = "", page = "http://192.168.4.1", note = "in the emulator it crashes when it turns Bluetooth on, before Wi-Fi setup can finish" }
 
 [[overrides]]
