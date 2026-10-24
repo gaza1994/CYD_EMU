@@ -168,8 +168,12 @@ pub struct EngineFeatures {
     /// `--mdns-relay`: answer/forward mDNS between the LAN and the NAT'd chip.
     pub mdns_relay: bool,
     /// `--ap-client` + `--ap-fwd`: join the firmware's own setup hotspot and forward its page
-    /// (being added to the engine; detected from `--help` only).
+    /// (detected from `--help` only).
     pub ap_client: bool,
+    /// `--list-boards`: the engine's built-in board profiles as JSON.
+    pub list_boards: bool,
+    /// `--board-config FILE.toml`: a board described in a TOML file.
+    pub board_config: bool,
 }
 
 impl EngineFeatures {
@@ -191,6 +195,8 @@ impl EngineFeatures {
             hostfwd: has("--hostfwd"),
             mdns_relay: has("--mdns-relay"),
             ap_client: help.contains("--ap-client") && help.contains("--ap-fwd"),
+            list_boards: help.contains("--list-boards"),
+            board_config: help.contains("--board-config"),
         }
     }
 
@@ -222,10 +228,34 @@ fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
 }
 
+/// The engine's built-in boards (`--list-boards`), cached like [`EngineFeatures::probe`].
+/// Empty for an engine without the flag.
+pub fn list_boards(exe: &Path) -> Vec<crate::profile::EngineBoard> {
+    if !EngineFeatures::probe(exe).list_boards {
+        return Vec::new();
+    }
+    let Ok(meta) = std::fs::metadata(exe) else { return Vec::new() };
+    let key = (exe.to_path_buf(), meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+    type Cache = Mutex<Vec<((PathBuf, u64, SystemTime), Vec<crate::profile::EngineBoard>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    if let Some((_, b)) = cache.lock().unwrap().iter().find(|(k, _)| *k == key) {
+        return b.clone();
+    }
+    let boards = run_args(exe, &["--list-boards"]).map(|out| crate::profile::parse_board_list(&out)).unwrap_or_default();
+    cache.lock().unwrap().push((key, boards.clone()));
+    boards
+}
+
 /// `exe --help`, stdout + stderr, with a 3 s timeout.
 fn run_help(exe: &Path) -> Option<String> {
+    run_args(exe, &["--help"])
+}
+
+/// `exe ARGS`, stdout + stderr, with a 3 s timeout.
+fn run_args(exe: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new(exe);
-    cmd.arg("--help").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -429,7 +459,10 @@ impl LaunchSpec {
             a.push(v);
         };
         push("--chip", profile.chip.clone());
-        push("--board", profile.engine.board.clone());
+        match profile.engine.board_config.as_deref().filter(|c| !c.trim().is_empty()) {
+            Some(cfg) => push("--board-config", cfg.to_string()),
+            None => push("--board", profile.engine.board.clone()),
+        }
         push("--boot", "rom".into());
         if let Some(dir) = settings.rom_dir.as_ref().filter(|d| !d.as_os_str().is_empty()) {
             push("--rom", path_str(&dir.join(&profile.engine.rom)));

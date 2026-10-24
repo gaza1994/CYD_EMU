@@ -56,8 +56,13 @@ pub struct Profile {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EngineProfile {
-    /// esp32sim `--board` name.
+    /// esp32sim `--board` name (empty with `board_config`).
+    #[serde(default)]
     pub board: String,
+    /// An esp32sim board profile TOML (`--board-config`, docs/board-profiles.md): a board the
+    /// engine has no built-in for. Relative paths are next to this profile file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_config: Option<String>,
     /// Mask ROM ELF file name, resolved against the ROM directory setting.
     pub rom: String,
     /// esp32sim `--console` source (`uart0` for classic ESP32).
@@ -185,6 +190,9 @@ impl Profile {
         if !matches!(self.chip.as_str(), "esp32" | "s3" | "esp32s3" | "c3" | "esp32c3" | "c6" | "esp32c6") {
             bail!("profile {}: unknown chip {:?}", self.id, self.chip);
         }
+        if self.engine.board.trim().is_empty() && self.engine.board_config.as_deref().is_none_or(|c| c.trim().is_empty()) {
+            bail!("profile {}: engine.board or engine.board_config is required", self.id);
+        }
         if self.flash.size_mb == 0 || self.flash.size_mb > 128 {
             bail!("profile {}: flash.size_mb must be 1..=128", self.id);
         }
@@ -245,7 +253,17 @@ impl ProfileLibrary {
         entries.sort();
         for path in entries {
             match std::fs::read_to_string(&path) {
-                Ok(text) => self.add_text(&path.display().to_string(), &text),
+                Ok(text) => {
+                    self.add_text(&path.display().to_string(), &text);
+                    // A relative --board-config is next to the profile.
+                    if let Ok(p) = Profile::parse(&text) {
+                        if let Some(prof) = self.profiles.get_mut(&p.id) {
+                            if let Some(bc) = prof.engine.board_config.as_mut().filter(|c| Path::new(c.as_str()).is_relative()) {
+                                *bc = dir.join(&*bc).display().to_string();
+                            }
+                        }
+                    }
+                }
                 Err(e) => self.errors.push(format!("{}: {e}", path.display())),
             }
         }
@@ -263,6 +281,102 @@ impl ProfileLibrary {
 
     pub fn get(&self, id: &str) -> Option<&Profile> {
         self.profiles.get(id)
+    }
+
+    /// Add a profile for every classic-ESP32 board the engine has built in (`--list-boards`)
+    /// that no loaded profile already runs. They copy the original CYD profile's ROM, flash
+    /// and buttons; the engine's own profile supplies the panel, touch and pins at run time.
+    /// Returns how many were added.
+    pub fn add_engine_boards(&mut self, boards: &[EngineBoard]) -> usize {
+        let Some(base) = self.profiles.get("esp32-2432s028r").cloned() else { return 0 };
+        let mut added = 0;
+        for b in boards.iter().filter(|b| b.chip == "esp32" && b.width > 0 && b.height > 0) {
+            let runs = |p: &Profile| p.engine.board == b.name || b.aliases.iter().any(|a| *a == p.engine.board);
+            if self.profiles.values().any(runs) {
+                continue;
+            }
+            let p = b.profile(&base);
+            if p.validate().is_ok() && !self.profiles.contains_key(&p.id) {
+                self.profiles.insert(p.id.clone(), p);
+                added += 1;
+            }
+        }
+        added
+    }
+}
+
+/// One board from `esp32sim --list-boards`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct EngineBoard {
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub chip: String,
+    pub description: String,
+    pub controller: String,
+    pub width: u32,
+    pub height: u32,
+    /// `xpt2046`, `gt911`, `cst816` or `none`.
+    pub touch: String,
+    pub rgb_led: bool,
+    pub sources: Vec<String>,
+}
+
+/// Parse `--list-boards` output (a JSON array; anything else gives an empty list).
+pub fn parse_board_list(json: &str) -> Vec<EngineBoard> {
+    let start = json.find('[').unwrap_or(0);
+    serde_json::from_str(json[start..].trim()).unwrap_or_default()
+}
+
+impl EngineBoard {
+    /// "ESP32-2432S024C 2.4\" (capacitive touch)" style names; the two-USB 2.8" is spelled out.
+    pub fn display_name(&self) -> String {
+        let model = self.name.strip_prefix("cyd-").unwrap_or(&self.name);
+        if model == "2432s028r-2usb" {
+            return "ESP32-2432S028R two-USB (USB-C + micro-USB)".into();
+        }
+        let upper = model.to_ascii_uppercase();
+        let inches = match model.get(4..8) {
+            Some("s024") => " 2.4\"",
+            Some("s028") => " 2.8\"",
+            Some("s032") => " 3.2\"",
+            Some("s035") => " 3.5\"",
+            _ => "",
+        };
+        let touch = match self.touch.as_str() {
+            "xpt2046" => " resistive touch",
+            "gt911" | "cst816" => " capacitive touch",
+            _ => "",
+        };
+        format!("ESP32-{upper}{inches}{}", if touch.is_empty() { String::new() } else { format!(" ({})", touch.trim()) })
+    }
+
+    /// A cyd-lab profile for this engine board, based on `base` (the original CYD).
+    pub fn profile(&self, base: &Profile) -> Profile {
+        let model = self.name.strip_prefix("cyd-").unwrap_or(&self.name);
+        let mut p = base.clone();
+        p.id = format!("esp32-{model}");
+        p.name = self.display_name();
+        p.description = if self.description.is_empty() { format!("esp32sim built-in board {}", self.name) } else { self.description.clone() };
+        p.engine.board = self.name.clone();
+        p.engine.board_config = None;
+        p.display = Some(DisplayProfile {
+            controller: self.controller.to_ascii_uppercase(),
+            width: self.width,
+            height: self.height,
+            default_rotation: 0,
+            bus: None,
+            // Every Sunton SPI board in the engine's list shares these panel pins.
+            pins: base.display.as_ref().map(|d| d.pins.clone()).unwrap_or_default(),
+        });
+        p.touch = match self.touch.as_str() {
+            "none" | "" => None,
+            t => Some(TouchProfile { controller: t.to_ascii_uppercase(), bus: Some("see the engine's board profile".into()), pins: TouchPins::default() }),
+        };
+        if !self.rgb_led {
+            p.rgb_led = None;
+        }
+        p
     }
 }
 
@@ -341,6 +455,41 @@ mod tests {
         assert!(Profile::parse(&MINIMAL.replace("id = \"mini\"", "id = \"bad id\"")).is_err());
         assert!(Profile::parse(&format!("psram_mb = 4\n{MINIMAL}")).is_err(), "classic ESP32 + PSRAM must be rejected");
         assert!(Profile::parse(&format!("{MINIMAL}\nunknown_key = 1")).is_err(), "typos must not be silently ignored");
+    }
+
+    const LIST: &str = r#"[{"name":"cyd-2432s028r","aliases":["cyd"],"chip":"esp32","description":"orig","controller":"ili9341","width":240,"height":320,"touch":"xpt2046","rgb_led":true,"sources":[]},
+{"name":"cyd-2432s028r-2usb","aliases":["cyd-2usb"],"chip":"esp32","description":"two-USB","controller":"ili9342","width":320,"height":240,"touch":"xpt2046","rgb_led":true,"sources":["x"]},
+{"name":"cyd-2432s024c","aliases":[],"chip":"esp32","description":"2.4 C","controller":"ili9341","width":240,"height":320,"touch":"cst816","rgb_led":true,"sources":[]},
+{"name":"cyd-3248s035r","aliases":[],"chip":"esp32","description":"3.5 R","controller":"st7796","width":320,"height":480,"touch":"xpt2046","rgb_led":true,"sources":[]}]"#;
+
+    #[test]
+    fn engine_boards_become_profiles() {
+        let boards = parse_board_list(LIST);
+        assert_eq!(boards.len(), 4);
+        assert!(parse_board_list("unknown arg --list-boards").is_empty());
+        let mut lib = ProfileLibrary::load(None);
+        assert_eq!(lib.add_engine_boards(&boards), 3, "the original CYD already has a profile");
+        let usb = lib.get("esp32-2432s028r-2usb").unwrap();
+        assert_eq!(usb.name, "ESP32-2432S028R two-USB (USB-C + micro-USB)");
+        assert_eq!(usb.engine.board, "cyd-2432s028r-2usb");
+        assert_eq!(usb.panel_size(), Some((320, 240)), "native landscape");
+        assert_eq!((usb.flash.size_mb, usb.engine.rom.as_str()), (4, "esp32_rev300_rom.elf"));
+        let c = lib.get("esp32-2432s024c").unwrap();
+        assert_eq!(c.name, "ESP32-2432S024C 2.4\" (capacitive touch)");
+        assert_eq!(c.touch.as_ref().unwrap().controller, "CST816");
+        assert_eq!(lib.get("esp32-3248s035r").unwrap().panel_size(), Some((320, 480)));
+        assert_eq!(lib.add_engine_boards(&boards), 0, "idempotent");
+    }
+
+    #[test]
+    fn board_config_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = MINIMAL.replace("board = \"none\"", "board_config = \"myboard.toml\"").replace("\"mini\"", "\"mine\"");
+        std::fs::write(dir.path().join("mine.toml"), text).unwrap();
+        let lib = ProfileLibrary::load(Some(dir.path()));
+        let p = lib.get("mine").unwrap();
+        assert_eq!(p.engine.board_config.as_deref(), Some(dir.path().join("myboard.toml").display().to_string().as_str()));
+        assert!(Profile::parse(&MINIMAL.replace("board = \"none\"", "")).is_err(), "a board or a board config");
     }
 
     #[test]

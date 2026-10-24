@@ -1101,6 +1101,7 @@ impl CydLabApp {
             catalog_job: None,
             thumbs: Default::default(),
         };
+        app.add_engine_boards();
         app.rom_ready = app.check_rom();
         if !app.rom_ready {
             app.start_rom_download();
@@ -1415,6 +1416,13 @@ impl CydLabApp {
     }
 
     /// What the configured engine build supports (cached per exe path/size/mtime).
+    /// Offer every board the engine has built in (`--list-boards`) alongside the profiles.
+    fn add_engine_boards(&mut self) {
+        if let Some(exe) = resolve_exe(&self.effective_engine().engine_exe) {
+            self.profiles.add_engine_boards(&crate::engine::list_boards(&exe));
+        }
+    }
+
     fn engine_features(&self) -> EngineFeatures {
         resolve_exe(&self.effective_engine().engine_exe).map(|p| EngineFeatures::probe(&p)).unwrap_or_default()
     }
@@ -1684,13 +1692,11 @@ impl CydLabApp {
                 ui.end_row();
                 ui.label("Variant");
                 egui::ComboBox::from_id_salt("profile").selected_text(self.profiles.get(&dlg.profile).map(|p| p.name.as_str()).unwrap_or("?")).show_ui(ui, |ui| {
-                    for p in self.profiles.profiles.values() {
-                        ui.selectable_value(&mut dlg.profile, p.id.clone(), &p.name);
-                    }
-                    ui.separator();
-                    ui.label(RichText::new("Coming soon").small().weak());
-                    for (name, why) in COMING_SOON_BOARDS {
-                        ui.add_enabled(false, egui::Button::selectable(false, *name)).on_disabled_hover_text(*why);
+                    // Yellow boards first (smallest screen first), then the rest.
+                    let mut list: Vec<&Profile> = self.profiles.profiles.values().collect();
+                    list.sort_by_key(|p| (!p.engine.board.starts_with("cyd-"), p.id.clone()));
+                    for p in list {
+                        ui.selectable_value(&mut dlg.profile, p.id.clone(), &p.name).on_hover_text(&p.description);
                     }
                 });
                 ui.end_row();
@@ -1698,7 +1704,9 @@ impl CydLabApp {
             if let Some(p) = self.profiles.get(&dlg.profile) {
                 ui.add_space(4.0);
                 ui.label(RichText::new(&p.description).small());
-                ui.label(RichText::new(format!("{} · {} MB flash · engine board `{}`", p.chip, p.flash.size_mb, p.engine.board)).small().weak());
+                let board = p.engine.board_config.clone().unwrap_or_else(|| p.engine.board.clone());
+                let screen = p.panel_size().map(|(w, h)| format!(" · {w}x{h} screen")).unwrap_or_default();
+                ui.label(RichText::new(format!("{} · {} MB flash{screen} · engine board `{board}`", p.chip, p.flash.size_mb)).small().weak());
             }
             ui.add_space(6.0);
             if ui.button("Create").clicked() {
@@ -1754,7 +1762,7 @@ impl CydLabApp {
         // (heading before this entry, entry), in gallery order.
         let grouped: Vec<(Option<&'static str>, crate::catalog::Entry)> = cat_profile
             .as_ref()
-            .map(|p| self.catalog.grouped(&p.id, show_broken).into_iter().flat_map(|(h, v)| v.into_iter().enumerate().map(move |(k, e)| ((k == 0).then_some(h), e.clone()))).collect())
+            .map(|p| self.catalog.grouped(&p.id, show_broken).into_iter().flat_map(|(h, v)| v.into_iter().enumerate().map(move |(k, e)| ((k == 0).then_some(h), e.for_profile(&p.id)))).collect())
             .unwrap_or_default();
         let headings: Vec<Option<&'static str>> = grouped.iter().map(|(h, _)| *h).collect();
         let entries: Vec<crate::catalog::Entry> = grouped.into_iter().map(|(_, e)| e).collect();
@@ -1856,6 +1864,9 @@ impl CydLabApp {
                                     }
                                 });
                                 ui.label(&e.description);
+                                if e.borrowed_for(&cp.id) {
+                                    ui.label(RichText::new("Built for the micro-USB 2432S028R. It runs on this board too, but its picture may be turned, mirrored or cut off on this panel.").small().color(Color32::from_rgb(220, 170, 80)));
+                                }
                                 if let Some(f) = e.first_setup.as_ref().map(|f| f.summary()).filter(|t| !t.is_empty()) {
                                     ui.label(RichText::new(format!("First Wi-Fi setup: {f}")).small());
                                 }
@@ -2131,6 +2142,7 @@ impl CydLabApp {
         });
         if reload_profiles {
             self.profiles = ProfileLibrary::load(Some(&self.paths.profiles));
+            self.add_engine_boards();
         }
         if save {
             let mut draft = self.settings_draft.take().unwrap();
@@ -2145,6 +2157,8 @@ impl CydLabApp {
             }
             draft.ui = self.settings.ui.clone();
             self.settings = draft;
+            self.profiles = ProfileLibrary::load(Some(&self.paths.profiles));
+            self.add_engine_boards();
         } else if !open {
             self.settings_draft = None;
         }
@@ -3503,11 +3517,3 @@ fn free_local_port() -> Option<u16> {
     std::net::TcpListener::bind(("127.0.0.1", 0)).ok().and_then(|l| l.local_addr().ok()).map(|a| a.port())
 }
 
-/// Board variants the New device dialog lists as "Coming soon" (the engine needs a board
-/// model for each first).
-const COMING_SOON_BOARDS: &[(&str, &str)] = &[
-    ("ESP32-2432S028R two-USB (USB-C + micro-USB)", "The newer 2.8\" board with two USB ports has an ST7789 panel; the emulator only models the ILI9341 so far."),
-    ("ESP32-2432S024R / 2432S024C (2.4\")", "Needs an engine board model (R = resistive touch, C = capacitive)."),
-    ("ESP32-2432S032R / 2432S032C (3.2\")", "Needs an engine board model (R = resistive touch, C = capacitive)."),
-    ("ESP32-3248S035R / 3248S035C (3.5\")", "Needs an engine board model (ST7796 panel; R = resistive touch, C = capacitive)."),
-];

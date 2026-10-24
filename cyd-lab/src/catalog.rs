@@ -31,9 +31,24 @@ pub use crate::catalog_assets::{CATALOG_TOML, TEMPLATES, THUMBS};
 /// (merged into every catalogue it reads, see `assets/cyd-lab-catalog.toml`).
 pub const OVERLAY_TOML: &str = include_str!("../assets/cyd-lab-catalog.toml");
 /// Firmware images built by cyd-lab and shipped inside the app (`type = "bundled"`).
-pub const BUNDLED_FIRMWARE: &[(&str, &[u8])] = &[("esphome-ha-cyd-2432s028r.factory.bin", include_bytes!("../assets/firmware/esphome-ha-cyd-2432s028r.factory.bin"))];
+pub const BUNDLED_FIRMWARE: &[(&str, &[u8])] = &[
+    ("esphome-ha-cyd-2432s028r.factory.bin", include_bytes!("../assets/firmware/esphome-ha-cyd-2432s028r.factory.bin")),
+    ("esphome-ha-cyd-2432s028r-2usb.factory.bin", include_bytes!("../assets/firmware/esphome-ha-cyd-2432s028r-2usb.factory.bin")),
+];
 /// Configs behind cyd-lab's bundled firmware (an entry's `config`).
-pub const OVERLAY_TEMPLATES: &[(&str, &str)] = &[("esphome/cyd-panel-2432s028r.yaml", include_str!("../firmware/esphome-ha/cyd-2432s028r.yaml"))];
+pub const OVERLAY_TEMPLATES: &[(&str, &str)] = &[
+    ("esphome/cyd-panel-2432s028r.yaml", include_str!("../firmware/esphome-ha/cyd-2432s028r.yaml")),
+    ("esphome/cyd-panel-2432s028r-2usb.yaml", include_str!("../firmware/esphome-ha/cyd-2432s028r-2usb.yaml")),
+];
+
+/// Catalogue profiles whose entries also apply to a board: the two 2.8" 2432S028R
+/// variants share pins, so firmware for the micro-USB board runs on the two-USB one too.
+pub fn profile_family(profile: &str) -> Vec<&str> {
+    match profile {
+        "cyd-2432s028r-2usb" => vec!["cyd-2432s028r-2usb", "cyd-2432s028r"],
+        p => vec![p],
+    }
+}
 
 /// Screen pictures for overlay entries (the emulator's `--tft-png`, landscape).
 pub const OVERLAY_THUMBS: &[(&str, &[u8])] = &[("esphome-ha-cyd", include_bytes!("../assets/cyd-lab-thumbs/esphome-ha-cyd.png"))];
@@ -151,6 +166,20 @@ pub struct Entry {
     /// in the setup checklist; never switched silently.
     #[serde(default)]
     pub view_rotation: Option<u16>,
+    /// Per-board replacements (`[entries.for_profile.PROFILE]`), applied by [`Entry::for_profile`].
+    #[serde(default)]
+    pub for_profile: HashMap<String, ProfileOverride>,
+}
+
+/// What an entry changes for one board profile (e.g. its own build for that panel).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProfileOverride {
+    pub source: Option<toml::Table>,
+    pub config: Option<String>,
+    pub view_rotation: Option<u16>,
+    pub notes: Option<String>,
+    pub emulator_notes: Option<String>,
 }
 
 /// First Wi-Fi setup of a firmware: Improv over serial, its own hotspot, or something else.
@@ -250,6 +279,9 @@ impl Catalog {
         let c: Catalog = v.try_into().context("catalogue entries")?;
         for e in &c.entries {
             e.spec().with_context(|| format!("entry {}", e.id))?;
+            for p in e.for_profile.keys() {
+                e.for_profile(p).spec().with_context(|| format!("entry {} for {p}", e.id))?;
+            }
         }
         Ok(c)
     }
@@ -262,16 +294,21 @@ impl Catalog {
     pub fn profile_for(&self, board_id: &str) -> Option<&CatProfile> {
         let b = board_id.to_ascii_lowercase();
         let short = b.strip_prefix("esp32-").unwrap_or(&b);
-        self.profiles.iter().find(|p| p.id == b || p.id == format!("cyd-{short}")).or_else(|| {
-            self.profiles.iter().find(|p| p.aliases.iter().any(|a| a.to_ascii_lowercase() == short))
-        })
+        let short = short.strip_prefix("cyd-").unwrap_or(short);
+        // 2432S024R / 2432S024C share one catalogue profile (cyd-2432s024).
+        let family = short.strip_suffix(['r', 'c']).filter(|f| f.ends_with(|c: char| c.is_ascii_digit()) && !short.ends_with("028r"));
+        self.profiles
+            .iter()
+            .find(|p| p.id == b || p.id == format!("cyd-{short}"))
+            .or_else(|| self.profiles.iter().find(|p| p.aliases.iter().any(|a| a.to_ascii_lowercase() == short)))
+            .or_else(|| family.and_then(|f| self.profiles.iter().find(|p| p.id == format!("cyd-{f}"))))
     }
 
     /// Entries for a catalogue profile, in catalogue order; broken ones only on request.
     pub fn entries_for(&self, profile: &str, show_broken: bool) -> Vec<&Entry> {
         self.entries
             .iter()
-            .filter(|e| e.profiles.iter().any(|p| p == profile))
+            .filter(|e| e.fits(profile))
             .filter(|e| show_broken || e.emulator_status != Status::Broken)
             .collect()
     }
@@ -290,7 +327,7 @@ impl Catalog {
     }
 
     pub fn hidden_broken(&self, profile: &str) -> usize {
-        self.entries.iter().filter(|e| e.profiles.iter().any(|p| p == profile) && e.emulator_status == Status::Broken).count()
+        self.entries.iter().filter(|e| e.fits(profile) && e.emulator_status == Status::Broken).count()
     }
 }
 
@@ -356,6 +393,40 @@ fn apply_overlay(v: &mut toml::Value, overlay: &str) -> Result<()> {
 }
 
 impl Entry {
+    /// Listed for this catalogue profile or one in its family ([`profile_family`]).
+    pub fn fits(&self, profile: &str) -> bool {
+        profile_family(profile).iter().any(|f| self.profiles.iter().any(|p| p == f))
+    }
+
+    /// Made for a sibling board, not listed for this one itself (e.g. a micro-USB 2432S028R
+    /// build shown for the two-USB board).
+    pub fn borrowed_for(&self, profile: &str) -> bool {
+        !self.profiles.iter().any(|p| p == profile) && self.fits(profile)
+    }
+
+    /// This entry as it applies to one board: its `for_profile` replacements filled in.
+    pub fn for_profile(&self, profile: &str) -> Entry {
+        let mut e = self.clone();
+        if let Some(o) = self.for_profile.get(profile) {
+            if let Some(src) = &o.source {
+                e.source = src.clone();
+            }
+            if let Some(c) = &o.config {
+                e.config = c.clone();
+            }
+            if o.view_rotation.is_some() {
+                e.view_rotation = o.view_rotation.filter(|r| *r != 0);
+            }
+            if let Some(n) = &o.notes {
+                e.notes = n.clone();
+            }
+            if let Some(n) = &o.emulator_notes {
+                e.emulator_notes = n.clone();
+            }
+        }
+        e
+    }
+
     /// Gallery group id (one of [`GROUPS`]).
     pub fn group_id(&self) -> &str {
         GROUPS.iter().map(|(g, _)| *g).find(|g| *g == self.group).unwrap_or("other")
@@ -776,6 +847,15 @@ mod tests {
         assert_eq!(p.parts.len(), 1);
         assert_eq!(p.parts[0].0, 0);
         assert_eq!(p.parts[0].1[0x1000], 0xE9, "factory image: bootloader at 0x1000");
+        // The two-USB board gets its own build (native landscape panel), config and no rotation hint.
+        let usb = ha.for_profile("cyd-2432s028r-2usb");
+        let Spec::Parts(parts) = usb.spec().unwrap() else { panic!() };
+        assert_eq!(parts[0].from, From::Bundled { file: "esphome-ha-cyd-2432s028r-2usb.factory.bin".into() });
+        let q = prepare(&usb, 4 << 20, None, &mut |_| {}).unwrap();
+        assert_ne!(q.parts[0].1, p.parts[0].1);
+        assert_eq!(usb.view_rotation, None);
+        assert!(Entry::template_text(&usb.config).unwrap().contains("rotation: 180"));
+        assert_eq!(ha.for_profile("cyd-2432s028r").view_rotation, Some(270));
     }
 
     #[test]
@@ -812,10 +892,21 @@ mod tests {
         assert!(!shown.iter().any(|e| e.id == "circuitpython"), "broken hidden by default");
         assert!(c.entries_for(&p.id, true).iter().any(|e| e.id == "circuitpython"));
         assert_eq!(c.hidden_broken(&p.id), 1);
-        // Other profiles only get their own entries.
+        // The two-USB 2.8" board also gets the micro-USB board's entries; others only their own.
         let usb = c.entries_for("cyd-2432s028r-2usb", true);
-        assert!(usb.iter().all(|e| e.profiles.contains(&"cyd-2432s028r-2usb".to_string())));
-        assert!(!usb.iter().any(|e| e.id == "wled"));
+        assert!(usb.iter().any(|e| e.id == "wled") && usb.iter().any(|e| e.id == "esphome-ha-cyd"));
+        assert!(usb.iter().find(|e| e.id == "wled").unwrap().borrowed_for("cyd-2432s028r-2usb"));
+        assert!(!usb.iter().find(|e| e.id == "nerdminer").unwrap().borrowed_for("cyd-2432s028r-2usb"));
+        let s024 = c.entries_for("cyd-2432s024", true);
+        assert!(s024.iter().all(|e| e.profiles.contains(&"cyd-2432s024".to_string())));
+        assert!(!s024.iter().any(|e| e.id == "wled"));
+        // Engine board names map onto catalogue profiles.
+        assert_eq!(c.profile_for("cyd-2432s028r-2usb").unwrap().id, "cyd-2432s028r-2usb");
+        assert_eq!(c.profile_for("cyd-2432s024c").unwrap().id, "cyd-2432s024");
+        assert_eq!(c.profile_for("cyd-3248s035r").unwrap().id, "cyd-3248s035");
+        assert_eq!(c.profile_for("cyd-2432s032c").unwrap().id, "cyd-2432s032");
+        assert_eq!(c.profile_for("esp32-2432s028r-2usb").unwrap().id, "cyd-2432s028r-2usb", "the profile ids cyd-lab makes from --list-boards");
+        assert_eq!(c.profile_for("esp32-2432s024c").unwrap().id, "cyd-2432s024");
     }
 
     #[test]

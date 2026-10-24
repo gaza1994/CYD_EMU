@@ -14,6 +14,8 @@
 #                                 publishes those ports and the checklist shows how to add it
 #   config      = "file"          a bundled config the gallery offers to copy (Copy config)
 #   view_rotation = 0|90|180|270  how the board is meant to be held (suggested, never applied silently)
+#   [entries.for_profile.PROFILE]  per-board replacements for source, config, view_rotation,
+#                                 notes and emulator_notes (e.g. a build for the two-USB 2432S028R)
 # Extra source type: "bundled" (file = name under assets/firmware/, offset, sha256, size).
 
 [[entries]]
@@ -22,11 +24,11 @@ name = "ESPHome for Home Assistant (with screen)"
 description = "Ready to adopt in Home Assistant: the screen shows the device name, IP and status, touch works, and the backlight, RGB LED and light sensor appear in Home Assistant. Wi-Fi setup over USB (Improv) or its own hotspot. Built by cyd-lab from its ESPHome config (no Bluetooth)."
 homepage = "https://esphome.io/"
 licence = "ESPHome: MIT (Python) + GPL-3.0 (C++)"
-profiles = ["cyd-2432s028r"]
+profiles = ["cyd-2432s028r", "cyd-2432s028r-2usb"]
 version = "1.0.0 (ESPHome 2026.10.0)"
 emulator_status = "works"
 emulator_notes = "Checked in the emulator: ready screen, touch (Identify button), Wi-Fi details over Improv in about 4 s, Home Assistant API reached through a published port."
-notes = """For the original micro-USB ESP32-2432S028R (ILI9341). A two-USB (ST7789) build will follow once the emulator has that board.
+notes = """For the original micro-USB ESP32-2432S028R (ILI9341 240x320, drawn landscape).
 Name: cyd-panel plus the last 6 digits of the MAC, e.g. cyd-panel-1a2b3c. No API encryption key, so Home Assistant adopts it without secrets; take control of it in the ESPHome add-on to add one.
 TODO: a one-click "Take control" (dashboard_import) needs a public copy of the config; not published yet."""
 group = "home-assistant"
@@ -41,6 +43,19 @@ file = "esphome-ha-cyd-2432s028r.factory.bin"
 offset = 0
 sha256 = "682ba746beb71f900ab032ec15adae1eee12268479d6652dcd06500b08a731a2"
 size = 1135504
+
+[entries.for_profile.cyd-2432s028r-2usb]
+notes = """For the two-USB ESP32-2432S028R (USB-C + micro-USB): native 320x240 landscape panel, ILI9341 320x240 with LVGL rotation 180, as proven on a real two-USB board.
+Name: cyd-panel plus the last 6 digits of the MAC, e.g. cyd-panel-1a2b3c. No API encryption key, so Home Assistant adopts it without secrets; take control of it in the ESPHome add-on to add one.
+TODO: a one-click "Take control" (dashboard_import) needs a public copy of the config; not published yet."""
+config = "esphome/cyd-panel-2432s028r-2usb.yaml"
+view_rotation = 0
+[entries.for_profile.cyd-2432s028r-2usb.source]
+type = "bundled"
+file = "esphome-ha-cyd-2432s028r-2usb.factory.bin"
+offset = 0
+sha256 = "ef691646c01c32bc65b61c337de7484c00c0db24f9595bff634b44cfa8d50340"
+size = 1135520
 
 # ---- groups and first-setup hints for the shared catalogue
 
