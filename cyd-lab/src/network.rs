@@ -112,6 +112,7 @@ impl DeviceNetwork {
     /// the preferred one unless another device or this one uses it: then the next free
     /// one, and for `same_port` forwards the firmware port moves with it (the firmware's
     /// config must then say that port, which the UI explains).
+    #[cfg(test)]
     pub fn add_preset(&mut self, p: &Preset, others: &[DeviceNetwork]) {
         self.add_preset_free(p, others, &|_| true);
     }
@@ -422,9 +423,28 @@ fn mismatch(wanted: &str, ap: &str) -> String {
     format!("Firmware is looking for Wi-Fi \"{wanted}\", but this device's access point offers \"{ap}\": set this device's Wi-Fi to match (Network > network name and password).")
 }
 
+/// An ESPHome native-API client connecting, as the firmware logs it
+/// (`[D][api.connection:2816]: Home Assistant 2026.10.1 (10.0.2.2): connected`): the client's
+/// name. `None` for any other line (also "disconnected").
+pub fn api_client_connected(line: &str) -> Option<String> {
+    let rest = &line[line.find("[api.connection")?..];
+    let msg = rest.split_once("]:")?.1.trim();
+    let who = msg.strip_suffix(": connected").or_else(|| msg.strip_suffix(": Connected successfully"))?;
+    let name = who.rsplit_once(" (").map(|(n, _)| n).unwrap_or(who).trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_clients_from_the_log() {
+        assert_eq!(api_client_connected("[D][api.connection:2816]: aioesphomeapi (10.0.2.2): connected").as_deref(), Some("aioesphomeapi"));
+        assert_eq!(api_client_connected("[12:00:01][D][api.connection:2816]: Home Assistant 2026.10.1 (10.0.2.2): connected").as_deref(), Some("Home Assistant 2026.10.1"));
+        assert_eq!(api_client_connected("[D][api.connection:2816]: aioesphomeapi (10.0.2.2): disconnected"), None);
+        assert_eq!(api_client_connected("[D][api:323]: Accept 10.0.2.2"), None);
+    }
 
     #[test]
     fn lan_ip_skips_virtual_adapters() {
