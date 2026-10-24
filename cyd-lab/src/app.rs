@@ -295,6 +295,8 @@ pub struct CydLabApp {
     confirm_delete: Option<String>,
     status: String,
     waker: Waker,
+    /// What `running.json` last said (rewritten only when this changes).
+    running_written: Option<Vec<crate::running::RunningDevice>>,
 }
 
 impl CydLabApp {
@@ -322,7 +324,7 @@ impl CydLabApp {
             status = format!("Profile errors: {}", profiles.errors.join("; "));
         }
         let selected = if devices.is_empty() { None } else { Some(0) };
-        CydLabApp { paths, settings, settings_draft: None, profiles, store, devices, selected, new_device: None, confirm_delete: None, status, waker }
+        CydLabApp { paths, settings, settings_draft: None, profiles, store, devices, selected, new_device: None, confirm_delete: None, status, waker, running_written: None }
     }
 
     fn profile_for(&self, i: usize) -> Option<Profile> {
@@ -501,9 +503,34 @@ impl CydLabApp {
             }
             any_running |= matches!(d.backend.state(), RunState::Running(_) | RunState::Stopping);
         }
+        self.publish_running();
         if any_running {
             // Notice process exits even when the engine is silent.
             ctx.request_repaint_after(Duration::from_millis(250));
+        }
+    }
+
+    /// Keep `running.json` (read by the Arduino discovery) in step with the powered-on devices.
+    fn publish_running(&mut self) {
+        let now: Vec<crate::running::RunningDevice> = self
+            .devices
+            .iter()
+            .filter(|d| matches!(d.backend.state(), RunState::Running(_)))
+            .filter_map(|d| {
+                let port = d.backend.capabilities().serial_tcp?;
+                Some(crate::running::RunningDevice { id: d.dev.id.clone(), name: d.dev.meta.name.clone(), profile: d.dev.meta.profile.clone(), serial_port: port })
+            })
+            .collect();
+        if self.running_written.as_ref() == Some(&now) {
+            return;
+        }
+        let file = crate::running::RunningFile { version: 1, pid: std::process::id(), devices: now.clone() };
+        match file.write(&self.paths.root.join(crate::running::FILE_NAME)) {
+            Ok(()) => self.running_written = Some(now),
+            Err(e) => {
+                self.status = format!("could not write running.json: {e}");
+                self.running_written = Some(now);
+            }
         }
     }
 
@@ -515,6 +542,8 @@ impl CydLabApp {
         for d in &mut self.devices {
             d.backend.stop();
         }
+        let _ = std::fs::remove_file(self.paths.root.join(crate::running::FILE_NAME));
+        self.running_written = None;
     }
 
     // --- dialogs ----------------------------------------------------------

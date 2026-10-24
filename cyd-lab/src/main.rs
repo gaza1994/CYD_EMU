@@ -5,6 +5,7 @@
 //! * `device`   – on-disk device store (device.toml + flash.bin per board)
 //! * `engine`   – the engine boundary: `Backend` trait, `ProcessBackend`, command line
 //! * `weblink`  – live screen/touch link to esp32sim's `--web` WebSocket
+//! * `running`  – running.json, the powered-on devices for the Arduino discovery
 //! * `app`      – the egui user interface
 
 // No console window behind the GUI on Windows release builds.
@@ -16,6 +17,7 @@ mod device;
 mod engine;
 mod profile;
 mod rfc2217;
+mod running;
 mod webinstall;
 mod weblink;
 
