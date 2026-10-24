@@ -280,9 +280,9 @@ Send Wi-Fi details, add it in Home Assistant (Discovered, or the ESPHome integra
 this PC's IP and the port published for 6053), then **Copy config** to customise it in the
 ESPHome add-on and update it over the air. Checked in the emulator: the ready screen, touch,
 Improv (connected in about 4 s) and the API through a published port with aioesphomeapi.
-Rebuild it with `esphome compile firmware/esphome-ha/cyd-2432s028r.yaml`, copy
-`firmware.factory.bin` to `assets/firmware/` and update `sha256`/`size` in
-`assets/cyd-lab-catalog.toml`. (`dashboard_import` is not set yet.)
+Rebuild it with `tools/build_esphome_ha.py` (runs `esphome compile`, copies
+`firmware.factory.bin` to `assets/firmware/` and updates `sha256`/`size` in
+`assets/cyd-lab-catalog.toml`). (`dashboard_import` is not set yet.)
 
 **ESPHome Web** (the generic image from web.esphome.io) has no screen driver: the display
 stays dark and it's only for adopting a blank ESP32 into Home Assistant. In the emulator it
