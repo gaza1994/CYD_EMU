@@ -121,6 +121,14 @@ impl Profile {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
         Profile::parse(&text).map_err(|e| format!("{path}: {e}"))
     }
+    /// One JSON object for `--list-boards`: what a front end needs to offer and draw the board.
+    pub fn to_json(&self) -> String {
+        let q = |s: &str| format!("\"{}\"", s.chars().flat_map(|c| match c { '"' | '\\' => vec!['\\', c], c if (c as u32) < 32 => format!("\\u{:04x}", c as u32).chars().collect(), c => vec![c] }).collect::<String>());
+        let list = |v: &[String]| format!("[{}]", v.iter().map(|s| q(s)).collect::<Vec<_>>().join(","));
+        let touch = match &self.touch { Touch::None => "none", Touch::Xpt2046 { .. } => "xpt2046", Touch::I2c { chip: I2cTouch::Gt911, .. } => "gt911", Touch::I2c { chip: I2cTouch::Cst820, .. } => "cst816" };
+        format!("{{\"name\":{},\"aliases\":{},\"chip\":{},\"description\":{},\"controller\":{},\"width\":{},\"height\":{},\"touch\":\"{touch}\",\"rgb_led\":{},\"sources\":{}}}",
+                q(self.name), list(&self.aliases), q(&self.chip), q(&self.description), q(&self.controller), self.width, self.height, self.led.is_some(), list(&self.sources))
+    }
     /// Whether the touch controller shares the panel's SCLK and MOSI (the 2.4", 3.2" and 3.5" boards).
     pub fn shared_touch_bus(&self) -> bool { matches!(self.touch, Touch::Xpt2046 { sclk, mosi, .. } if sclk == self.sclk && mosi == self.mosi) }
 }

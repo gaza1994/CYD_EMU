@@ -25,6 +25,7 @@ fn help(chip: &str, code: i32) -> ! {
     eprintln!("                        cyd-2432s024r/c, cyd-2432s032r/c, cyd-3248s035r/c, generic-display, esp32dev, none)");
     eprintln!("  --board-config F.toml   a classic board profile: SPI display, touch, backlight, LED (docs/board-profiles.md);");
     eprintln!("                        with --board generic-display, or instead of a built-in --board name");
+    eprintln!("  --list-boards         print the built-in classic board profiles as JSON (name, aliases, size, touch) and exit");
     eprintln!("  --flash-mb N, --psram-mb N   memory sizes (S3 default 8 / 2, C3, C6 and classic 4 / 0)");
     eprintln!("  --max-seconds S       stop after S emulated seconds (always give one: the run returns)");
     eprintln!("  --console usb|uart0|both|none   which consoles to print (uart0 shows the ROM and bootloader)");
@@ -286,6 +287,7 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--cooja-verbose" => o.cooja_verbose = true,
             "--cooja-rx-timing" => o.cooja_rx_at_end = match next().as_str() { "start" => false, "end" => true, x => { eprintln!("--cooja-rx-timing {}: start or end", x); std::process::exit(2) } },
             "-h" | "--help" => help(default_chip, 0),
+            "--list-boards" => { println!("{}", esp32::board::profiles_json()); std::process::exit(0) }
             "-V" | "--version" => { println!("esp32sim {}", env!("CARGO_PKG_VERSION")); std::process::exit(0) }
             _ => { eprintln!("unknown arg {}", a); usage(default_chip) }
         }

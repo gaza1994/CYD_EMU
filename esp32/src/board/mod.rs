@@ -37,6 +37,11 @@ pub fn profile_names() -> Vec<&'static str> {
     profile::BUILTIN.iter().map(|t| profile::Profile::parse(t).expect("built-in board profile").name).collect()
 }
 
+/// The built-in profiles as a JSON array, for `--list-boards`.
+pub fn profiles_json() -> String {
+    format!("[{}]", profile::BUILTIN.iter().map(|t| profile::Profile::parse(t).expect("built-in board profile").to_json()).collect::<Vec<_>>().join(",\n "))
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -58,5 +63,12 @@ mod tests {
         assert!(super::make_board_config("/nonexistent.toml", "esp32").is_err());
         assert_eq!(super::profile_names().len(), super::profile::BUILTIN.len());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn profiles_list_as_json() {
+        let j = super::profiles_json();
+        assert_eq!(j.matches("\"name\":").count(), super::profile::BUILTIN.len());
+        assert!(j.contains("\"name\":\"cyd-2432s028r-2usb\",\"aliases\":[\"cyd-2usb\"]") && j.contains("\"width\":320,\"height\":480,\"touch\":\"gt911\""), "{j}");
     }
 }
