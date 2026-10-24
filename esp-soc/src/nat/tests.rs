@@ -2,7 +2,7 @@ use super::*;
 use std::net::TcpListener;
 
 fn flow() -> Tcp {
-    Tcp { guest_mac: [2; 6], guest_ip: [10, 0, 2, 15], guest_port: 1234,
+    Tcp { our_mac: GATEWAY_MAC, guest_mac: [2; 6], guest_ip: [10, 0, 2, 15], guest_port: 1234,
         dst_ip: [127, 0, 0, 1], dst_port: 80, inbound: false, transport: Transport::Closed,
         guest_write: GuestWrite::Open, host_closed: false,
         our_seq: 100, guest_seq: 200, guest_window: WINDOW,
@@ -352,4 +352,19 @@ fn hostfwd_holds_until_the_station_mac_is_known_then_relays_both_ways() {
         }
     }
     assert_eq!(&got[..2], b"ok");
+}
+
+#[test]
+fn hostfwd_syn_comes_from_the_local_address() {
+    let mut nat = Nat::new(false);
+    nat.local = ([2, 0x50, 0x48, 0x4f, 0x4e, 0x45], [192, 168, 4, 2]);
+    let bound = nat.listen(&HostFwdSpec { bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), guest_ip: [192, 168, 4, 1], guest_port: 80 }).unwrap();
+    let _host = TcpStream::connect(bound).unwrap();
+    nat.set_station([4; 6]);
+    let frames = poll_ready(&mut nat, 1);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(&frames[0][0..6], &[4; 6]);
+    assert_eq!(&frames[0][6..12], &nat.local.0);
+    assert_eq!(&frames[0][26..30], &[192, 168, 4, 2]);
+    assert_eq!(&frames[0][30..34], &[192, 168, 4, 1]);
 }

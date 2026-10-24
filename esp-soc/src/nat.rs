@@ -124,7 +124,7 @@ struct Pending {
 }
 
 struct Tcp {
-    guest_mac: [u8; 6], guest_ip: [u8; 4], guest_port: u16, dst_ip: [u8; 4], dst_port: u16,
+    our_mac: [u8; 6], guest_mac: [u8; 6], guest_ip: [u8; 4], guest_port: u16, dst_ip: [u8; 4], dst_port: u16,
     inbound: bool,
     transport: Transport,
     guest_write: GuestWrite,
@@ -181,7 +181,7 @@ impl Tcp {
         seg.extend_from_slice(data);
         let check = transport_checksum(&self.dst_ip, &self.guest_ip, 6, &seg);
         seg[16..18].copy_from_slice(&check.to_be_bytes());
-        ethernet(&self.guest_mac, &GATEWAY_MAC, 0x0800, &ip_packet(6, &self.dst_ip, &self.guest_ip, &seg))
+        ethernet(&self.guest_mac, &self.our_mac, 0x0800, &ip_packet(6, &self.dst_ip, &self.guest_ip, &seg))
     }
 
     fn send(&mut self, flags: u8, data: Vec<u8>, now_us: u64) -> Vec<u8> {
@@ -233,6 +233,8 @@ pub struct Nat {
     forwards: Vec<HostFwd>,
     pending: Vec<Pending>,
     sta_mac: [u8; 6],
+    /// The MAC and IP the guest sees `--hostfwd` connections come from (the gateway by default).
+    pub local: ([u8; 6], [u8; 4]),
     next_eph: u16,
     isn: u32,
     pub resolver: [u8; 4],
@@ -248,7 +250,7 @@ pub struct Nat {
 impl Nat {
     pub fn new(log: bool) -> Self {
         Self { tcp: Vec::new(), udp: Vec::new(), forwards: Vec::new(), pending: Vec::new(),
-            sta_mac: [0; 6], next_eph: INBOUND_PORT_BASE, isn: 0x1000,
+            sta_mac: [0; 6], local: (GATEWAY_MAC, GATEWAY_IP), next_eph: INBOUND_PORT_BASE, isn: 0x1000,
             resolver: host_resolver(), log, mdns: None,
             tcp_opened: 0, tcp_refused: 0, tcp_accepted: 0, hostfwd: 0,
             udp_flows: 0, udp_evicted: 0, udp_send_errors: 0, bytes_to_host: 0, bytes_to_guest: 0 }
@@ -342,7 +344,7 @@ impl Nat {
             let Some(pending) = connector(address(dip, dport)) else { return Vec::new() };
             if let Some(i) = evict { self.tcp.remove(i); }
             self.isn = self.isn.wrapping_add(0x10000);
-            self.tcp.push(Tcp { guest_mac: *gmac, guest_ip: *gip, guest_port: sport, dst_ip: *dip, dst_port: dport,
+            self.tcp.push(Tcp { our_mac: GATEWAY_MAC, guest_mac: *gmac, guest_ip: *gip, guest_port: sport, dst_ip: *dip, dst_port: dport,
                 inbound: false, transport: Transport::Connecting(pending), guest_write: GuestWrite::Open, host_closed: false,
                 our_seq: self.isn, guest_seq: seq.wrapping_add(1), guest_window: window,
                 to_host: VecDeque::new(), unacked: VecDeque::new(), last_activity_us: now_us });
@@ -428,11 +430,11 @@ impl Nat {
             }
             let Some(eph) = self.alloc_eph() else { self.pending.push(p); continue; };
             self.isn = self.isn.wrapping_add(0x10000);
-            let mut c = Tcp { guest_mac: self.sta_mac, guest_ip: p.guest_ip, guest_port: p.guest_port,
-                dst_ip: GATEWAY_IP, dst_port: eph, inbound: true, transport: Transport::Connected(p.sock),
+            let mut c = Tcp { our_mac: self.local.0, guest_mac: self.sta_mac, guest_ip: p.guest_ip, guest_port: p.guest_port,
+                dst_ip: self.local.1, dst_port: eph, inbound: true, transport: Transport::Connected(p.sock),
                 guest_write: GuestWrite::Open, host_closed: false, our_seq: self.isn, guest_seq: 0,
                 guest_window: WINDOW, to_host: VecDeque::new(), unacked: VecDeque::new(), last_activity_us: now_us };
-            if self.log { eprintln!("[nat] TCP hostfwd SYN {}:{} -> {}:{}", ip(&GATEWAY_IP), eph, ip(&c.guest_ip), c.guest_port); }
+            if self.log { eprintln!("[nat] TCP hostfwd SYN {}:{} -> {}:{}", ip(&self.local.1), eph, ip(&c.guest_ip), c.guest_port); }
             out.push(c.send(SYN, Vec::new(), now_us));
             self.tcp.push(c);
         }
