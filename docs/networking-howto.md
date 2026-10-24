@@ -38,6 +38,11 @@ sees a SYN from 10.0.2.2 to 10.0.2.15:80. Empty host address binds loopback; emp
 the station. The listener is bound when the run starts; SYNs go out once the station's MAC is known
 (association). Requires `--wifi` and `--net nat`.
 
+To reach the guest from other machines (a phone, Home Assistant on the LAN), give the host address
+explicitly: `--hostfwd tcp:0.0.0.0:6053-:6053` listens on every interface, so anyone who can reach
+the host can reach the guest port; there is no filtering, so only do this on a network you trust.
+Each connection appears to the guest as coming from 10.0.2.2.
+
 The same `--wifi` and `--net` work on the **ESP32-C6** (`esp32sim-c6`): the access point and the
 network are the same code, the MAC model is the C6's own ([wifi-c6-plan.md](wifi-c6-plan.md)). What
 has been tried is one station on one open or WPA2 network; `examples/c6-wifi-station` has the full command. The C3 also supports `--wifi` with open/WPA2 station mode and the same network backend.
