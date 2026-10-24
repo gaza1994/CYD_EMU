@@ -112,7 +112,7 @@ fn network_help_ui(ui: &mut egui::Ui, ip: &str, n: &crate::network::DeviceNetwor
     for f in n.active_forwards() {
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("{host}:{}", f.host)).monospace());
-            ui.label(RichText::new(format!("→ firmware port {} ({})", f.guest, if f.label.is_empty() { "TCP" } else { &f.label })).small());
+            ui.label(RichText::new(format!("-> firmware port {} ({})", f.guest, if f.label.is_empty() { "TCP" } else { &f.label })).small());
             if ui.small_button("Copy").clicked() {
                 ui.ctx().copy_text(format!("{host}:{}", f.host));
             }
@@ -808,13 +808,15 @@ impl CydLabApp {
                     ui.label(format!("{name} holds only the app. A blank board also needs a bootloader (0x1000) and a partition table (0x8000), so the app alone can't boot. Tools send this file to boards that are already set up (OTA updates, uploads)."));
                     ui.add_space(4.0);
                     ui.label(RichText::new("Use the merged/factory image instead: it is the like-for-like choice, the same bytes a real CYD gets over USB.").strong());
-                    egui::Grid::new("tool_hints").num_columns(2).show(ui, |ui| {
-                        for (tool, hint) in crate::firmware::TOOL_HINTS {
-                            ui.label(RichText::new(*tool).small().strong());
-                            ui.label(RichText::new(*hint).small());
-                            ui.end_row();
-                        }
-                    });
+                    for (tool, hint) in crate::firmware::TOOL_HINTS {
+                        let mut job = egui::text::LayoutJob::default();
+                        let small = egui::TextStyle::Small.resolve(ui.style());
+                        let fmt = |c: Color32| egui::TextFormat { font_id: small.clone(), color: c, ..Default::default() };
+                        job.append(&format!("{tool}: "), 0.0, fmt(ui.visuals().strong_text_color()));
+                        job.append(hint, 0.0, fmt(ui.visuals().text_color()));
+                        job.wrap.max_width = ui.available_width();
+                        ui.label(job);
+                    }
                     ui.label(RichText::new("You can also drop a build's bootloader, partition table and app together.").small().weak());
                     ui.add_space(4.0);
                     if *install_anyway {
@@ -1640,7 +1642,7 @@ impl CydLabApp {
         let d = &mut self.devices[i];
         let net = d.dev.meta.network.clone();
         let eff = net.effective(&defaults);
-        let ports: Vec<String> = net.active_forwards().iter().map(|f| format!("{}→{}", f.host, f.guest)).collect();
+        let ports: Vec<String> = net.active_forwards().iter().map(|f| format!("{}->{}", f.host, f.guest)).collect();
         let summary = if !net.wifi {
             "Network: Wi-Fi off".to_string()
         } else {
@@ -1650,8 +1652,18 @@ impl CydLabApp {
                 if ports.is_empty() { "no ports published".to_string() } else { format!("{} {}", if net.lan { ip_text.as_str() } else { "127.0.0.1" }, ports.join(", ")) }
             )
         };
-        ui.horizontal_wrapped(|ui| {
-            egui::CollapsingHeader::new(RichText::new(summary).small()).id_salt(("net", i)).show(ui, |ui| {
+        let state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(("net", i)), false);
+        state
+            .show_header(ui, |ui| {
+                ui.label(RichText::new(summary).small());
+                ui.menu_button(RichText::new("Use with…").small(), |ui| {
+                    ui.set_max_width(460.0);
+                    if let Some(k) = network_help_ui(ui, &ip_text, &d.dev.meta.network, features.mdns_relay) {
+                        add_preset = Some(k);
+                    }
+                });
+            })
+            .body(|ui| {
                 let n = &mut d.dev.meta.network;
                 ui.add_enabled_ui(!alive, |ui| {
                     if alive {
@@ -1676,7 +1688,7 @@ impl CydLabApp {
                     ui.horizontal(|ui| {
                         let mine = crate::network::WifiDetails { ssid: n.ssid.clone(), password: n.password.clone() };
                         if mine == defaults && !mine.ssid.is_empty() {
-                            ui.label(RichText::new("✓ new devices get these Wi-Fi details").small().weak());
+                            ui.label(RichText::new("New devices get these Wi-Fi details").small().weak());
                         } else if ui.add_enabled(!mine.ssid.is_empty(), egui::Button::new("Use these Wi-Fi details for new devices").small()).on_hover_text("Saved in settings.toml, so you only type them once").clicked() {
                             make_default = true;
                         }
@@ -1693,16 +1705,16 @@ impl CydLabApp {
                             ui.end_row();
                             let mut remove = None;
                             for (k, f) in n.forwards.iter_mut().enumerate() {
-                                save |= ui.add(egui::TextEdit::singleline(&mut f.label).desired_width(110.0).hint_text("label")).changed();
+                                save |= ui.add(egui::TextEdit::singleline(&mut f.label).desired_width(120.0).hint_text("label")).changed();
                                 let hc = ui.add(egui::DragValue::new(&mut f.host).range(1..=65535)).changed();
                                 if hc && f.same_port {
                                     f.guest = f.host;
                                 }
                                 save |= hc;
-                                ui.label("→");
+                                ui.label("->");
                                 ui.horizontal(|ui| {
                                     save |= ui.add(egui::DragValue::new(&mut f.guest).range(1..=65535)).changed();
-                                    if ui.small_button("✕").clicked() {
+                                    if ui.small_button("Remove").clicked() {
                                         remove = Some(k);
                                     }
                                 });
@@ -1736,13 +1748,6 @@ impl CydLabApp {
                     ui.label(RichText::new(mdns).small().weak());
                 });
             });
-            ui.menu_button(RichText::new("Use with…").small(), |ui| {
-                ui.set_max_width(460.0);
-                if let Some(k) = network_help_ui(ui, &ip_text, &d.dev.meta.network, features.mdns_relay) {
-                    add_preset = Some(k);
-                }
-            });
-        });
         if let Some(k) = add_preset {
             d.dev.meta.network.add_preset(&crate::network::PRESETS[k], &others);
             save = true;
@@ -1769,6 +1774,9 @@ impl CydLabApp {
         let live_port = self.devices[i].backend.capabilities().serial_tcp.filter(|_| alive);
         let others: Vec<u16> = self.devices.iter().enumerate().filter(|(j, _)| *j != i).filter_map(|(_, d)| d.dev.meta.serial_tcp_port).collect();
         let mut save = false;
+        let net_ip = cached_lan_ip().map(|i| i.to_string()).unwrap_or_else(|| "this PC's IP".into());
+        let net_others: Vec<crate::network::DeviceNetwork> = self.devices.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, d)| d.dev.meta.network.clone()).collect();
+        let mut net_preset = None;
         let d = &mut self.devices[i];
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Serial:").small().weak());
@@ -1805,7 +1813,13 @@ impl CydLabApp {
                     ui.ctx().copy_text(url.clone());
                 }
                 let name = d.dev.meta.name.clone();
-                ui.menu_button("Use with…", |ui| use_with_ui(ui, &url, &name));
+                ui.menu_button("Use with…", |ui| {
+                    use_with_ui(ui, &url, &name);
+                    ui.separator();
+                    if let Some(k) = network_help_ui(ui, &net_ip, &d.dev.meta.network, features.mdns_relay) {
+                        net_preset = Some(k);
+                    }
+                });
             }
             let note = match (alive, live_port.is_some(), features.serial_tcp) {
                 (true, true, _) => "live".to_string(),
@@ -1818,6 +1832,13 @@ impl CydLabApp {
                 com_port_ui(ui, d, &com);
             }
         });
+        if let Some(k) = net_preset {
+            d.dev.meta.network.add_preset(&crate::network::PRESETS[k], &net_others);
+            save = true;
+            if alive {
+                d.lab(format!("{} ports added: they apply at the next power-on.", crate::network::PRESETS[k].name));
+            }
+        }
         if save {
             if let Err(e) = d.dev.save() {
                 d.lab(format!("could not save device settings: {e:#}"));
