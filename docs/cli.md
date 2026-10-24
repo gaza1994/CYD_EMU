@@ -84,6 +84,8 @@ the final image of a one-shot run uses it, a harness that wants "configure once,
 | `--console usb\|uart0\|both\|all\|none`, `--console-prefix` | which consoles to print |
 | `--realtime` | pace to wall time without the UI |
 | `--web PORT [--web-dir DIR]` | browser UI (implies real time); without `--web-dir`, the `web/` beside the executable or up to three directories above it, else `./web`; with none found the WebSocket still runs and the page is a 404 |
+| `--serial-tcp PORT` | UART0 on `127.0.0.1:PORT` for esptool and other serial tools (implies real time; below) |
+| `--quit-on-stdin-eof` | save `--flash-file` and exit 0 when stdin closes ([Persistent flash](#persistent-flash)) |
 | `--cam-image F`, `--cam-fps N` | camera source for boards with a camera |
 | `--cooja` (C6) | run as a Cooja-NG external mote: the lock-step NDJSON protocol on stdin/stdout, the guest console as `log` events, the 802.15.4 frames as `tx`/`rx`. Honors `--no-reboot` and `--max-seconds` (see [esp32c6.md](esp32c6.md), "Cooja-NG lock-step") |
 | `--cooja-slice-us N` | how long a busy guest runs before asking csim to step it again (default 100; `hello.args.slice_us` overrides). A transmission reaches csim's medium at the end of the slice it started in, so this bounds how late it is |
@@ -96,6 +98,46 @@ core does not add to that count. It checks the cap between scheduling rounds, so
 the current round past the requested number. With an approximate cost model, it counts
 scheduled events. Use `--max-seconds` for a predictable duration. The final execution report
 separately lists the actual instruction count for each core.
+
+### Serial bridge (`--serial-tcp`)
+
+`--serial-tcp PORT` puts UART0 on a TCP port on 127.0.0.1, so esptool (and other tools built on pyserial, which
+opens the URLs itself) or a terminal can treat the emulated board as one on a USB serial adapter:
+
+- **RFC 2217** (pyserial's `rfc2217://`): DTR and RTS drive EN and IO0 through the two-transistor auto-reset
+  circuit every devkit has (EN low = RTS ∧ ¬DTR, IO0 low = DTR ∧ ¬RTS). An EN pulse reboots the chip
+  in-process through the ROM; flash (and `--flash-file`) is kept. IO0 low within 250 ms of wall time after EN
+  rises boots download mode (classic ESP32: `GPIO_STRAP` 0x0f; otherwise `--strap`, default 0x13). The
+  250 ms stands in for the board's EN capacitor: RFC 2217 cannot carry the lines' timing.
+- **Raw** (`socket://`): the same bytes with no line control; boot download mode with `--strap 0x0f` and run
+  esptool with `--before no-reset`.
+- While a client is connected, the chip's UART0 output goes to it instead of stdout. Baud changes are
+  accepted and ignored (the virtual line is not timed), so `--baud 460800/921600` work.
+- A chip that stops (say a half-written bootloader the ROM jumps out of) stays on the line until the
+  client resets it, so re-running the same esptool command recovers it.
+
+```
+esptool --chip esp32 --port rfc2217://127.0.0.1:4000 --baud 921600 write-flash 0x1000 firmware.bin
+```
+
+With the flasher stub a write runs at about 750 kbit/s. `--no-stub` works but is slow (about 40 kbit/s):
+pyserial's RFC 2217 client renegotiates the port, waiting for four acknowledgements, on every timeout change,
+which the ROM protocol does per command.
+
+A tool that only takes a COM port name (`esphome run`, the Arduino IDE, most Windows flashers) needs a
+virtual COM pair bridged to the port. On Windows, install com0com (a pair such as `COM20` ↔ `CNCB0`) and
+run hub4com from the same package on the `CNCB0` end; the tool then opens `COM20`:
+
+```
+:: RFC 2217, DTR/RTS carried (com0com shows the tool's RTS/DTR to CNCB0 as CTS/DSR), so auto-reset works
+com2tcp-rfc2217.bat \\.\CNCB0 127.0.0.1 4000
+:: raw bytes only: start the emulator with --strap 0x0f and flash with --before no-reset
+hub4com --route=All:All --octs=off \\.\CNCB0 --use-driver=tcp *127.0.0.1:4000
+```
+
+(`*` keeps hub4com reconnecting when the emulator restarts.) ESPHome takes a device that is not a serial port
+name for an OTA address, so without a COM pair build with `esphome compile` and write the factory image with
+esptool at 0x0.
 
 ## Outputs
 | Flag | Meaning |

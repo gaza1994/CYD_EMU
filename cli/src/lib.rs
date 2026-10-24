@@ -29,6 +29,7 @@ fn help(chip: &str, code: i32) -> ! {
     eprintln!("  --script F            host actions at emulated times (button presses, touches, serial input, stop)");
     eprintln!("  --tft-png F, --wav F  save the display / the audio at the end of the run");
     eprintln!("  --web PORT            serve the board UI at http://127.0.0.1:PORT/ in real time");
+    eprintln!("  --flash-file F        the flash as a file: loaded at start, written back at exit and on a quit or signal");
     eprintln!("  --serial-tcp PORT     UART0 at 127.0.0.1:PORT, raw or RFC 2217 with DTR/RTS auto-reset (esptool rfc2217://)");
     eprintln!("  --quit-on-stdin-eof   save (--flash-file) and exit 0 when stdin closes; the page's {{\"t\":\"quit\"}} does the same");
     eprintln!("  --elf F               symbols for logs, traces and profiles (repeatable)");
