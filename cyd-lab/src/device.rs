@@ -30,6 +30,9 @@ pub const SCREEN_FILE: &str = "screen.png";
 /// First COM port number handed out. COM1..COM9 are commonly taken by real
 /// hardware, and com0com pairs are usually created higher up.
 pub const FIRST_COM_PORT: u32 = 20;
+/// First TCP port handed out for the engine's serial bridge (`--serial-tcp`, RFC 2217).
+/// 2217 is RFC 2217's own number; ten times it stays clear of the --web range (18320+).
+pub const FIRST_SERIAL_TCP_PORT: u16 = 22170;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeviceMeta {
@@ -43,6 +46,10 @@ pub struct DeviceMeta {
     /// Factory MAC (eFuse) for the emulated chip, passed as `--mac`.
     #[serde(default)]
     pub mac: Option<String>,
+    /// TCP port for the engine's RFC 2217 serial bridge (`--serial-tcp PORT`).
+    /// `None` = pick a free port at power-on.
+    #[serde(default)]
+    pub serial_tcp_port: Option<u16>,
     #[serde(default)]
     pub notes: String,
     /// View rotation in degrees (0/90/180/270) applied to the screen in the UI.
@@ -71,7 +78,7 @@ impl Device {
     pub fn flash_size(&self) -> Result<u64> {
         Ok(fs::metadata(self.flash_path())?.len())
     }
-    fn save(&self) -> Result<()> {
+    pub fn save(&self) -> Result<()> {
         let text = toml::to_string_pretty(&self.meta)?;
         write_atomic(&self.dir.join(DEVICE_FILE), text.as_bytes())
     }
@@ -133,6 +140,7 @@ impl DeviceStore {
             profile: profile.id.clone(),
             com_port: Some(next_com_port(&used)),
             mac: Some(generate_mac(&id, now)),
+            serial_tcp_port: Some(next_serial_tcp_port(&existing.iter().filter_map(|d| d.meta.serial_tcp_port).collect::<Vec<_>>())),
             notes: String::new(),
             view_rotation: profile.display.as_ref().map(|d| d.default_rotation).unwrap_or(0),
             created: now,
@@ -256,6 +264,11 @@ fn next_com_port(used: &[String]) -> String {
         .unwrap()
 }
 
+/// The lowest port at or above [`FIRST_SERIAL_TCP_PORT`] not used by another device.
+pub fn next_serial_tcp_port(used: &[u16]) -> u16 {
+    (FIRST_SERIAL_TCP_PORT..u16::MAX).find(|p| !used.contains(p)).unwrap_or(FIRST_SERIAL_TCP_PORT)
+}
+
 /// Espressif OUI (24:0A:C4) + 3 bytes derived from the id and creation time.
 fn generate_mac(id: &str, now: u64) -> String {
     // FNV-1a: deterministic, no extra dependency, good enough for uniqueness on one PC.
@@ -306,6 +319,8 @@ mod tests {
         assert_eq!(a.id, "board");
         assert_eq!(b.id, "board-2");
         assert_ne!(a.meta.com_port, b.meta.com_port);
+        assert_eq!(a.meta.serial_tcp_port, Some(FIRST_SERIAL_TCP_PORT));
+        assert_eq!(b.meta.serial_tcp_port, Some(FIRST_SERIAL_TCP_PORT + 1));
         let (all, errs) = store.list().unwrap();
         assert!(errs.is_empty());
         assert_eq!(all.len(), 2);

@@ -14,8 +14,8 @@ use anyhow::{Context, Result};
 use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, TextureHandle, TextureOptions, Vec2};
 use serde::{Deserialize, Serialize};
 
-use crate::device::{parse_offset, Device, DeviceStore};
-use crate::engine::{self, Backend, BootMode, EngineEvent, EngineSettings, LaunchSpec, ProcessBackend, RunState, Stream, Waker};
+use crate::device::{self, parse_offset, Device, DeviceStore};
+use crate::engine::{self, Backend, BootMode, EngineEvent, EngineFeatures, EngineSettings, LaunchSpec, ProcessBackend, RunState, Stream, Waker};
 use crate::profile::{Profile, ProfileLibrary};
 
 const CONSOLE_LINES: usize = 5000;
@@ -25,6 +25,9 @@ const CONSOLE_LINES: usize = 5000;
 
 /// Where cyd-lab keeps its data. `CYD_LAB_HOME` overrides the default
 /// (`%APPDATA%\cyd-lab` on Windows, `~/.local/share/cyd-lab` on Linux).
+/// Shortest touch the panel will see; quicker clicks are stretched to this.
+const MIN_TOUCH_HOLD: std::time::Duration = std::time::Duration::from_millis(120);
+
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub root: PathBuf,
@@ -77,8 +80,18 @@ fn resolve_exe(p: &Path) -> Option<PathBuf> {
     std::env::split_paths(&path).map(|d| d.join(p)).find(|c| c.is_file())
 }
 
+/// Can we listen on 127.0.0.1:port right now?
+fn port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers (unit tested)
+
+/// The URL tools use to reach a device's `--serial-tcp` port (pyserial / esptool syntax).
+pub fn rfc2217_url(port: u16) -> String {
+    format!("rfc2217://127.0.0.1:{port}")
+}
 
 /// Map a point in the (rotated) view, normalised to 0..1, to normalised panel
 /// coordinates. `rotation` is how far the view is turned clockwise from the
@@ -149,6 +162,10 @@ struct DeviceView {
     link_up: bool,
     link_note: String,
     touch_down: Option<(u16, u16)>,
+    /// When the current press started (to enforce a minimum hold).
+    touch_since: Option<std::time::Instant>,
+    /// A release held back until the press has lasted `MIN_TOUCH_HOLD`.
+    touch_release_due: Option<(u16, u16, std::time::Instant)>,
     touch_note: String,
     serial_input: String,
     rename_buf: String,
@@ -173,6 +190,8 @@ impl DeviceView {
             link_up: false,
             link_note: String::new(),
             touch_down: None,
+            touch_since: None,
+            touch_release_due: None,
             touch_note: String::new(),
             serial_input: String::new(),
             import_offset: "0x10000".into(),
@@ -246,14 +265,36 @@ impl CydLabApp {
         self.profiles.get(&self.devices[i].dev.meta.profile).cloned()
     }
 
+    /// What the configured engine build supports (cached per exe path/size/mtime).
+    fn engine_features(&self) -> EngineFeatures {
+        resolve_exe(&self.settings.engine.engine_exe).map(|p| EngineFeatures::probe(&p)).unwrap_or_default()
+    }
+
+    /// The TCP port for this device's `--serial-tcp`: its configured port if free,
+    /// otherwise the first free one not configured on another device.
+    fn serial_tcp_port_for(&self, i: usize) -> Option<u16> {
+        let others: Vec<u16> = self.devices.iter().enumerate().filter(|(j, _)| *j != i).filter_map(|(_, d)| d.dev.meta.serial_tcp_port).collect();
+        let wanted = self.devices[i].dev.meta.serial_tcp_port;
+        if let Some(p) = wanted.filter(|p| port_is_free(*p)) {
+            return Some(p);
+        }
+        let mut used = others;
+        if let Some(p) = wanted {
+            used.push(p);
+        }
+        (device::FIRST_SERIAL_TCP_PORT..u16::MAX).find(|p| !used.contains(p) && port_is_free(*p))
+    }
+
     fn launch_spec(&self, i: usize, boot: BootMode) -> Result<LaunchSpec> {
         let profile = self.profile_for(i).with_context(|| format!("unknown profile {:?}", self.devices[i].dev.meta.profile))?;
+        let features = self.engine_features();
+        let serial = if features.serial_tcp { self.serial_tcp_port_for(i) } else { None };
         let port = if self.settings.engine.live_link {
             Some(engine::reserve_port(self.settings.engine.web_port_base).context("no free port for --web")?)
         } else {
             None
         };
-        Ok(LaunchSpec::build(&profile, &self.devices[i].dev, &self.settings.engine, boot, port))
+        Ok(LaunchSpec::build(&profile, &self.devices[i].dev, &self.settings.engine, &features, boot, port, serial))
     }
 
     fn power_on(&mut self, i: usize, boot_held: bool) {
@@ -278,11 +319,16 @@ impl CydLabApp {
     }
 
     fn press_en(&mut self, i: usize, boot_held: bool) {
-        // EN pulse = restart the engine so the BOOT strap is sampled again.
         let boot = BootMode::from_boot_held(boot_held);
+        // Same strap: the engine's own in-process reset (keeps RAM-less state, loses nothing).
+        if self.devices[i].backend.state() == RunState::Running(boot) && self.devices[i].backend.soft_reset().is_ok() {
+            return;
+        }
+        // Strap changed (or no live link): power-cycle so the new BOOT strap is sampled.
+        // With --flash-file this waits for the engine to save flash.bin first.
         let r = self.launch_spec(i, boot).and_then(|spec| {
             let port = spec.web_port;
-            let r = self.devices[i].backend.reset(&spec);
+            let r = self.devices[i].backend.restart(spec);
             if r.is_err() {
                 if let Some(p) = port {
                     engine::release_port(p);
@@ -306,6 +352,8 @@ impl CydLabApp {
                     EngineEvent::Exited(_) => {
                         d.link_up = false;
                         d.touch_down = None;
+                        d.touch_since = None;
+                        d.touch_release_due = None;
                     }
                     EngineEvent::LinkUp => {
                         d.link_up = true;
@@ -313,8 +361,13 @@ impl CydLabApp {
                     }
                     EngineEvent::LinkDown(why) => {
                         d.link_up = false;
-                        d.link_note = why.clone();
-                        d.lab(format!("live link: {why}"));
+                        if matches!(d.backend.state(), RunState::Running(_)) {
+                            d.link_note = why.clone();
+                            d.lab(format!("live link: {why}"));
+                        } else {
+                            // The engine closing its socket on the way out is expected.
+                            d.link_note = "live link closed (powered off)".into();
+                        }
                     }
                 }
             }
@@ -345,7 +398,7 @@ impl CydLabApp {
                     }
                 }
             }
-            any_running |= matches!(d.backend.state(), RunState::Running(_));
+            any_running |= matches!(d.backend.state(), RunState::Running(_) | RunState::Stopping);
         }
         if any_running {
             // Notice process exits even when the engine is silent.
@@ -353,7 +406,11 @@ impl CydLabApp {
         }
     }
 
+    /// Graceful stop of every engine, in parallel: ask all, then wait (shared grace period).
     fn stop_all(&mut self) {
+        for d in &mut self.devices {
+            d.backend.request_stop();
+        }
         for d in &mut self.devices {
             d.backend.stop();
         }
@@ -431,7 +488,11 @@ impl CydLabApp {
                 ui.end_row();
                 ui.label("");
                 match resolve_exe(&e.engine_exe) {
-                    Some(p) => ui.label(RichText::new(format!("found: {}", p.display())).small().color(Color32::LIGHT_GREEN)),
+                    Some(p) => {
+                        let f = EngineFeatures::probe(&p);
+                        let yn = |b: bool| if b { "yes" } else { "no" };
+                        ui.label(RichText::new(format!("found: {}\n--flash-file: {}   --serial-tcp: {}   --web-dir: {}", p.display(), yn(f.flash_file), yn(f.serial_tcp), yn(f.web_dir))).small().color(Color32::LIGHT_GREEN))
+                    }
                     None => ui.label(RichText::new("not found (give a full path, or put it on PATH)").small().color(Color32::LIGHT_RED)),
                 };
                 ui.end_row();
@@ -465,6 +526,9 @@ impl CydLabApp {
                 ui.end_row();
                 ui.label("First --web port");
                 ui.add(egui::DragValue::new(&mut e.web_port_base).range(1024..=65000));
+                ui.end_row();
+                ui.label("Power-off grace");
+                ui.add(egui::DragValue::new(&mut e.stop_grace_secs).range(1..=120).suffix(" s")).on_hover_text("How long to wait for the engine to write flash.bin before killing it");
                 ui.end_row();
                 ui.label("Real time");
                 ui.checkbox(&mut e.realtime, "pace emulation to the wall clock (--realtime)");
@@ -603,6 +667,8 @@ impl CydLabApp {
         let profile = self.profile_for(i);
         let state = self.devices[i].backend.state();
         let running = matches!(state, RunState::Running(_));
+        let alive = running || state == RunState::Stopping;
+        let features = self.engine_features();
 
         // --- header
         ui.horizontal(|ui| {
@@ -620,15 +686,6 @@ impl CydLabApp {
             ui.label(format!("id {}", d.dev.id));
             ui.label("·");
             ui.label(format!("MAC {}", d.dev.meta.mac.as_deref().unwrap_or("-")));
-            ui.label("·");
-            let bridge = engine::bridge::NullBridge { port_name: d.dev.meta.com_port.clone() };
-            let com = bridge.port_name.clone().unwrap_or_else(|| "no COM port".into());
-            match bridge.state() {
-                engine::bridge::BridgeState::NotBridged => {
-                    ui.label(RichText::new(format!("{com}: not bridged yet")).color(Color32::from_rgb(230, 180, 60)))
-                        .on_hover_text("The COM-port bridge is not implemented in the engine yet. Until then, put firmware on the board with \"Import firmware\" below.");
-                }
-            }
         });
         let caps = d.backend.capabilities();
         ui.horizontal_wrapped(|ui| {
@@ -646,9 +703,20 @@ impl CydLabApp {
             chip(ui, caps.live_screen, "live screen", "TFT frames over the engine's --web WebSocket");
             chip(ui, caps.touch, "touch", "Mouse clicks on the screen are sent as panel touches");
             chip(ui, caps.png_snapshot, "PNG snapshot", "--tft-png: display saved when a run ends");
-            chip(ui, caps.flash_writeback, "flash write-back", "Not in esp32sim yet: flash writes made by firmware are lost at power-off");
-            chip(ui, caps.com_bridge, "COM bridge", "Not in esp32sim yet: no host COM port for esptool / Arduino IDE / esphome");
+            let (wb, wb_tip) = if alive {
+                (caps.flash_writeback, if caps.flash_writeback { "This run uses --flash-file: firmware writes are saved to flash.bin when you power off" } else { "This run uses --flash-image: firmware writes are lost at power-off" })
+            } else {
+                (features.flash_file, if features.flash_file { "Engine supports --flash-file: firmware writes persist across power cycles" } else { "This engine build has no --flash-file: firmware writes are lost at power-off" })
+            };
+            chip(ui, wb, "flash write-back", wb_tip);
+            let (sb, sb_tip) = if alive {
+                (caps.serial_tcp.is_some(), "UART0 served as RFC 2217 over TCP (--serial-tcp)")
+            } else {
+                (features.serial_tcp, if features.serial_tcp { "Engine supports --serial-tcp (RFC 2217, DTR/RTS auto-reset)" } else { "This engine build has no --serial-tcp yet" })
+            };
+            chip(ui, sb, "serial bridge", sb_tip);
         });
+        self.serial_bridge_ui(ui, i, alive, &features);
         ui.separator();
 
         // --- controls
@@ -657,12 +725,12 @@ impl CydLabApp {
         let mut boot_button_down = false;
         ui.horizontal(|ui| {
             let d = &mut self.devices[i];
-            let power_text = if running { "Power off" } else { "Power on" };
+            let power_text = if state == RunState::Stopping { "Saving flash…" } else if running { "Power off" } else { "Power on" };
             let power_btn = egui::Button::new(RichText::new(power_text).strong()).fill(if running { Color32::from_rgb(120, 40, 40) } else { Color32::from_rgb(40, 100, 50) });
-            if ui.add(power_btn).clicked() {
+            if ui.add_enabled(state != RunState::Stopping, power_btn).clicked() {
                 power_toggle = true;
             }
-            if ui.add_enabled(running, egui::Button::new("EN (reset)")).on_hover_text("Pulse EN: restart the chip. BOOT is sampled on release.").clicked() {
+            if ui.add_enabled(running, egui::Button::new("EN (reset)")).on_hover_text("Pulse EN: reset the chip. BOOT is sampled on release (a changed BOOT power-cycles the engine).").clicked() {
                 en = true;
             }
             ui.separator();
@@ -673,7 +741,7 @@ impl CydLabApp {
         let boot_held = self.devices[i].boot_latched || boot_button_down;
         if power_toggle {
             if running {
-                self.devices[i].backend.stop();
+                self.devices[i].backend.request_stop();
             } else {
                 self.power_on(i, boot_held);
             }
@@ -691,7 +759,8 @@ impl CydLabApp {
             let d = &mut self.devices[i];
             let size = d.dev.flash_size().map(|s| format!("{} MB", s / (1024 * 1024))).unwrap_or_else(|_| "missing".into());
             ui.label(format!("Flash ({size}):"));
-            if ui.button("Erase flash").on_hover_text("Reset flash.bin to all 0xFF").clicked() {
+            ui.add_enabled_ui(!alive, |ui| {
+            if ui.button("Erase flash").on_hover_text("Reset flash.bin to all 0xFF").on_disabled_hover_text("Power off first: the running engine owns flash.bin and rewrites it at power-off").clicked() {
                 erase = true;
             }
             ui.separator();
@@ -703,9 +772,10 @@ impl CydLabApp {
                     d.import_path = f.to_string_lossy().into_owned();
                 }
             }
-            if ui.button("Import").clicked() {
+            if ui.button("Import").on_disabled_hover_text("Power off first: the running engine owns flash.bin and rewrites it at power-off").clicked() {
                 import = true;
             }
+            });
         });
         ui.horizontal(|ui| {
             let d = &mut self.devices[i];
@@ -722,7 +792,7 @@ impl CydLabApp {
             let r = self.store.erase_flash(&self.devices[i].dev);
             let d = &mut self.devices[i];
             match r {
-                Ok(()) => d.lab(if running { "flash erased (takes effect at next power-on / EN)" } else { "flash erased to 0xFF" }),
+                Ok(()) => d.lab("flash erased to 0xFF"),
                 Err(e) => d.lab(format!("erase failed: {e:#}")),
             }
         }
@@ -732,7 +802,7 @@ impl CydLabApp {
             let d = &mut self.devices[i];
             match r {
                 Ok(off) => {
-                    let msg = format!("imported {} at 0x{off:x}{}", d.import_path.trim(), if running { " (takes effect at next power-on / EN)" } else { "" });
+                    let msg = format!("imported {} at 0x{off:x}", d.import_path.trim());
                     d.lab(msg);
                 }
                 Err(e) => d.lab(format!("import failed: {e:#}")),
@@ -758,6 +828,64 @@ impl CydLabApp {
             ui.separator();
             ui.vertical(|ui| self.console_ui(ui, i));
         });
+    }
+
+    /// Per-device serial settings: TCP port for `--serial-tcp`, the planned COM name,
+    /// and the rfc2217:// URL with a copy button.
+    fn serial_bridge_ui(&mut self, ui: &mut egui::Ui, i: usize, alive: bool, features: &EngineFeatures) {
+        let live_port = self.devices[i].backend.capabilities().serial_tcp.filter(|_| alive);
+        let others: Vec<u16> = self.devices.iter().enumerate().filter(|(j, _)| *j != i).filter_map(|(_, d)| d.dev.meta.serial_tcp_port).collect();
+        let mut save = false;
+        let d = &mut self.devices[i];
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Serial:").small().weak());
+            ui.add_enabled_ui(!alive, |ui| {
+                ui.label("TCP port");
+                let mut port = d.dev.meta.serial_tcp_port.unwrap_or(device::FIRST_SERIAL_TCP_PORT);
+                if ui.add(egui::DragValue::new(&mut port).range(1024..=65535)).on_hover_text("--serial-tcp PORT (RFC 2217). If it is taken at power-on, the next free port is used for that run.").changed() {
+                    d.dev.meta.serial_tcp_port = Some(port);
+                    save = true;
+                }
+                if ui.button("Auto").on_hover_text("Pick a free port not used by another device").clicked() {
+                    let p = (device::FIRST_SERIAL_TCP_PORT..u16::MAX).find(|p| !others.contains(p) && port_is_free(*p));
+                    d.dev.meta.serial_tcp_port = p;
+                    save = true;
+                }
+                ui.label("COM name");
+                let mut com = d.dev.meta.com_port.clone().unwrap_or_default();
+                if ui.add(egui::TextEdit::singleline(&mut com).desired_width(60.0)).on_hover_text("Windows COM port for this board once the com0com bridge exists (planned, see README)").changed() {
+                    d.dev.meta.com_port = if com.trim().is_empty() { None } else { Some(com.trim().to_uppercase()) };
+                    save = true;
+                }
+            });
+            let port = live_port.or(d.dev.meta.serial_tcp_port);
+            if let Some(p) = port {
+                let url = rfc2217_url(p);
+                let color = if live_port.is_some() { Color32::LIGHT_GREEN } else { Color32::GRAY };
+                ui.label(RichText::new(&url).monospace().color(color)).on_hover_text(format!(
+                    "esptool --port \"{url}?ign_set_control\" ...\nPlatformIO / Arduino: upload_port = {url}\nThe engine maps DTR/RTS through the auto-reset circuit, so esptool can reset into the bootloader."
+                ));
+                if ui.small_button("Copy").clicked() {
+                    ui.ctx().copy_text(url);
+                }
+            }
+            let note = match (alive, live_port.is_some(), features.serial_tcp) {
+                (true, true, _) => "live".to_string(),
+                (true, false, true) => "not enabled for this run (no free port?)".to_string(),
+                (_, _, false) => "engine has no --serial-tcp yet: URL is reserved, not served".to_string(),
+                (false, _, true) => "served at power-on".to_string(),
+            };
+            ui.label(RichText::new(note).small().weak());
+            if let Some(com) = &d.dev.meta.com_port {
+                ui.label(RichText::new(format!("· {com} via com0com: planned")).small().color(Color32::from_rgb(230, 180, 60)))
+                    .on_hover_text("A real COM port needs a com0com pair plus hub4com relaying it to the TCP port. Not automated yet; see README \"COM ports on Windows\".");
+            }
+        });
+        if save {
+            if let Err(e) = d.dev.save() {
+                d.lab(format!("could not save device settings: {e:#}"));
+            }
+        }
     }
 
     fn screen_ui(&mut self, ui: &mut egui::Ui, i: usize, profile: Option<&Profile>) {
@@ -823,9 +951,16 @@ impl CydLabApp {
 
         // --- touch: mouse on the screen = finger on the panel
         let pointer = resp.interact_pointer_pos().or(resp.hover_pos());
+        // The engine samples the panel at its own pace, so a press+release inside one
+        // frame (a fast click, or xdotool) would be missed: hold every touch >= MIN_TOUCH_HOLD.
+        let now = std::time::Instant::now();
         if resp.is_pointer_button_down_on() {
             if let Some((x, y)) = pointer.and_then(|p| view_to_panel_px(rot, panel_w, panel_h, rect, p)) {
                 if d.touch_down != Some((x, y)) {
+                    d.touch_release_due = None;
+                    if d.touch_down.is_none() {
+                        d.touch_since = Some(now);
+                    }
                     d.touch_down = Some((x, y));
                     d.touch_note = match d.backend.touch(x, y, true) {
                         Ok(()) => format!("touch ({x}, {y})"),
@@ -834,10 +969,28 @@ impl CydLabApp {
                 }
             }
         } else if let Some((x, y)) = d.touch_down.take() {
-            d.touch_note = match d.backend.touch(x, y, false) {
-                Ok(()) => format!("release ({x}, {y})"),
-                Err(e) => format!("release ({x}, {y}) not delivered: {e}"),
-            };
+            let since = d.touch_since.take().unwrap_or(now);
+            d.touch_release_due = Some((x, y, since + MIN_TOUCH_HOLD));
+        } else if resp.clicked() && d.touch_release_due.is_none() {
+            // Down and up landed in the same frame: synthesise the press now.
+            if let Some((x, y)) = pointer.and_then(|p| view_to_panel_px(rot, panel_w, panel_h, rect, p)) {
+                d.touch_note = match d.backend.touch(x, y, true) {
+                    Ok(()) => format!("touch ({x}, {y})"),
+                    Err(e) => format!("touch ({x}, {y}) not delivered: {e}"),
+                };
+                d.touch_release_due = Some((x, y, now + MIN_TOUCH_HOLD));
+            }
+        }
+        if let Some((x, y, due)) = d.touch_release_due {
+            if now >= due {
+                d.touch_release_due = None;
+                d.touch_note = match d.backend.touch(x, y, false) {
+                    Ok(()) => format!("release ({x}, {y})"),
+                    Err(e) => format!("release ({x}, {y}) not delivered: {e}"),
+                };
+            } else {
+                ui.ctx().request_repaint_after(due - now);
+            }
         }
         if let Some((x, y)) = resp.hover_pos().and_then(|p| view_to_panel_px(rot, panel_w, panel_h, rect, p)) {
             resp.on_hover_text_at_pointer(format!("panel ({x}, {y})"));
@@ -919,6 +1072,7 @@ fn status_of(s: RunState) -> (Color32, &'static str) {
         RunState::Stopped => (Color32::from_gray(110), "stopped"),
         RunState::Running(BootMode::Normal) => (Color32::from_rgb(70, 200, 90), "running"),
         RunState::Running(BootMode::Download) => (Color32::from_rgb(240, 190, 40), "download mode"),
+        RunState::Stopping => (Color32::from_rgb(230, 140, 50), "saving flash…"),
         RunState::Exited(Some(0)) => (Color32::from_gray(110), "exited"),
         RunState::Exited(_) => (Color32::from_rgb(220, 70, 60), "crashed / exited"),
     }
@@ -980,6 +1134,16 @@ impl Drop for CydLabApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serial_bridge_helpers() {
+        assert_eq!(rfc2217_url(22170), "rfc2217://127.0.0.1:22170");
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let taken = l.local_addr().unwrap().port();
+        assert!(!port_is_free(taken));
+        drop(l);
+        assert!(port_is_free(taken));
+    }
 
     #[test]
     fn rotation_mapping_round_trip_corners() {

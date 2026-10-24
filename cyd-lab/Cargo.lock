@@ -414,6 +414,7 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "libc",
  "rfd",
  "serde",
  "tempfile",
