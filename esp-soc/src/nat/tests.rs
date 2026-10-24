@@ -378,3 +378,38 @@ fn hostfwd_syn_comes_from_the_local_address() {
     assert_eq!(&frames[0][26..30], &[192, 168, 4, 2]);
     assert_eq!(&frames[0][30..34], &[192, 168, 4, 1]);
 }
+
+#[test]
+fn losing_the_link_ends_forward_clients_and_new_ones_wait_a_bounded_time() {
+    let mut nat = Nat::new(false);
+    let bound = nat.listen(&HostFwdSpec { bind: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), guest_ip: [10, 0, 2, 15], guest_port: 80 }).unwrap();
+    nat.set_station([2; 6]);
+    let mut live = TcpStream::connect(bound).unwrap();
+    live.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+    let syn = poll_ready(&mut nat, 1);
+    let (eph, seq) = (u16::from_be_bytes(syn[0][34..36].try_into().unwrap()), u32::from_be_bytes(syn[0][38..42].try_into().unwrap()));
+    nat.tcp_in(&[2; 6], &[10, 0, 2, 15], &[10, 0, 2, 2], &segment_ports(80, eph, 1000, seq + 1, SYN | ACK, &[]), 2);
+    assert_eq!(nat.forward_clients().len(), 1);
+    nat.unlinked(3);
+    assert!(nat.forward_clients().is_empty());
+    assert_eq!(live.read(&mut [0; 8]).unwrap(), 0, "the host client sees the end at once");
+    // a client arriving with no link waits for one, and is started when it comes back
+    let accept = |nat: &mut Nat, now_us: u64| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while nat.pending.is_empty() { assert!(std::time::Instant::now() < deadline, "accept timed out"); nat.unlinked(now_us); std::thread::yield_now(); }
+    };
+    let _waiting = TcpStream::connect(bound).unwrap();
+    accept(&mut nat, 10);
+    nat.unlinked(10 + UNLINKED_WAIT_US - 1);
+    assert_eq!(nat.pending.len(), 1);
+    nat.set_station([2; 6]);
+    assert_eq!(poll_ready(&mut nat, 20)[0][47], SYN);
+    // one that outlasts the wait is closed
+    let mut late = TcpStream::connect(bound).unwrap();
+    late.set_read_timeout(Some(std::time::Duration::from_secs(1))).unwrap();
+    let t = 30_000_000;
+    accept(&mut nat, t);
+    nat.unlinked(t + UNLINKED_WAIT_US);
+    assert!(nat.pending.is_empty());
+    assert_eq!(late.read(&mut [0; 8]).unwrap(), 0);
+}

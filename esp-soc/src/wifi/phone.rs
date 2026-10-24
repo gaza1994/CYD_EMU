@@ -20,6 +20,8 @@ pub const HOTSPOTS_MAX: usize = 8;
 const RETRY_US: u64 = 500_000;
 const TRIES: u32 = 6;
 const NET_POLL_US: u64 = 500;
+/// With no hotspot, how often the forwards' host sockets are closed out (`Nat::unlinked`).
+const UNLINKED_POLL_US: u64 = 50_000;
 
 /// `--ap-client ssid=NAME[,psk=PASS]`: which hotspot to join, any open one without `ssid`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -122,11 +124,13 @@ impl Phone {
     /// The channel and signal a frame from the phone arrives with.
     pub fn rx_meta(&self) -> (u8, i8) { (self.channel, -35) }
 
+    fn net_poll_us(&self) -> u64 { if self.state == PhoneState::Up { NET_POLL_US } else { UNLINKED_POLL_US } }
+
     /// True when `step` has nothing to send at `now_us`.
     pub fn idle_at(&self, now_us: u64) -> bool {
         self.queue.iter().all(|a| a.at_us > now_us)
             && (matches!(self.state, PhoneState::Scanning | PhoneState::Up) || now_us < self.retry_at)
-            && (self.state != PhoneState::Up || now_us.wrapping_sub(self.net_polled_us) < NET_POLL_US)
+            && now_us.wrapping_sub(self.net_polled_us) < self.net_poll_us()
     }
 
     fn hdr(&mut self, fc: u16, a1: &[u8; 6], a3: &[u8; 6]) -> Vec<u8> {
@@ -376,9 +380,13 @@ impl Phone {
                 }
             }
         }
-        if self.state == PhoneState::Up && now_us.wrapping_sub(self.net_polled_us) >= NET_POLL_US {
+        if now_us.wrapping_sub(self.net_polled_us) >= self.net_poll_us() {
             self.net_polled_us = now_us;
-            for e in self.nat.poll(now_us) { self.data(&e, now_us); }
+            if self.state == PhoneState::Up {
+                for e in self.nat.poll(now_us) { self.data(&e, now_us); }
+            } else {
+                self.nat.unlinked(now_us);
+            }
         }
         let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.queue).into_iter().partition(|a| a.at_us <= now_us);
         self.queue = later;

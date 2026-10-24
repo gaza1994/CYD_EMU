@@ -20,6 +20,8 @@ const MAX_FLOWS: usize = 64;
 const MAX_CONNECTS: usize = 8;
 const MAX_HOSTFWD: usize = 8;
 const MAX_PENDING: usize = 16;
+/// How long a forward's new client waits for a link while there is none (the phone has lost the hotspot).
+const UNLINKED_WAIT_US: u64 = 10_000_000;
 const UDP_BATCH: usize = 16;
 const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 const STATION_IP: [u8; 4] = [10, 0, 2, 15];
@@ -123,6 +125,7 @@ struct Pending {
     guest_port: u16,
     peer: SocketAddr,
     host_port: u16,
+    since_us: u64,
 }
 
 /// A client of a forward, still open: who connected to which host port, and the inbound flow
@@ -409,7 +412,7 @@ impl Nat {
         None
     }
 
-    fn accept_hostfwd(&mut self) {
+    fn accept_hostfwd(&mut self, now_us: u64) {
         let mut accepted = Vec::new();
         for fwd in &self.forwards {
             let host_port = fwd.listener.local_addr().map_or(0, |a| a.port());
@@ -417,7 +420,7 @@ impl Nat {
                 match fwd.listener.accept() {
                     Ok((sock, peer)) => {
                         if sock.set_nonblocking(true).is_err() || sock.set_nodelay(true).is_err() { continue; }
-                        accepted.push(Pending { sock, guest_ip: fwd.guest_ip, guest_port: fwd.guest_port, peer, host_port });
+                        accepted.push(Pending { sock, guest_ip: fwd.guest_ip, guest_port: fwd.guest_port, peer, host_port, since_us: now_us });
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => break,
                     Err(_) => break,
@@ -459,11 +462,22 @@ impl Nat {
         self.tcp.iter().find(|c| c.inbound && c.dst_port == eph && !c.host_closed && matches!(c.transport, Transport::Connected(_)))
     }
 
+    /// The guest's network is gone (the phone lost its hotspot): close every flow's host socket, so
+    /// its client sees the end now rather than at the idle timeout, and forget the station. New
+    /// forward clients wait up to `UNLINKED_WAIT_US` for the next link, then are closed too.
+    pub fn unlinked(&mut self, now_us: u64) {
+        let open = self.tcp.iter().filter(|c| matches!(c.transport, Transport::Connected(_))).count();
+        if open > 0 { eprintln!("[emu] phone: hotspot gone, closing {open} forwarded or outbound connection(s)"); }
+        self.tcp.clear(); self.udp.clear(); self.fwd_clients.clear(); self.sta_mac = [0; 6];
+        self.accept_hostfwd(now_us);
+        self.pending.retain(|p| now_us.wrapping_sub(p.since_us) < UNLINKED_WAIT_US);
+    }
+
     /// Pump a bounded amount of host traffic, then retransmit and expire flows.
     pub fn poll(&mut self, now_us: u64) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         if let Some(relay) = &mut self.mdns { out.extend(relay.poll(&self.sta_mac)); }
-        self.accept_hostfwd();
+        self.accept_hostfwd(now_us);
         self.start_pending(now_us, &mut out);
         for c in &mut self.tcp {
             if c.closed() { continue; }

@@ -94,14 +94,16 @@ Every hotspot the guest advertises is printed as `[emu] device hotspot: 'NAME' b
 `psk=` is reported and skipped. IDF first beacons its default `ESP_xxxxxx` and then renames it on
 the same BSSID; the phone notices the rename and starts the join again. Once a portal saves
 credentials and reboots, the guest's station joins the `--wifi` network as usual, and the phone
-rejoins whatever hotspot comes back. At run time, the web channel's `ap_client` / `ap_status`
+rejoins whatever hotspot comes back. When the hotspot goes (reboot, AP mode off, channel change),
+the phone closes every `--ap-fwd` connection at once, so the host side sees the end straight away; a
+new connection made with no hotspot waits up to 10 s for one and is then reset. At run time, the web channel's `ap_client` / `ap_status`
 messages do the same thing and list the hotspots ([web-ui.md](web-ui.md)).
 
 Tried end to end:
 
 | Firmware | Hotspot | Portal steps | Result |
 | --- | --- | --- | --- |
-| openHASP v0.7.0-rc12 | `HASP-xxxxxx`, **WPA2**, password `haspadmin` | `POST /api/config/wifi/` `{"ssid":"esp32sim","pass":"esp32sim-pass"}`, then `GET /config` (saves `/config.json` and reboots). A `GET /config` *before* the POST saves an empty SSID | reboots, `WIFI: Connected to esp32sim`, 10.0.2.15 |
+| openHASP v0.7.0-rc12 | `HASP-xxxxxx`, **WPA2**, password `haspadmin` | `POST /api/config/wifi/` `{"ssid":"esp32sim","pass":"esp32sim-pass"}`, then `GET /config` (saves `/config.json` and reboots). A `GET /config` *before* the POST saves an empty SSID | reboots, `WIFI: Connected to esp32sim`, 10.0.2.15, `--hostfwd` port 80 serves its UI |
 | NerdMiner v2 (WiFiManager) | `NerdMinerAP`, WPA2, `MineYourCoins` | send `Host: 192.168.4.1` (any other host gets WiFiManager's 302 captive redirect); `GET /wifisave?s=esp32sim&p=esp32sim-pass` with the form's Poolurl, Poolport, btcAddress, TimeZone fields | "Credentials saved", SW reset, "WiFi connected" |
 
 Limits: the classic ESP32 only for now; the C3/C6 MACs do not deliver the phone's frames yet. One
