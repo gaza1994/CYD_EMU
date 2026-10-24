@@ -661,6 +661,7 @@ impl CydLabApp {
                 let (n, t) = self.rom_progress;
                 let frac = t.map(|t| n as f32 / t.max(1) as f32);
                 let text = match t {
+                    _ if n == 0 => "Connecting to github.com…".to_string(),
                     Some(t) => format!("Downloading… {:.1} / {:.1} MB", n as f64 / 1e6, t as f64 / 1e6),
                     None => format!("Downloading… {:.1} MB", n as f64 / 1e6),
                 };
