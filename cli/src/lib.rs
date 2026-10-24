@@ -462,11 +462,7 @@ fn attach_nearby_networks(link: &mut esp_soc::wifi::StationLink, o: &Opts) {
 
 /// `--ap-fwd tcp:H:HP-G:GP`: a `--hostfwd` form whose guest address defaults to ESP-IDF's SoftAP
 /// address, 192.168.4.1 (`esp_netif` default `IP4_ADDR(&ip, 192, 168, 4, 1)`), not the station's.
-fn ap_fwd_spec(spec: &str) -> Result<esp_soc::nat::HostFwdSpec, String> {
-    let mut parsed = esp_soc::nat::HostFwdSpec::parse(spec)?;
-    if spec.rsplit_once('-').is_some_and(|(_, g)| g.starts_with(':')) { parsed.guest_ip = [192, 168, 4, 1]; }
-    Ok(parsed)
-}
+fn ap_fwd_spec(spec: &str) -> Result<esp_soc::nat::HostFwdSpec, String> { esp_soc::wifi::phone::fwd_spec(spec) }
 
 /// `--ap-client SPEC` and its `--ap-fwd` ports: the phone that joins the guest's own hotspot.
 fn attach_phone(link: &mut esp_soc::wifi::StationLink, o: &Opts, log: bool) {

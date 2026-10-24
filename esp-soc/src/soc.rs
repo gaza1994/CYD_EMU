@@ -104,6 +104,8 @@ pub trait SocBus: Bus {
     /// given, on the air the chip's WiFi MAC hears, logging as the bus's debug flags say. They
     /// survive a guest reboot. A second call replaces them and restarts the link's queues, pacing
     /// and counts; the relay mode stays.
+    /// The station's link, on chips where a virtual phone can join the guest's SoftAP (`--ap-client`).
+    fn station_link(&mut self) -> Option<&mut crate::wifi::StationLink> { None }
     fn attach_wifi(&mut self, _cfg: crate::wifi::ApConfig, _nat: Option<crate::nat::Nat>) -> Result<(), String> { Err("this chip has no WiFi".into()) }
     /// Select host Ethernet transport instead of the built-in virtual network. Off by default.
     /// Changing modes clears queued Ethernet frames; the selection survives chip reset.

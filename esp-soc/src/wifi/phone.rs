@@ -40,6 +40,14 @@ impl PhoneConfig {
     }
 }
 
+/// `--ap-fwd` and the control channel's `fwd`: a `--hostfwd` spec whose empty guest address means
+/// the hotspot's gateway, 192.168.4.1 (IDF's default SoftAP address).
+pub fn fwd_spec(spec: &str) -> Result<HostFwdSpec, String> {
+    let mut parsed = HostFwdSpec::parse(spec)?;
+    if spec.rsplit_once('-').is_some_and(|(_, g)| g.starts_with(':')) { parsed.guest_ip = [192, 168, 4, 1]; }
+    Ok(parsed)
+}
+
 /// A network the guest advertises: what its beacons say.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hotspot { pub ssid: String, pub bssid: [u8; 6], pub channel: u8, pub secure: bool, pub last_us: u64 }
@@ -92,6 +100,23 @@ impl Phone {
     /// A guest reboot: the hotspot goes away and the phone scans again, keeping its forwards.
     pub fn rejoin(&mut self) {
         self.state = PhoneState::Scanning; self.hotspots.clear(); self.ip = None; self.secured = false; self.queue.clear(); self.offer = None;
+    }
+
+    /// Drop the association and lease and scan again; hotspots and forwards stay.
+    fn unlink(&mut self) {
+        self.state = PhoneState::Scanning; self.ip = None; self.secured = false; self.queue.clear(); self.offer = None; self.nat.local = (self.mac, [0; 4]); self.warned = false;
+    }
+
+    /// The control channel's `ap_client`: join another hotspot (or the same with another password)
+    /// on its next beacon.
+    pub fn configure(&mut self, cfg: PhoneConfig) { self.cfg = cfg; self.unlink(); }
+
+    /// `{"state":..,"ip":..,"join":..,"hotspots":[{"ssid","bssid","channel","secure"}..]}` for the web UI and cyd-lab.
+    pub fn status_json(&self) -> String {
+        let q = |s: &str| format!("\"{}\"", crate::web::json_escape(s));
+        let ip = self.ip.map_or("null".into(), |a| q(&format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3])));
+        let list: Vec<String> = self.hotspots.iter().map(|h| format!("{{\"ssid\":{},\"bssid\":{},\"channel\":{},\"secure\":{}}}", q(&h.ssid), q(&super::mac_str(&h.bssid)), h.channel, h.secure)).collect();
+        format!("{{\"state\":{},\"ip\":{},\"join\":{},\"hotspots\":[{}]}}", q(&format!("{:?}", self.state).to_lowercase()), ip, self.cfg.ssid.as_deref().map_or("null".into(), q), list.join(","))
     }
 
     /// The channel and signal a frame from the phone arrives with.
@@ -222,7 +247,7 @@ impl Phone {
                 eprintln!("[emu] device hotspot: '{}' bssid {} channel {} ({}), was '{}'", ssid, super::mac_str(&bssid), channel, if secure { "WPA2-PSK" } else { "open" }, h.ssid);
                 *h = Hotspot { ssid: ssid.clone(), bssid, channel, secure, last_us: now_us };
                 if self.state != PhoneState::Scanning && self.bssid == bssid {
-                    self.state = PhoneState::Scanning; self.ip = None; self.secured = false; self.queue.clear(); self.offer = None; self.nat.local = (self.mac, [0; 4]);
+                    self.unlink();
                 }
             }
             None => {

@@ -128,7 +128,7 @@ impl<S: Soc> Machine<S> {
         }
         for m in w.poll_incoming() {
             let Ok(message) = parse_json(&m) else { continue };
-            let field = |key| message.get(key).and_then(Json::scalar_text);
+            let field = |key: &str| message.get(key).and_then(Json::scalar_text);
             let t = field("t").unwrap_or_default();
             match t.as_str() {
                 "btn" => { let pin: u8 = field("pin").and_then(|x| x.parse().ok()).unwrap_or(0); let v = field("v").unwrap_or_default() == "1";
@@ -159,6 +159,20 @@ impl<S: Soc> Machine<S> {
                 "reset" if self.web_restart => { self.button_reset = true; self.bus.request_reset(esp_periph::RST_POWERON); *self.bus.irq_dirty() = true; }
                 // a front end closing down: the run ends as if signalled (the flash file is written)
                 "quit" => self.quit_requested = true,
+                // a phone for the guest's own hotspot (`--ap-client`): `ssid`/`psk` to (re)join, `fwd` a
+                // `--ap-fwd` spec to publish; every `ap_client` and `ap_status` answers with `ap_status`
+                "ap_client" | "ap_status" => {
+                    let reply = match self.bus.station_link() {
+                        None => r#"{"t":"ap_status","error":"this chip has no SoftAP phone"}"#.to_string(),
+                        Some(link) => match if t == "ap_client" { Self::ap_client(link, &field) } else { Ok(String::new()) } {
+                            Err(e) => format!("{{\"t\":\"ap_status\",\"error\":\"{}\"}}", crate::web::json_escape(&e)),
+                            Ok(bound) => format!("{{\"t\":\"ap_status\",\"bound\":{},\"phone\":{}}}",
+                                if bound.is_empty() { "null".into() } else { format!("\"{bound}\"") },
+                                link.phone().map_or("null".into(), |p| p.status_json())),
+                        },
+                    };
+                    w.send_text(&reply);
+                }
                 "touch" => { let x: u16 = field("x").and_then(|v| v.parse().ok()).unwrap_or(0); let y: u16 = field("y").and_then(|v| v.parse().ok()).unwrap_or(0);
                              let down = field("down").unwrap_or_default() == "1"; self.bus.touch_input(x, y, down); }
                 _ => {}
@@ -166,4 +180,20 @@ impl<S: Soc> Machine<S> {
         }
     }
 
+
+    /// The `ap_client` control message: a phone on first use, its hotspot choice and a forward.
+    fn ap_client(link: &mut crate::wifi::StationLink, field: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
+        use crate::wifi::phone::{fwd_spec, Phone, PhoneConfig};
+        let ssid = field("ssid").filter(|s| !s.is_empty());
+        let spec: Vec<String> = [ssid.map(|s| format!("ssid={s}")), field("psk").filter(|s| !s.is_empty()).map(|p| format!("psk={p}"))].into_iter().flatten().collect();
+        let cfg = PhoneConfig::parse(&spec.join(","))?;
+        let fwd = field("fwd").filter(|s| !s.is_empty()).map(|f| fwd_spec(&f)).transpose()?;
+        if link.phone().is_none() { link.set_phone(Some(Phone::new(cfg.clone(), false))); }
+        let phone = link.phone_mut().unwrap();
+        if field("ssid").is_some() || field("psk").is_some() { phone.configure(cfg); }
+        let Some(fwd) = fwd else { return Ok(String::new()) };
+        let bound = phone.forward(&fwd).map_err(|e| format!("fwd: {e}"))?;
+        eprintln!("[emu] ap-fwd tcp {} -> {}.{}.{}.{}:{} on the device hotspot", bound, fwd.guest_ip[0], fwd.guest_ip[1], fwd.guest_ip[2], fwd.guest_ip[3], fwd.guest_port);
+        Ok(bound.to_string())
+    }
 }

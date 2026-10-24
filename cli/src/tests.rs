@@ -188,6 +188,25 @@ fn ap_client_and_ap_fwd_default_to_the_hotspot_gateway() {
     assert!(ap_fwd_spec("udp::0-:80").is_err());
 }
 
+/// The control channel's `ap_client` makes a phone at run time and `ap_status` reports it; a
+/// forward binds a host port. cyd-lab drives a setup portal this way without restarting the run.
+#[test]
+fn the_control_channel_makes_and_reports_the_softap_phone() {
+    let mut m = esp32::machine([0; 6], 4 << 20);
+    let web = esp_soc::web::WebServer::queued();
+    m.web = Some(web.clone());
+    web.push_incoming(r#"{"t":"ap_status"}"#.into());
+    web.push_incoming(r#"{"t":"ap_client","ssid":"NerdMinerAP","psk":"MineYourCoins","fwd":"tcp:127.0.0.1:0-:80"}"#.into());
+    web.push_incoming(r#"{"t":"ap_client","psk":"short"}"#.into());
+    m.run(1);
+    let out: Vec<String> = web.take_outbox().into_iter().filter(|(k, _)| *k == 1).map(|(_, d)| String::from_utf8(d).unwrap()).filter(|s| s.contains("ap_status")).collect();
+    assert_eq!(out[0], r#"{"t":"ap_status","bound":null,"phone":null}"#);
+    assert!(out[1].contains(r#""bound":"127.0.0.1:"#) && out[1].contains(r#""phone":{"state":"scanning","ip":null,"join":"NerdMinerAP","hotspots":[]}"#), "{}", out[1]);
+    assert!(out[2].contains("psk must be 8..=63"), "{}", out[2]);
+    let link = esp_soc::SocBus::station_link(&mut m.bus).unwrap();
+    assert_eq!(link.phone().unwrap().cfg.psk.as_deref(), Some("MineYourCoins"));
+}
+
 #[test]
 fn analog_scripts_validate_inputs_and_keep_panel_touch_separate() {
     use esp_soc::ScriptAction;
