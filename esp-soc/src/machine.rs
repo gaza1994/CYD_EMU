@@ -125,6 +125,9 @@ pub struct Machine<S: Soc> {
     /// at waiti, batches that ran the whole grant, granted rounds, batches the bound refused, reserved.
     pub bb_stats: [u64; 8],
     run_steps: u64,
+    /// `--serial-tcp`: UART0 to a TCP client, whose DTR/RTS reset the chip; and the cycle of its last poll.
+    pub serial_tcp: Option<crate::serial_tcp::SerialTcp>,
+    serial_last: u64,
 }
 
 /// Default scheduling quantum; `Machine::quantum` can change it (not bit-exact with the default). q256: 256 on wasm32,
@@ -148,7 +151,7 @@ impl<S: Soc> Machine<S> {
         Machine {
             web_restart: false, button_reset: false, mac, reboots: 0, stubs: HashMap::new(), stub_bloom: 0, probe_bloom: 0, stub_hits: 0, fn_probes: HashMap::new(),
             cores: (0..S::CORES).map(|i| S::new_core_with_bus(i, &bus)).collect(), core_held: (0..S::CORES).map(|i| i > 0).collect(), quantum: QUANTUM, run_steps: 0, vq_stats: [0; 4], vq_skip: 0, vq_penalty: 0, vq_max: std::env::var("ESP32SIM_VQ").ok().and_then(|v| v.parse().ok()).unwrap_or(VQ_DEFAULT),
-            bb_max: std::env::var("ESP32SIM_BB").ok().and_then(|v| v.parse().ok()).unwrap_or(BB_DEFAULT).min(4096), bb_stats: [0; 8],
+            bb_max: std::env::var("ESP32SIM_BB").ok().and_then(|v| v.parse().ok()).unwrap_or(BB_DEFAULT).min(4096), bb_stats: [0; 8], serial_tcp: None, serial_last: 0,
             bus, symbols: BTreeMap::new(),
             dbg: Debug { stop_on_unimplemented: true, stop_after_exceptions: u64::MAX },
             observers: Vec::new(), probes: Wants::NONE, prev_irq: vec![0; S::CORES],
@@ -361,7 +364,9 @@ impl<S: Soc> Machine<S> {
                 if backlog.len() > 65536 { let cut = backlog.len() - 49152; backlog.drain(..cut); }
             }
             if let Some(w) = &self.web { if !d.is_empty() { w.send_text(&format!("{{\"t\":\"serial\",\"src\":\"{}\",\"data\":\"{}\"}}", src, crate::web::json_escape(&String::from_utf8_lossy(&d)))); } }
-            let (bit, tag) = [(1, "[usb]  "), (2, "[uart0] "), (4, "[uart1] "), (4, "[uart2] ")][i];
+            let (mut bit, tag) = [(1, "[usb]  "), (2, "[uart0] "), (4, "[uart1] "), (4, "[uart2] ")][i];
+            // A `--serial-tcp` client owns UART0: its bytes (often binary) leave stdout while it is connected.
+            if i == 1 && !d.is_empty() && self.serial_tcp.as_ref().is_some_and(|s| s.send(&d)) { bit = 0; }
             emit(bit, tag, d, &mut self.console.all);
         }
     }
@@ -1072,7 +1077,43 @@ impl<S: Soc> Machine<S> {
         // pacing clock live out of line.
         if self.web.is_some() && self.bus.cycles().wrapping_sub(self.ws.last_push_cycles) >= self.ws.push_interval { self.web_push_due(); }
         if self.rt.enabled && self.bus.cycles().wrapping_sub(self.rt.last_check) >= 1 << 16 { self.rt_pace(); }
+        if self.serial_tcp.is_some() && self.bus.cycles().wrapping_sub(self.serial_last) >= S::CPU_HZ / 4000 { self.serial_poll(); }
         stopped
+    }
+
+    /// `--serial-tcp`, every 250 us of chip time: chip output to the client, client bytes into
+    /// UART0 as far as its FIFO has room (128 bytes per poll outruns a 921600-baud line), and the
+    /// auto-reset. EN low holds the chip: the machine stops until EN is high again, then boots
+    /// through the ROM as the board's reset button does (flash and every host input survive), in
+    /// download mode when IO0 goes low within 250 ms of wall time. RFC 2217 cannot carry the
+    /// lines' timing (pyserial waits at least 50 ms for each SET-CONTROL answer, so esptool's
+    /// DTR-then-RTS step reaches us well after EN rose): the window stands in for the board's EN
+    /// capacitor, as Espressif's esp_rfc2217_server replays the whole sequence locally.
+    #[cold]
+    #[inline(never)]
+    fn serial_poll(&mut self) {
+        self.serial_last = self.bus.cycles();
+        self.drain_console();
+        let Some(s) = &self.serial_tcp else { return };
+        if s.reset_lines().2 {
+            let mut high: Option<std::time::Instant> = None;
+            let download = loop {
+                let (en_low, io0_low, fell) = s.reset_lines();
+                drop(s.take_input(usize::MAX));
+                if en_low || fell { high = None; }
+                else if io0_low { break true; }
+                else if high.get_or_insert_with(std::time::Instant::now).elapsed() >= std::time::Duration::from_millis(250) { break false; }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+            if let Some(straps) = s.straps { self.bus.set_strap(straps[download as usize]); }
+            eprintln!("[emu] serial: EN reset{}", if download { ", IO0 low: download mode" } else { "" });
+            self.button_reset = true;
+            self.bus.request_reset(esp_periph::RST_POWERON);
+            *self.bus.irq_dirty() = true;
+            return;
+        }
+        let room = self.bus.uart_rx_room(0);
+        if room != 0 { let d = s.take_input(room); if !d.is_empty() { self.bus.uart_input(0, &d); } }
     }
 
     /// EX168 s4: the due branch of the display push, out of line (EX170 semantics: re-derive the

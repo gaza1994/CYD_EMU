@@ -149,6 +149,7 @@ impl esp_soc::SocBus for SocBus {
         self.periph.usb.host_input(data);
         self.irq_dirty |= before != self.periph.usb.irq();
     }
+    fn uart_rx_room(&self, n: usize) -> usize { self.periph.uart.get(n).map_or(0, |u| u.rx_room()) }
     fn uart_input(&mut self, n: usize, data: &[u8]) {
         let Some(u) = self.periph.uart.get_mut(n) else { return };
         let before = u.irq();

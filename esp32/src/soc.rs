@@ -163,6 +163,7 @@ impl esp_soc::SocBus for SocBus {
         self.periph.uart[0].host_input(data);
         self.irq_dirty = true;
     }
+    fn uart_rx_room(&self, n: usize) -> usize { self.periph.uart.get(n).map_or(0, |u| u.rx_room()) }
     fn uart_input(&mut self, n: usize, data: &[u8]) {
         if let Some(u) = self.periph.uart.get_mut(n) {
             u.host_input(data);

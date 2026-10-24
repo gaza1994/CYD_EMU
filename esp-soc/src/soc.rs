@@ -159,6 +159,8 @@ pub trait SocBus: Bus {
     fn serial_input(&mut self, data: &[u8]);
     /// Bytes from the host into UART `n`'s receive FIFO (a terminal on the chip's UART0 pins).
     fn uart_input(&mut self, n: usize, data: &[u8]);
+    /// Free slots in UART `n`'s receive FIFO, which a host bridge paces its input by.
+    fn uart_rx_room(&self, _n: usize) -> usize { 0 }
     /// Release a host drive so the chip can resolve its pad pulls again.
     fn gpio_release_input(&mut self, _pin: u8) {}
     fn gpio_set_input(&mut self, pin: u8, level: bool);
