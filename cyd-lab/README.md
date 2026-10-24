@@ -408,6 +408,77 @@ The discovery reads `%APPDATA%\cyd-lab\running.json`. If you start cyd-lab with 
   (pyserial URL handlers). Untested here.
 * **esptool:** `--port rfc2217://127.0.0.1:PORT`, tested.
 
+## Network: Wi-Fi, Home Assistant, OTA, web pages
+
+Every device has its own emulated Wi-Fi access point (`--wifi ssid=..,psk=.. --net nat`,
+on by default). The firmware joins it as it would join your router: it gets 10.0.2.15,
+can reach the internet through this PC, and nothing changes on your real Wi-Fi.
+
+- **Network name / password** (device's Network section): set them to the ones built into
+  the firmware, i.e. your home Wi-Fi details, and the same firmware works unchanged. Empty
+  password = open network. "Use these Wi-Fi details for new devices" stores them as the
+  app-wide default. **They are stored in plain text** in `device.toml` / `settings.toml`
+  (the UI masks the password; the files don't). The engine's `--wifi` SPEC is split on
+  commas, so a network name or password containing `,` can't be used (cyd-lab says so and
+  starts the device with Wi-Fi off).
+- **Published ports** (`--hostfwd tcp:ADDR:HOST-:GUEST`, TCP only): nothing is published by
+  default. Presets: *ESPHome* (API 6053 + OTA 3232), *Arduino OTA* (3232), *Web page*
+  (firmware port 80 on this PC's 8080), or "+ Other port". A second device gets the next
+  free PC ports (6054, 3233, ...). A port that is busy at power-on is skipped with a
+  console note.
+- **Reach from my network** (on by default) listens on 0.0.0.0, so Home Assistant or a
+  phone on your LAN can connect to *this PC's IP*:port (shown in the Network section and
+  in "Use with..."). Off = 127.0.0.1 only.
+- **API vs OTA ports**: a client that takes a port (Home Assistant's ESPHome integration,
+  a browser) can use any PC port, so the API can be 6054 -> 6053 with no firmware change.
+  OTA tools connect to the port the firmware listens on, so OTA forwards keep PC port =
+  firmware port; for a second device set it in the firmware too (ESPHome
+  `ota: port: 3233`, Arduino `ArduinoOTA.setPort(3233)`).
+- **mDNS**: when the engine has `--mdns-relay` (detected from `--help`), cyd-lab passes
+  `--mdns-relay auto` so `name.local` and Home Assistant discovery work. The current engine
+  build doesn't have it yet: connect by IP.
+- **Windows Firewall**: the first time a device with published ports powers on, Windows
+  asks about esp32sim. Tick *Private networks* and Allow, or other machines can't connect.
+- **Wi-Fi banner**: the console watches the firmware's Wi-Fi log (ESP-IDF `wifi:` reason
+  codes 201 NO_AP_FOUND / 202 AUTH_FAIL / 15 handshake timeout, Arduino-ESP32's
+  `Reason: 201 - NO_AP_FOUND`, ESPHome's `Connecting to '...'` / `Disconnected ...
+  reason=...`, and prints such as `Could not find network X`). If the firmware looks for a
+  different network than the device offers, or the password is wrong, an orange banner
+  says so, with a button to use the firmware's network name.
+
+Home Assistant with ESPHome firmware, step by step: build the YAML with your home Wi-Fi,
+drop `firmware.factory.bin` (Install > Manual download > *Factory format*) onto cyd-lab,
+set the device's Wi-Fi to the same network name and password, click "+ ESPHome (API +
+OTA)", power on, then in Home Assistant: Settings > Devices & services > Add integration >
+ESPHome, host = this PC's IP, port 6053. Later updates: `esphome upload --device <PC IP>`.
+
+### Image files: what to drop
+
+The image check is generic ESP-IDF format, whatever built it:
+
+| File | Where | cyd-lab |
+|---|---|---|
+| merged / factory image (ESPHome `*.factory.bin`, Arduino `<sketch>.ino.merged.bin`, `esptool merge-bin`) | 0x0 | written as is: the like-for-like choice |
+| bootloader | 0x1000 | |
+| partition table | 0x8000 | |
+| otadata (`boot_app0.bin`) | 0xe000 (from the table) | |
+| app-only image (ESPHome OTA `firmware.bin` / `*.ota.bin`, Arduino `<sketch>.ino.bin`, PlatformIO `firmware.bin`) | first app partition | board has a table: offered into the first app partition (factory/ota_0), otadata reset. Blank board: refused, with per-tool hints |
+
+Drop several files at once (e.g. a build folder's `bootloader.bin`, `partitions.bin`,
+`boot_app0.bin`, `firmware.bin`) and cyd-lab lists each with its offset to confirm or edit.
+"Write at offset..." writes any file at an offset you choose. "Install anyway" for an app on
+a blank board adds a generic ESP-IDF bootloader (v5.5.5, from the Arduino-ESP32 3.3.x
+core) and the Arduino-ESP32 default 4 MB partition table (nvs 0x9000, otadata 0xe000,
+app0 0x10000 and app1 0x150000 of 1.25 MB, spiffs 0x290000, coredump 0x3f0000). That may
+differ from the layout the firmware was built for, so the merged/factory image remains the
+recommended file.
+
+Tested on Linux (Xvfb, cyd-lab + esp32sim cyd-2432s028r 3a5afa79): an Arduino sketch
+(WiFi + WebServer, built with esp32 3.3.12) dropped as four files, Wi-Fi from the device
+setting, `curl http://<PC LAN IP>:8080/` served by the sketch; ESPHome 2026.10.0 with
+HomeNet: joins, aioesphomeapi via the LAN IP, `esphome upload --device <LAN IP>` OTA;
+wrong network / wrong password banners for both.
+
 ## Data layout
 
 ```

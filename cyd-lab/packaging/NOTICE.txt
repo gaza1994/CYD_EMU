@@ -28,6 +28,16 @@ Arduino platform files written by "Set up Arduino IDE"
   Systems" Arduino core (LGPL-2.1 / Apache-2.0, see that package); cyd-lab
   copies the recipes it needs and adds its own discovery and monitor lines.
 
+ESP-IDF second-stage bootloader and Arduino-ESP32 default partition table
+  Embedded in cyd-lab.exe, used only by "Install anyway" for an app-only image
+  on a blank board. bootloader.bin is the ESP32 bootloader built from ESP-IDF
+  v5.5.5 as shipped in the Arduino-ESP32 3.3.12 core (esp32-arduino-libs):
+  Copyright Espressif Systems (Shanghai) Co Ltd, Apache License 2.0
+  (https://github.com/espressif/esp-idf). The partition table is the core's
+  default.csv layout (https://github.com/espressif/arduino-esp32, tools/
+  partitions; the core is LGPL-2.1, its build data files are Apache-2.0
+  compatible). Both are unmodified.
+
 Third-party Rust crates
   Listed with their licences in third-party-cyd-lab.txt and
   third-party-esp32sim.txt (all permissive: MIT, Apache-2.0, BSD, Zlib,
