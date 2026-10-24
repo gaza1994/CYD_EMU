@@ -40,6 +40,14 @@ const MMU_APP: u32 = 0x3ff1_2000;
 const MMU_INVALID: u32 = 1 << 8;
 const PAGE: usize = 0x1_0000;
 const WDEV_RND: u32 = 0x3ff7_5144;
+/// Native-clock samples of the BT (0x3ff7_101c) and BLE (0x3ff7_121c) cores: the ROM's
+/// r_ld_read_clock (0x4003c9e4) and r_rwble_reset (0x40054ce8) set bit 31, spin until the
+/// hardware clears it, then read the 28-bit clock in 312.5 µs half-slots. Modelled as the cycle
+/// counter at 3.2 kHz with the sample always complete; nothing else of the baseband is.
+const BT_CLKN_SAMPLE: [u32; 2] = [0x3ff7_101c, 0x3ff7_121c];
+/// BLE core version (read-only): r_lld_core_reset (0x40048a9c) asserts it reads 0x0800_0900
+/// (lld.c:289 ASSERT_PARAM otherwise), the literal at 0x40048a94.
+const BLE_VERSION: (u32, u32) = (0x3ff7_1204, 0x0800_0900);
 
 fn merge(old: u32, value: u32, addr: u32, size: u32) -> u32 {
     let (shift, mask) = match size { 1 => ((addr & 3) * 8, 0xff), 2 => ((addr & 2) * 8, 0xffff), _ => return value };
@@ -224,6 +232,10 @@ impl SocBus {
         let w = if a == WDEV_RND {
             self.rng.now = self.cycles as u32;
             self.rng.read(0)
+        } else if a == BLE_VERSION.0 {
+            BLE_VERSION.1
+        } else if BT_CLKN_SAMPLE.contains(&a) {
+            ((self.cycles as u128 * 3200 / crate::periph::CPU_HZ as u128) as u32) & 0x0fff_ffff
         } else {
             self.periph.read32(a)
         };
@@ -240,7 +252,7 @@ impl SocBus {
             return;
         }
         let a = Self::ahb_to_apb(addr & !3).unwrap_or(addr & !3);
-        if a == WDEV_RND {
+        if a == WDEV_RND || BT_CLKN_SAMPLE.contains(&a) {
             return;
         }
         let v = if size == 4 { value } else { merge(self.periph.read32(a), value, addr, size) };
@@ -690,6 +702,18 @@ mod tests {
             assert_eq!(b.read32(addr), Ok(rng.read(0)));
             b.write32(addr, 0xdeadbeef).unwrap();
         }
+    }
+
+    #[test]
+    fn bt_clock_samples_complete_and_ble_version_reads_back() {
+        let mut b = SocBus::new(0, [0; 6]);
+        b.cycles = crate::periph::CPU_HZ;                        // one second: 3200 half-slots
+        for a in BT_CLKN_SAMPLE {
+            b.write32(a, 1 << 31).unwrap();
+            assert_eq!(b.read32(a), Ok(3200), "{a:#x}: sample done, bit 31 clear");
+        }
+        b.write32(BLE_VERSION.0, 0).unwrap();
+        assert_eq!(b.read32(BLE_VERSION.0), Ok(0x0800_0900));
     }
 
     #[test]
