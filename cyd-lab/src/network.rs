@@ -113,14 +113,23 @@ impl DeviceNetwork {
     /// one, and for `same_port` forwards the firmware port moves with it (the firmware's
     /// config must then say that port, which the UI explains).
     pub fn add_preset(&mut self, p: &Preset, others: &[DeviceNetwork]) {
+        self.add_preset_free(p, others, &|_| true);
+    }
+
+    /// [`DeviceNetwork::add_preset`], also skipping PC ports `port_free` says are taken
+    /// right now (another program listening). Returns how many forwards were added.
+    pub fn add_preset_free(&mut self, p: &Preset, others: &[DeviceNetwork], port_free: &dyn Fn(u16) -> bool) -> usize {
+        let mut added = 0;
         for (label, guest, host, same) in p.forwards {
             if self.forwards.iter().any(|f| f.guest == *guest || (f.same_port && *same && f.label.contains("OTA") && label.contains("OTA"))) {
                 continue;
             }
             let used: Vec<u16> = others.iter().flat_map(|n| n.host_ports()).chain(self.host_ports()).collect();
-            let h = (*host..u16::MAX).find(|h| !used.contains(h)).unwrap_or(*host);
+            let h = (*host..u16::MAX).find(|h| !used.contains(h) && port_free(*h)).unwrap_or(*host);
+            added += 1;
             self.forwards.push(Forward { label: label.to_string(), host: h, guest: if *same { h } else { *guest }, same_port: *same });
         }
+        added
     }
 
     /// The address forwards listen on.
@@ -207,12 +216,103 @@ pub fn engine_args(net: &DeviceNetwork, defaults: &WifiDetails, f: NetFeatures, 
 }
 
 /// This PC's address on the local network (the one a default route would use), if any.
-/// Sends nothing: connecting a UDP socket only picks the route.
+/// Sends nothing: connecting a UDP socket only picks the route. On Windows, when that
+/// route goes through a virtual adapter (WSL / Hyper-V vEthernet, VirtualBox, VMware, a
+/// VPN such as Tailscale), the first real adapter with a gateway is used instead.
 pub fn lan_ip() -> Option<std::net::IpAddr> {
     let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    s.connect("192.0.2.1:9").ok()?;
-    let ip = s.local_addr().ok()?.ip();
-    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
+    let routed = s.connect("192.0.2.1:9").ok().and_then(|_| s.local_addr().ok()).map(|a| a.ip()).filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
+    pick_lan_ip(routed, &adapters())
+}
+
+/// A network adapter: its name, IPv4 addresses and whether it has a default gateway.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Adapter {
+    pub name: String,
+    pub v4: Vec<std::net::Ipv4Addr>,
+    pub gateway: bool,
+}
+
+/// Adapter names (friendly name or description) that are not the PC's real LAN.
+pub fn is_virtual_adapter(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    ["vethernet", "wsl", "hyper-v", "virtualbox", "vmware", "tailscale", "zerotier", "wireguard", "loopback", "docker", "openvpn", "tap-windows", "npcap", "bluetooth"].iter().any(|k| n.contains(k))
+}
+
+/// Choose the LAN address: the routed one unless it belongs to a virtual adapter, then the
+/// first private IPv4 of a real adapter with a gateway, then any real private IPv4.
+pub fn pick_lan_ip(routed: Option<std::net::IpAddr>, adapters: &[Adapter]) -> Option<std::net::IpAddr> {
+    let owner = |ip: std::net::IpAddr| adapters.iter().find(|a| a.v4.iter().any(|v| std::net::IpAddr::V4(*v) == ip));
+    if let Some(ip) = routed {
+        match owner(ip) {
+            Some(a) if is_virtual_adapter(&a.name) => {}
+            _ => return Some(ip),
+        }
+    }
+    let real = || adapters.iter().filter(|a| !is_virtual_adapter(&a.name));
+    let usable = |v: &&std::net::Ipv4Addr| v.is_private() && !v.is_link_local();
+    real().filter(|a| a.gateway).flat_map(|a| a.v4.iter()).find(usable).or_else(|| real().flat_map(|a| a.v4.iter()).find(usable)).map(|v| std::net::IpAddr::V4(*v)).or(routed)
+}
+
+/// The PC's adapters (Windows: GetAdaptersAddresses). Elsewhere empty: the routed address
+/// is used as it is.
+#[cfg(windows)]
+pub fn adapters() -> Vec<Adapter> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetAdaptersAddresses, GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH};
+    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
+    let mut out = Vec::new();
+    let mut len: u32 = 32 * 1024;
+    for _ in 0..3 {
+        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+        let p = buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+        let r = unsafe { GetAdaptersAddresses(AF_INET as u32, GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST, std::ptr::null(), p, &mut len) };
+        if r == 111 {
+            continue; // ERROR_BUFFER_OVERFLOW: len now holds the size needed
+        }
+        if r != 0 {
+            return out;
+        }
+        let wide = |w: *const u16| -> String {
+            if w.is_null() {
+                return String::new();
+            }
+            let mut n = 0;
+            unsafe {
+                while *w.add(n) != 0 {
+                    n += 1;
+                }
+                String::from_utf16_lossy(std::slice::from_raw_parts(w, n))
+            }
+        };
+        let mut a = p as *const IP_ADAPTER_ADDRESSES_LH;
+        while !a.is_null() {
+            let ad = unsafe { &*a };
+            if ad.OperStatus == IfOperStatusUp {
+                let mut v4 = Vec::new();
+                let mut u = ad.FirstUnicastAddress;
+                while !u.is_null() {
+                    let ua = unsafe { &*u };
+                    let sa = ua.Address.lpSockaddr;
+                    if !sa.is_null() && unsafe { (*sa).sa_family } == AF_INET {
+                        let sin = unsafe { &*(sa as *const SOCKADDR_IN) };
+                        v4.push(std::net::Ipv4Addr::from(u32::from_be(unsafe { sin.sin_addr.S_un.S_addr })));
+                    }
+                    u = ua.Next;
+                }
+                let name = format!("{} {}", wide(ad.FriendlyName), wide(ad.Description));
+                out.push(Adapter { name, v4, gateway: !ad.FirstGatewayAddress.is_null() });
+            }
+            a = ad.Next;
+        }
+        return out;
+    }
+    out
+}
+
+#[cfg(not(windows))]
+pub fn adapters() -> Vec<Adapter> {
+    Vec::new()
 }
 
 /// What the console says about joining Wi-Fi.
@@ -325,6 +425,39 @@ fn mismatch(wanted: &str, ap: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lan_ip_skips_virtual_adapters() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let ad = |name: &str, ip: [u8; 4], gw: bool| Adapter { name: name.into(), v4: vec![Ipv4Addr::from(ip)], gateway: gw };
+        let list = vec![
+            ad("vEthernet (WSL (Hyper-V firewall)) Hyper-V Virtual Ethernet Adapter", [172, 28, 32, 1], false),
+            ad("Tailscale Tailscale Tunnel", [100, 101, 1, 2], false),
+            ad("Ethernet Intel(R) Ethernet Connection", [192, 168, 1, 50], true),
+            ad("VirtualBox Host-Only Network", [192, 168, 56, 1], false),
+        ];
+        let v4 = |a: [u8; 4]| Some(IpAddr::V4(Ipv4Addr::from(a)));
+        // the route already picks the real adapter
+        assert_eq!(pick_lan_ip(v4([192, 168, 1, 50]), &list), v4([192, 168, 1, 50]));
+        // the route goes through WSL's switch: use the real one
+        assert_eq!(pick_lan_ip(v4([172, 28, 32, 1]), &list), v4([192, 168, 1, 50]));
+        // no route at all
+        assert_eq!(pick_lan_ip(None, &list), v4([192, 168, 1, 50]));
+        // no adapter list (Linux): the routed address as it is
+        assert_eq!(pick_lan_ip(v4([10, 0, 0, 7]), &[]), v4([10, 0, 0, 7]));
+        assert!(is_virtual_adapter("VMware Network Adapter VMnet8"));
+        assert!(!is_virtual_adapter("Wi-Fi Intel(R) Wi-Fi 6 AX201 160MHz"));
+    }
+
+    #[test]
+    fn preset_skips_ports_in_use() {
+        let mut n = DeviceNetwork::default();
+        let added = n.add_preset_free(&PRESETS[0], &[], &|p| p != 6053 && p != 3232);
+        assert_eq!(added, 2);
+        let got: Vec<(u16, u16)> = n.forwards.iter().map(|f| (f.host, f.guest)).collect();
+        assert_eq!(got, vec![(6054, 6053), (3233, 3233)]);
+        assert_eq!(n.add_preset_free(&PRESETS[0], &[], &|_| true), 0, "already there");
+    }
 
     fn w(s: &str, p: &str) -> WifiDetails {
         WifiDetails { ssid: s.into(), password: p.into() }
