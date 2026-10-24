@@ -38,6 +38,7 @@ Text frames (JSON):
 | `board` | `name`, `chip` (`esp32s3`, `esp32c3`, `esp32c6`, `esp32`) | on connect; the page switches layout and titles a bare module by the chip |
 | `serial` | `src` (`usb`/`uart0`), `data` | console output (ANSI colours stripped by the page) |
 | `ring` | `leds` `[[r,g,b]…]` | ring changed |
+| `fwd` | `event` (`connect` or `disconnect`), `via` (`hostfwd` or `ap-fwd`), `port` (the host port), `peer` (the client's `ip:port`), `clients` (how many that port has open now) | a client of a forwarded port connects or goes. Connect means the guest accepted the connection; disconnect means either side closed it or it was reset (a refused connection never shows as connected). A late joiner gets one `connect` per open client |
 | `stat` | `time`, `insns`, `frames`, `behind`, `resyncs`, `speed` (emulated seconds per wall second over the last second, `null` before the first second and when not paced), `cam`, `gpio_in` | every 20 ms emulated |
 
 Binary frames (first byte = type):

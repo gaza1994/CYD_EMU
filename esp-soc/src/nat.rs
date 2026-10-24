@@ -121,7 +121,14 @@ struct Pending {
     sock: TcpStream,
     guest_ip: [u8; 4],
     guest_port: u16,
+    peer: SocketAddr,
+    host_port: u16,
 }
+
+/// A client of a forward, still open: who connected to which host port, and the inbound flow
+/// (by its source port on the guest's side, unique among inbound flows) carrying it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FwdClient { pub host_port: u16, pub peer: SocketAddr, eph: u16 }
 
 struct Tcp {
     our_mac: [u8; 6], guest_mac: [u8; 6], guest_ip: [u8; 4], guest_port: u16, dst_ip: [u8; 4], dst_port: u16,
@@ -232,6 +239,7 @@ pub struct Nat {
     udp: Vec<Udp>,
     forwards: Vec<HostFwd>,
     pending: Vec<Pending>,
+    fwd_clients: Vec<FwdClient>,
     sta_mac: [u8; 6],
     /// The MAC and IP the guest sees `--hostfwd` connections come from (the gateway by default).
     pub local: ([u8; 6], [u8; 4]),
@@ -249,7 +257,7 @@ pub struct Nat {
 
 impl Nat {
     pub fn new(log: bool) -> Self {
-        Self { tcp: Vec::new(), udp: Vec::new(), forwards: Vec::new(), pending: Vec::new(),
+        Self { tcp: Vec::new(), udp: Vec::new(), forwards: Vec::new(), pending: Vec::new(), fwd_clients: Vec::new(),
             sta_mac: [0; 6], local: (GATEWAY_MAC, GATEWAY_IP), next_eph: INBOUND_PORT_BASE, isn: 0x1000,
             resolver: host_resolver(), log, mdns: None,
             tcp_opened: 0, tcp_refused: 0, tcp_accepted: 0, hostfwd: 0,
@@ -404,11 +412,12 @@ impl Nat {
     fn accept_hostfwd(&mut self) {
         let mut accepted = Vec::new();
         for fwd in &self.forwards {
+            let host_port = fwd.listener.local_addr().map_or(0, |a| a.port());
             loop {
                 match fwd.listener.accept() {
-                    Ok((sock, _)) => {
+                    Ok((sock, peer)) => {
                         if sock.set_nonblocking(true).is_err() || sock.set_nodelay(true).is_err() { continue; }
-                        accepted.push(Pending { sock, guest_ip: fwd.guest_ip, guest_port: fwd.guest_port });
+                        accepted.push(Pending { sock, guest_ip: fwd.guest_ip, guest_port: fwd.guest_port, peer, host_port });
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => break,
                     Err(_) => break,
@@ -437,7 +446,17 @@ impl Nat {
             if self.log { eprintln!("[nat] TCP hostfwd SYN {}:{} -> {}:{}", ip(&self.local.1), eph, ip(&c.guest_ip), c.guest_port); }
             out.push(c.send(SYN, Vec::new(), now_us));
             self.tcp.push(c);
+            self.fwd_clients.push(FwdClient { host_port: p.host_port, peer: p.peer, eph });
         }
+    }
+
+    /// The forwards' clients the guest has accepted and neither side has closed, in connect order.
+    pub fn forward_clients(&self) -> Vec<FwdClient> {
+        self.fwd_clients.iter().copied().filter(|f| self.inbound(f.eph).is_some_and(|c| !c.handshake_pending())).collect()
+    }
+    /// The inbound flow carrying a forward's client while its host socket is open both ways.
+    fn inbound(&self, eph: u16) -> Option<&Tcp> {
+        self.tcp.iter().find(|c| c.inbound && c.dst_port == eph && !c.host_closed && matches!(c.transport, Transport::Connected(_)))
     }
 
     /// Pump a bounded amount of host traffic, then retransmit and expire flows.
@@ -527,6 +546,8 @@ impl Nat {
             !c.closed() && now_us.wrapping_sub(c.last_activity_us) < timeout
         });
         self.udp.retain(|f| now_us.wrapping_sub(f.last_activity_us) < IDLE_CLOSE_US);
+        let fwd = std::mem::take(&mut self.fwd_clients);
+        self.fwd_clients = fwd.into_iter().filter(|f| self.inbound(f.eph).is_some()).collect();
         out
     }
 }

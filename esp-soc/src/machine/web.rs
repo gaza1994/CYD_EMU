@@ -14,6 +14,11 @@ fn display_message(width: u32, height: u32, pixels: &[u16]) -> Vec<u8> {
     message
 }
 
+/// `{"t":"fwd",…}`: a client of a forwarded port connected or went; `clients` is how many that port has now.
+fn fwd_event(event: &str, via: &str, c: &crate::nat::FwdClient, clients: usize) -> String {
+    format!("{{\"t\":\"fwd\",\"event\":\"{event}\",\"via\":\"{via}\",\"port\":{},\"peer\":\"{}\",\"clients\":{clients}}}", c.host_port, c.peer)
+}
+
 fn camera_message(rgb: &[u8]) -> Vec<u8> {
     let mut message = Vec::with_capacity(5 + rgb.len());
     message.extend_from_slice(&[4, 64, 1, 240, 0]); // 320 by 240 preview, little-endian u16
@@ -90,6 +95,18 @@ impl<S: Soc> Machine<S> {
             w.send_text(&format!("{{\"t\":\"ap_status\",\"bound\":null,\"phone\":{ap}}}"));
             self.ws.ap_sent = ap;
         }
+        // clients of forwarded ports, both networks, as connect/disconnect events
+        let fwd: Vec<(&'static str, crate::nat::FwdClient)> = self.bus.station_link().map_or(Vec::new(), |l| {
+            let host = l.net().and_then(|n| n.nat.as_ref()).map_or(Vec::new(), |n| n.forward_clients());
+            let phone = l.phone().map_or(Vec::new(), |p| p.nat.forward_clients());
+            host.into_iter().map(|c| ("hostfwd", c)).chain(phone.into_iter().map(|c| ("ap-fwd", c))).collect()
+        });
+        if fwd != self.ws.fwd_sent {
+            let count = |set: &[(&str, crate::nat::FwdClient)], via: &str, port: u16| set.iter().filter(|(v, c)| *v == via && c.host_port == port).count();
+            for (via, c) in self.ws.fwd_sent.iter().filter(|e| !fwd.contains(e)) { w.send_text(&fwd_event("disconnect", via, c, count(&fwd, via, c.host_port))); }
+            for (via, c) in fwd.iter().filter(|e| !self.ws.fwd_sent.contains(e)) { w.send_text(&fwd_event("connect", via, c, count(&fwd, via, c.host_port))); }
+            self.ws.fwd_sent = fwd;
+        }
         let board = self.bus.board_ref();
         // snapshot for late-joining clients: backlog, frame, ring
         if w.needs_hello() {
@@ -101,6 +118,7 @@ impl<S: Soc> Machine<S> {
             if let Some(rgb) = board.camera_preview(320, 240) { hello.push(frame(2, &camera_message(&rgb))); }
             if let Some((leds, _)) = board.leds() { hello.push(frame(1, format!("{{\"t\":\"ring\",\"leds\":[{}]}}", leds_json(leds)).as_bytes())); }
             for (id, leds, _) in board.led_grids() { hello.push(frame(1, format!("{{\"t\":\"grid\",\"id\":\"{}\",\"leds\":[{}]}}", id, leds_json(leds)).as_bytes())); }
+            for (via, c) in &self.ws.fwd_sent { hello.push(frame(1, fwd_event("connect", via, c, self.ws.fwd_sent.iter().filter(|(v, d)| v == via && d.host_port == c.host_port).count()).as_bytes())); }
             if !self.ws.ap_sent.is_empty() { hello.push(frame(1, format!("{{\"t\":\"ap_status\",\"bound\":null,\"phone\":{}}}", self.ws.ap_sent).as_bytes())); }
             w.set_hello(hello);
         }

@@ -323,10 +323,13 @@ fn hostfwd_holds_until_the_station_mac_is_known_then_relays_both_ways() {
     assert_eq!(&frames[0][30..34], &[10, 0, 2, 15]);
     let eph = u16::from_be_bytes(frames[0][34..36].try_into().unwrap());
     let syn_seq = u32::from_be_bytes(frames[0][38..42].try_into().unwrap());
+    assert!(nat.forward_clients().is_empty(), "a client counts once the guest accepts it");
     let ack = nat.tcp_in(&[2; 6], &[10, 0, 2, 15], &[10, 0, 2, 2], &segment_ports(80, eph, 1000, syn_seq + 1, SYN | ACK, &[]), 2);
     assert_eq!(ack.len(), 1);
     assert_eq!(ack[0][47], ACK);
     assert_eq!(nat.tcp_accepted, 1);
+    let clients = nat.forward_clients();
+    assert_eq!((clients.len(), clients[0].host_port, clients[0].peer), (1, bound.port(), host.local_addr().unwrap()));
     let again = nat.tcp_in(&[2; 6], &[10, 0, 2, 15], &[10, 0, 2, 2], &segment_ports(80, eph, 1000, syn_seq + 1, SYN | ACK, &[]), 2);
     assert_eq!(again.len(), 1);
     assert_eq!(again[0][47], ACK);
@@ -352,6 +355,13 @@ fn hostfwd_holds_until_the_station_mac_is_known_then_relays_both_ways() {
         }
     }
     assert_eq!(&got[..2], b"ok");
+    drop(host);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while !nat.forward_clients().is_empty() {
+        assert!(std::time::Instant::now() < deadline, "the client's close is seen");
+        nat.poll(7);
+        std::thread::yield_now();
+    }
 }
 
 #[test]
