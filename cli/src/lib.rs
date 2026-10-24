@@ -544,6 +544,16 @@ fn run_with_reboots<S: Soc>(m: &mut Machine<S>, mut remaining: u64, reboot: bool
         let stop = m.run(budget);
         remaining = remaining.saturating_sub(m.run_steps().saturating_sub(before));
         if signal_poll && interrupt::pending() { return Stop::MaxInsns }
+        let stop = match stop {
+            Stop::MaxInsns | Stop::SwReset => stop,
+            // A stopped chip behind --serial-tcp stays on the line: its client's EN reset reboots it.
+            other if m.serial_tcp.is_some() => {
+                eprintln!("[emu] serial: chip stopped ({:?}) at t={:.3}s; waiting for an EN reset from the client", other, m.seconds());
+                if !m.serial_wait_reset(|| signal_poll && interrupt::pending()) { return other }
+                Stop::SwReset
+            }
+            other => other,
+        };
         match stop {
             Stop::SwReset => {
                 let cause = m.bus.reset_cause();

@@ -1116,6 +1116,19 @@ impl<S: Soc> Machine<S> {
         if room != 0 { let d = s.take_input(room); if !d.is_empty() { self.bus.uart_input(0, &d); } }
     }
 
+    /// `--serial-tcp` after the chip stopped (a crash, say booting a half-written flash): keeps the
+    /// line up until its client pulses EN, true then with the reset requested, or false once `quit`.
+    pub fn serial_wait_reset(&mut self, quit: impl Fn() -> bool) -> bool {
+        if self.serial_tcp.is_none() { return false; }
+        while !quit() {
+            self.serial_poll();
+            if self.web.is_some() { self.web_poll_input(); }
+            if self.button_reset { return true; }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        false
+    }
+
     /// EX168 s4: the due branch of the display push, out of line (EX170 semantics: re-derive the
     /// interval from the board, then decide).
     #[cold]
