@@ -145,3 +145,17 @@ Checked with official MicroPython v1.29.0 (`ESP32_GENERIC`) and a pure-Python IL
 T-Display above: the window and pixel writes land where the driver addresses them and the LED
 follows GPIO 4/16/17. With a polling XPT2046 reader on `SPI(2)` and on `SoftSPI`, scripted
 touches at (120,160), (30,280) and (200,60) read back as those pixels.
+
+The radio works on the board as on the classic ESP32 anywhere (`--wifi`): MicroPython v1.29.0
+scans the virtual AP, joins it with WPA2 in about 4.5 s, takes 10.0.2.15 by DHCP, resolves names
+and opens TCP and UDP sockets to the host, and a `socket` server on port 80 answers through
+`--hostfwd tcp:0.0.0.0:8080-:80`. ESPHome 2026.10.0 (ESP-IDF 5.5.6; `ili9xxx` ILI9341, `xpt2046`
+with `calibration: x_min 240, x_max 3800, y_min 200, y_max 3700` and `transform: mirror_x: true`,
+`lvgl`), flashed as `firmware.factory.bin` with `--flash-at 0x0=`, draws its LVGL screen, takes
+taps, reaches Wi-Fi 5 s after reset, and with `--hostfwd tcp:0.0.0.0:6053-:6053 --hostfwd
+tcp:0.0.0.0:3232-:3232` answers the encrypted native API (`aioesphomeapi`, `esphome logs
+--device 127.0.0.1`) and takes `esphome upload --device 127.0.0.1` (`ota: port: 3232`): about
+980 KB in 16 s, a reboot into `ota_1`, and with `--flash-file` the new image kept across runs.
+The bootloader rolls the update back if the run ends before ESPHome's `safe_mode` marks the boot
+good (60 s), as on the board. The run kept to real time with `--realtime` and at 5.6 Minsn/s.
+mDNS does not cross the NAT, so give tools the address rather than `cyd-emu.local`.
