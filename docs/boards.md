@@ -215,6 +215,20 @@ The energy-scan firmware and the run recipe: `examples/waveshare-c6-lcd147/`, [e
 
 Selected with `--chip esp32 --board ttgo-tdisplay` (alias `tdisplay`); [esp32.md](esp32.md#the-board---board-ttgo-tdisplay).
 
+## `cyd-2432s028r` — Sunton ESP32-2432S028R "Cheap Yellow Display" (classic ESP32)
+
+| Device | Bus | Model |
+| --- | --- | --- |
+| ILI9341 2.8" 240×320 TN panel | HSPI/SPI2 on its IO_MUX pins (SCK 14, MOSI 13, MISO 12), CS 15, D/C 2, RST tied to EN | `DcsPanel::ili9341()`: bytes of transactions on GPIO 14/13 while CS is low; MADCTL rotation, COLMOD 565, CASET/PASET/RAMWR, SLPOUT/DISPON/DISPOFF, INVON/INVOFF (shown inverted: TN glass), vendor commands ignored; rotation 0 (MADCTL 0x48) is upright portrait |
+| Backlight | GPIO 21, active high | level tracked, in the report |
+| RGB LED | GPIO 4 R, 16 G, 17 B, active low | the page's ring (one LED), digital levels |
+| LDR | GPIO 34 (ADC1 channel 6) | `--adc-raw 34=N` |
+| BOOT button | GPIO 0, active low | `press boot 150` |
+| XPT2046 touch | CLK 25, MOSI 32, MISO 39, CS 33, IRQ 36 | IRQ idles high (not touched) |
+| TF card, speaker, CN1 | SPI3 on 18/19/23/5, GPIO 26 | not modelled |
+
+Selected with `--chip esp32 --board cyd-2432s028r` (alias `cyd`); [esp32.md](esp32.md#the-board---board-cyd-2432s028r).
+
 ## `none` — bare module
 
 No devices; console only. For stock ESP-IDF projects (`examples/hello_world`).

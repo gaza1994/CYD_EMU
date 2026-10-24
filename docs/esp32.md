@@ -37,7 +37,8 @@ The core includes DRAM, IRAM, RTC RAM, flash MMUs, DPORT interrupt routing and
 secondary-core control, eFuse, SPI flash, three UARTs, GPIO/IO_MUX, RTC control,
 and timer groups including LACT. `none` and `esp32dev` select the bare module.
 The default board option also selects the bare module for this chip.
-`ttgo-tdisplay` (alias `tdisplay`) is the LilyGO TTGO T-Display, see below.
+`ttgo-tdisplay` (alias `tdisplay`) is the LilyGO TTGO T-Display, `cyd-2432s028r` (alias `cyd`) the
+"Cheap Yellow Display", see below.
 WASM accepts the `esp32` chip identifier. Boot applications through ROM.
 
 T0/T1 and LACT use 64-bit counters and the shared timer stepping logic.
@@ -46,7 +47,7 @@ LACT sleep-time RTC stepping and timer-group watchdog execution are not modeled.
 Classic peripheral extensions include I2C0/1, sixteen LEDC channels,
 SPI2/3 with controller-local DMA, and eight RMT channels. SPI and RMT feed
 the existing board/display/WS2812 interfaces. `esp32dev-loopback` supplies a loopback board fixture; `ttgo-tdisplay`
-hangs an ST7789 on SPI3 (below). Hardware fade and RMT receive
+hangs an ST7789 on SPI3 and `cyd-2432s028r` an ILI9341 on SPI2 (below). Hardware fade and RMT receive
 are not implemented; transaction-level SPI has no bit-level timing.
 
 Classic Wi-Fi uses the shared `StationLink` access point, network and Ethernet
@@ -106,3 +107,26 @@ and the browser runs it as the `tdisplay-prices` demo (`run.html?wasm&fw=tdispla
 official MicroPython image fetched by `tools/fetch-micropython.sh`, the app's LittleFS image in
 `web/wasm/fw/public/`, demo prices instead of a fetch because the browser has no sockets.
 
+## The board: `--board cyd-2432s028r`
+
+The Sunton ESP32-2432S028R (ESP32-WROOM-32, 4 MB flash, no PSRAM), sold as the "Cheap Yellow
+Display", wires an ILI9341 2.8" 240×320 TN panel to HSPI on its IO_MUX pins (SCK 14, MOSI 13,
+MISO 12) with CS 15, D/C 2, reset on EN and the backlight on GPIO 21 (active high); an RGB LED on
+GPIO 4/16/17 (active low), an LDR on GPIO 34 and an XPT2046 resistive touch controller on its own
+pins (CLK 25, MOSI 32, MISO 39, CS 33, IRQ 36). `esp32/src/board/cyd.rs` is the board: a
+`DcsPanel::ili9341()` fed the bytes of every SPI transaction whose routes are SCK 14 / MOSI 13 while
+GPIO 15 is low (IO_MUX function 1 and the GPIO matrix both count, so either host works); reads on
+MISO return 0xff (no ILI9341 read commands are modelled).
+
+The glass is the controller's RAM with its columns mirrored: Adafruit_ILI9341, TFT_eSPI and
+LovyanGFX all use MADCTL 0x48 (MX|BGR) as rotation 0, portrait with the connector side at the
+bottom, and 0x28 as rotation 1, so `--tft-png` and the page show what those drivers call upright.
+Red and blue are exchanged unless MADCTL's BGR bit is set; INVON shows the inverted colours (the
+TN glass, unlike the IPS ST7789 boards, has no inversion to compensate); DISPOFF and sleep show
+black. The backlight level is reported but does not dim the frame (drivers PWM it through LEDC).
+COLMOD 0x66 (18-bit) is not decoded: the shared `DcsPanel` reads 16-bit pixels.
+
+Checked with official MicroPython v1.29.0 (`ESP32_GENERIC`) and a pure-Python ILI9341 driver on
+`machine.SPI(1)` (HSPI) drawing a test pattern from a LittleFS image at 0x200000, as for the
+T-Display above: the window and pixel writes land where the driver addresses them and the LED
+follows GPIO 4/16/17.

@@ -36,6 +36,9 @@ impl DcsPanel {
     pub fn st7735() -> Self { Self::new(132, 162) }
     /// ST7789: 240 × 320 of RAM behind the 1.47", 1.69" and 2.0" modules.
     pub fn st7789() -> Self { let mut p = Self::new(240, 320); p.ramctrl = true; p }
+    /// ILI9341: 240 × 320 of RAM behind the 2.4" and 2.8" modules. Its B0h is the RGB interface
+    /// control, not RAMCTRL, so pixels always arrive high byte first.
+    pub fn ili9341() -> Self { Self::new(240, 320) }
 
     /// A hardware or software reset: every register back to power-on, the RAM kept (as on silicon).
     pub fn reset(&mut self) {
@@ -160,5 +163,8 @@ mod tests {
         let mut other = DcsPanel::st7735();
         cmd(&mut other, 0xb0, &[0x00, 0xe8]);
         assert!(!other.little_endian, "0xB0 is not RAMCTRL on the ST7735");
+        let mut ili = DcsPanel::ili9341();
+        cmd(&mut ili, 0xb0, &[0x00, 0xe8]);
+        assert!(!ili.little_endian && ili.cols == 240 && ili.rows == 320, "0xB0 is the RGB interface control on the ILI9341");
     }
 }
