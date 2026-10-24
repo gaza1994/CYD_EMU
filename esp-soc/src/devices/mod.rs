@@ -5,6 +5,7 @@
 pub mod co5300;
 pub mod dcs_panel;
 pub mod spi_bitbang;
+pub mod touch_i2c;
 pub mod ws2812;
 pub mod xpt2046;
 
