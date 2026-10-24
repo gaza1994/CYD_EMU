@@ -43,10 +43,20 @@ impl RunningDevice {
 
 /// cyd-lab's data directory: `CYD_LAB_HOME`, else `%APPDATA%\cyd-lab` / `~/.local/share/cyd-lab`.
 pub fn data_dir() -> Option<PathBuf> {
-    match std::env::var_os("CYD_LAB_HOME") {
-        Some(p) => Some(PathBuf::from(p)),
-        None => directories::BaseDirs::new().map(|b| b.data_dir().join("cyd-lab")),
+    if let Some(p) = std::env::var_os("CYD_LAB_HOME") {
+        return Some(PathBuf::from(p));
     }
+    if let Some(d) = portable_dir() {
+        return Some(d);
+    }
+    directories::BaseDirs::new().map(|b| b.data_dir().join("cyd-lab"))
+}
+
+/// Portable mode: a file named `portable` next to the executable keeps all data in
+/// `data/` beside it (a USB stick, an unzipped folder you can delete in one go).
+pub fn portable_dir() -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    dir.join("portable").exists().then(|| dir.join("data"))
 }
 
 impl RunningFile {

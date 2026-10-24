@@ -6,18 +6,24 @@
 //! * `engine`   – the engine boundary: `Backend` trait, `ProcessBackend`, command line
 //! * `weblink`  – live screen/touch link to esp32sim's `--web` WebSocket
 //! * `running`  – running.json, the powered-on devices for the Arduino discovery
+//! * `setup`    – first run: bundled engine, mask ROM download (pinned SHA-256), portable mode
+//! * `firmware` – where a dropped .bin goes (merged / app / bootloader heuristics)
+//! * `arduino_setup` – "Set up Arduino IDE": the board into the sketchbook's hardware/ folder
 //! * `app`      – the egui user interface
 
 // No console window behind the GUI on Windows release builds.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod arduino_setup;
 mod combridge;
 mod device;
 mod engine;
+mod firmware;
 mod profile;
 mod rfc2217;
 mod running;
+mod setup;
 mod webinstall;
 mod weblink;
 

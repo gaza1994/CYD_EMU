@@ -68,7 +68,14 @@ fn diff(old: &[RunningDevice], new: &[RunningDevice]) -> Vec<Value> {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).map(PathBuf::from).or_else(|| running::data_dir().map(|d| d.join(running::FILE_NAME)));
+    // argv[1], else `running-path.txt` beside this exe (written by cyd-lab's "Set up
+    // Arduino IDE", so a portable cyd-lab is found), else the standard data dir.
+    let beside = || {
+        let f = std::env::current_exe().ok()?.with_file_name("running-path.txt");
+        let t = std::fs::read_to_string(f).ok()?;
+        Some(PathBuf::from(t.trim())).filter(|p| !p.as_os_str().is_empty())
+    };
+    let path = std::env::args().nth(1).map(PathBuf::from).or_else(beside).or_else(|| running::data_dir().map(|d| d.join(running::FILE_NAME)));
     let out = Out(Arc::new(Mutex::new(std::io::stdout())));
     let mut hello = false;
     let mut started = false;
