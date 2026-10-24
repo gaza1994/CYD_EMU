@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 pub const ROM_RELEASE: &str = "20260528";
 pub const ROM_URL: &str = "https://github.com/espressif/esp-rom-elfs/releases/download/20260528/esp-rom-elfs-20260528.tar.gz";
+/// Size of that tarball, for the progress bar when the server sends no length.
+pub const ROM_TARBALL_SIZE: u64 = 4_902_355;
 pub const ROM_TARBALL_SHA256: &str = "caa463d3cbef2430a5a35847c1d9f2f152403b17a802050927ff60c8da54fe46";
 /// The ROMs cyd-lab needs (the CYD is a classic ESP32 rev 3). Same hashes as the engine's script.
 pub const ROMS: &[(&str, &str)] = &[("esp32_rev300_rom.elf", "920b70635440517866aab2230964a570d2cf2b676658d93c52fbac108c1cca31")];
@@ -40,7 +42,8 @@ pub fn fetch_roms(dir: &Path, progress: &mut dyn FnMut(u64, Option<u64>)) -> Res
         return Ok(());
     }
     let resp = ureq::get(ROM_URL).call().with_context(|| format!("downloading {ROM_URL}"))?;
-    let total = resp.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
+    let total = resp.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()).or(Some(ROM_TARBALL_SIZE));
+    progress(0, total);
     let mut reader = resp.into_body().into_with_config().limit(256 * 1024 * 1024).reader();
     let mut tarball = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
