@@ -66,6 +66,8 @@ Text frames:
 | `key` | `src`, `data` — bytes exactly as typed, no newline added: the page's console is a terminal (click it, type; Enter is CR, Backspace DEL, arrows and Ctrl-letters their escape/control codes, paste sends the text). The **Terminal** tab (`web/terminal.js`) is a real VT100 on UART0 — xterm.js (MIT; `tools/fetch-web-vendor.sh` puts it in `web/vendor/xterm`, pinned by hash — not committed), 100×30 — so cursor movement, colours and full-screen programs render; it encodes its own keys into the same `key` message |
 | `gpio` | `pin`, `level` |
 | `touch` | `x`, `y`, `down` (1 = touching); panel coordinates — a rotated panel view (the panel header's selector, `?rotate=`, or a manifest's `display_rotate`) maps its point back first |
+| `ap_client` | optional `ssid`, `psk`, `fwd` (an `--ap-fwd` spec). Creates the SoftAP phone if there is none (same as `--ap-client`). Given `ssid`/`psk`, it drops any join and looks for that hotspot again; `fwd` binds a host port. Answered with `ap_status`, plus `bound` (the host address) or `error`. Classic ESP32 |
+| `ap_status` | none; answered with `{"t":"ap_status","bound":null,"phone":{"state":"scanning\|authenticating\|associating\|handshake\|dhcp\|up","ip":..,"join":..,"hotspots":[{"ssid","bssid","channel","secure"}]}}`. `phone` is null before any `ap_client`; on a chip without the phone, the reply is `error` |
 
 Binary frame type 3: camera picture, `w u16le, h u16le`, RGBA8888 — used by the picture
 upload and the webcam (4 fps). Frames up to 8 MB are accepted.

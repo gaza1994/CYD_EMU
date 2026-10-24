@@ -75,6 +75,40 @@ The same `--wifi` and `--net` work on the **ESP32-C6** (`esp32sim-c6`): the acce
 network are the same code, the MAC model is the C6's own ([wifi-c6-plan.md](wifi-c6-plan.md)). What
 has been tried is one station on one open or WPA2 network; `examples/c6-wifi-station` has the full command. The C3 also supports `--wifi` with open/WPA2 station mode and the same network backend.
 
+## The device's own hotspot (SoftAP setup portals)
+
+Firmware that starts in `WIFI_MODE_AP` or `APSTA` (WiFiManager, openHASP, NerdMiner, ESPHome's
+captive portal) expects a phone to join its hotspot and open a page at 192.168.4.1.
+`--ap-client` is that phone. It hears the guest's beacons, authenticates and associates. If the
+hotspot is WPA2, it runs the supplicant half of the four-way handshake with `psk=`. It then takes a
+DHCP lease from the guest (normally 192.168.4.2). `--ap-fwd` publishes a guest port on the host
+through the phone; it uses the same form as `--hostfwd`, but the empty guest address means 192.168.4.1.
+These addresses exist only inside the emulator; nothing is sent to a real 192.168.4.x network.
+
+    esp32sim --chip esp32 --board cyd-2432s028r --flash-file hasp.flash \
+      --wifi ssid=esp32sim,psk=esp32sim-pass --net nat \
+      --ap-client ssid=HASP-001122,psk=haspadmin --ap-fwd tcp:127.0.0.1:18480-:80
+
+Every hotspot the guest advertises is printed as `[emu] device hotspot: 'NAME' bssid .. channel ..
+(open|WPA2-PSK)`. Without `ssid=`, the phone joins the first open one; a secured one without
+`psk=` is reported and skipped. IDF first beacons its default `ESP_xxxxxx` and then renames it on
+the same BSSID; the phone notices the rename and starts the join again. Once a portal saves
+credentials and reboots, the guest's station joins the `--wifi` network as usual, and the phone
+rejoins whatever hotspot comes back. At run time, the web channel's `ap_client` / `ap_status`
+messages do the same thing and list the hotspots ([web-ui.md](web-ui.md)).
+
+Tried end to end:
+
+| Firmware | Hotspot | Portal steps | Result |
+| --- | --- | --- | --- |
+| openHASP v0.7.0-rc12 | `HASP-xxxxxx`, **WPA2**, password `haspadmin` | `POST /api/config/wifi/` `{"ssid":"esp32sim","pass":"esp32sim-pass"}`, then `GET /config` (saves `/config.json` and reboots). A `GET /config` *before* the POST saves an empty SSID | reboots, `WIFI: Connected to esp32sim`, 10.0.2.15 |
+| NerdMiner v2 (WiFiManager) | `NerdMinerAP`, WPA2, `MineYourCoins` | send `Host: 192.168.4.1` (any other host gets WiFiManager's 302 captive redirect); `GET /wifisave?s=esp32sim&p=esp32sim-pass` with the form's Poolurl, Poolport, btcAddress, TimeZone fields | "Credentials saved", SW reset, "WiFi connected" |
+
+Limits: the classic ESP32 only for now; the C3/C6 MACs do not deliver the phone's frames yet. One
+phone, TCP forwards only, no UDP. The phone's frames set only the SoftAP bit (29) of the rx_ctrl
+address-filter matches; bit 28 is the station's (esp32-open-mac's `filter_match`). Frames marked
+for the station are dropped by the guest's AP.
+
 ## What the network gives the firmware
 
 - **DHCP** — address, mask, gateway, DNS, so `esp_netif` reaches `IP_EVENT_STA_GOT_IP`.
