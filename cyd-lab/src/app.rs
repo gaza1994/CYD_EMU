@@ -50,6 +50,9 @@ impl Paths {
 #[serde(default)]
 pub struct AppSettings {
     pub engine: EngineSettings,
+    /// Wi-Fi details given to new devices ("Use these Wi-Fi details for new devices").
+    /// Plain text in settings.toml.
+    pub wifi: crate::network::WifiDetails,
 }
 
 impl AppSettings {
@@ -78,8 +81,55 @@ fn resolve_exe(p: &Path) -> Option<PathBuf> {
 }
 
 /// Can we listen on 127.0.0.1:port right now?
+/// The PC's LAN address, refreshed every 20 s.
+fn cached_lan_ip() -> Option<std::net::IpAddr> {
+    static CACHE: std::sync::Mutex<Option<(Instant, Option<std::net::IpAddr>)>> = std::sync::Mutex::new(None);
+    let mut c = CACHE.lock().unwrap();
+    match *c {
+        Some((t, ip)) if t.elapsed() < Duration::from_secs(20) => ip,
+        _ => {
+            let ip = crate::network::lan_ip();
+            *c = Some((Instant::now(), ip));
+            ip
+        }
+    }
+}
+
+/// "Add to Home Assistant" steps for this device.
+fn ha_help_ui(ui: &mut egui::Ui, ip: &str, n: &crate::network::DeviceNetwork, mdns: bool) {
+    ui.set_max_width(420.0);
+    ui.label(RichText::new("Add this device to Home Assistant").strong());
+    if mdns && n.lan {
+        ui.label("It should appear by itself under Settings > Devices & services > Discovered. If not:");
+    }
+    ui.label("1. Power the device on and wait for the console to show it joined Wi-Fi.");
+    ui.label("2. In Home Assistant: Settings > Devices & services > Add integration > ESPHome.");
+    ui.horizontal(|ui| {
+        ui.label(format!("3. Host: {ip}"));
+        if ui.small_button("Copy").clicked() {
+            ui.ctx().copy_text(ip.to_string());
+        }
+        ui.label(format!("Port: {}", n.api_port));
+    });
+    ui.label("4. Enter the API encryption key from your YAML if it asks.");
+    if !n.lan {
+        ui.label(RichText::new("\"Reach from my network\" is off: only programs on this PC can connect (127.0.0.1).").small().color(Color32::from_rgb(230, 160, 90)));
+    }
+    ui.separator();
+    ui.label(RichText::new(format!("OTA updates from ESPHome Builder: set the device address to {ip}{}.", if n.ota_port != crate::network::ESPHOME_OTA_PORT { format!(" and the YAML's ota port to {}", n.ota_port) } else { String::new() })).small());
+    ui.label(RichText::new("Windows: the first time a device powers on, Windows Firewall asks about esp32sim. Tick Private networks and click Allow, or Home Assistant can't connect.").small());
+}
+
 fn port_is_free(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// Can a TCP port be listened on at `addr` (0.0.0.0 or 127.0.0.1)? The listener is closed
+/// again straight away, before the engine binds it.
+fn bind_is_free(addr: &str, port: u16) -> bool {
+    let free = |a: &str| std::net::TcpListener::bind((a, port)).is_ok();
+    // A port taken on one address of the PC also blocks 0.0.0.0 on Windows; check both.
+    free(addr) && (addr != "0.0.0.0" || free("127.0.0.1"))
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +263,12 @@ struct DeviceView {
     drop_ask: Option<DropAsk>,
     /// No bootloader in flash.bin (0xE9 at 0x1000), refreshed after writes and power-off.
     flash_blank: bool,
+    /// Wi-Fi join attempts seen in the console, for the "firmware is looking for" banner.
+    wifi_watch: crate::network::WifiWatch,
+    /// The access point of the current run (what the banner compares against).
+    wifi_ap: crate::network::WifiDetails,
+    /// Show the Wi-Fi password in the Network section.
+    show_password: bool,
 }
 
 /// Firmware queued for flash.bin. Applied once the engine is stopped (it owns the file
@@ -228,8 +284,16 @@ struct PendingFlash {
 struct DropAsk {
     name: String,
     data: Vec<u8>,
-    offset: String,
-    why: String,
+    kind: DropKind,
+}
+
+enum DropKind {
+    /// Unknown file: the user confirms the offset.
+    Offset { offset: String, why: String },
+    /// App-only (OTA format) image, the device has a partition table.
+    IntoPartition { offset: u64, otadata: Option<(u64, u64)> },
+    /// App-only (OTA format) image on a blank board.
+    OnBlank { install_anyway: bool },
 }
 
 /// Does flash.bin hold a bootloader? (Reads 0x1001 bytes.)
@@ -288,6 +352,9 @@ impl DeviceView {
             pending_flash: None,
             drop_ask: None,
             flash_blank,
+            wifi_watch: Default::default(),
+            wifi_ap: Default::default(),
+            show_password: false,
         }
     }
 
@@ -392,7 +459,12 @@ impl DeviceView {
                 self.lab(format!("{name}: {kind} at 0x{off:x}"));
                 self.queue_flash(false, vec![(off, data, name.clone())], name, true);
             }
-            crate::firmware::Placement::Ask(off, why) => self.drop_ask = Some(DropAsk { name, data, offset: format!("0x{off:x}"), why }),
+            crate::firmware::Placement::Ask(off, why) => self.drop_ask = Some(DropAsk { name, data, kind: DropKind::Offset { offset: format!("0x{off:x}"), why } }),
+            crate::firmware::Placement::AppIntoPartition { offset, otadata } => self.drop_ask = Some(DropAsk { name, data, kind: DropKind::IntoPartition { offset, otadata } }),
+            crate::firmware::Placement::AppOnBlank { install_anyway } => {
+                self.lab(format!("{name}: app-only (OTA format) image and the board is blank, not written. In ESPHome choose Manual download > Factory format."));
+                self.drop_ask = Some(DropAsk { name, data, kind: DropKind::OnBlank { install_anyway } })
+            }
         }
     }
 
@@ -400,7 +472,17 @@ impl DeviceView {
         if self.console.len() >= CONSOLE_LINES {
             self.console.pop_front();
         }
-        self.console.push_back((stream, strip_ansi(&line)));
+        let line = strip_ansi(&line);
+        if stream != Stream::Lab {
+            let before = self.wifi_watch.banner.clone();
+            self.wifi_watch.feed(&line, &self.wifi_ap);
+            if self.wifi_watch.banner != before {
+                if let Some(b) = self.wifi_watch.banner.clone() {
+                    self.console.push_back((Stream::Lab, format!("[cyd-lab] {b}")));
+                }
+            }
+        }
+        self.console.push_back((stream, line));
     }
 
     fn lab(&mut self, msg: impl Into<String>) {
@@ -618,29 +700,75 @@ impl CydLabApp {
         let mut cancel = false;
         let d = &mut self.devices[i];
         let ask = d.drop_ask.as_mut().unwrap();
+        let name = ask.name.clone();
         egui::Modal::new(egui::Id::unique("drop_ask")).show(ctx, |ui| {
-            ui.set_max_width(460.0);
-            ui.heading(format!("Where should {} go?", ask.name));
-            ui.label(&ask.why);
-            ui.horizontal(|ui| {
-                ui.label("Write at offset");
-                ui.add(egui::TextEdit::singleline(&mut ask.offset).desired_width(90.0));
-                ui.label(RichText::new("0x0 merged/factory · 0x1000 bootloader · 0x8000 partitions · 0x10000 app").small().weak());
-            });
-            ui.horizontal(|ui| {
-                if ui.button(RichText::new("Write").strong()).clicked() {
-                    go = true;
+            ui.set_max_width(500.0);
+            match &mut ask.kind {
+                DropKind::Offset { offset, why } => {
+                    ui.heading(format!("Where should {name} go?"));
+                    ui.label(why.as_str());
+                    ui.horizontal(|ui| {
+                        ui.label("Write at offset");
+                        ui.add(egui::TextEdit::singleline(offset).desired_width(90.0));
+                        ui.label(RichText::new("0x0 merged/factory · 0x1000 bootloader · 0x8000 partitions · 0x10000 app").small().weak());
+                    });
                 }
-                if ui.button("Cancel").clicked() {
-                    cancel = true;
+                DropKind::IntoPartition { offset, .. } => {
+                    ui.heading("Write the app into the app partition?");
+                    ui.label(format!("{name} is an app-only image (ESPHome calls it the OTA format). This board already has a bootloader and partition table, so it can go into the first app partition at 0x{offset:x}, and the boot choice (otadata) is reset so that partition boots, like an OTA update. Saved settings (NVS) stay."));
+                    ui.label(RichText::new("For a clean start, use the factory format (ESPHome: Manual download > Factory format) instead: it goes to 0x0 and is exactly what a real CYD gets over USB.").small().weak());
+                }
+                DropKind::OnBlank { install_anyway } => {
+                    ui.heading("This is the OTA format file");
+                    ui.label(format!("{name} holds only the app. ESPHome sends this file over the network to a board that is already set up. This board is blank (no bootloader, no partition table), so the app alone can't boot."));
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("In ESPHome choose Install > Manual download > Factory format, and drop that file (….factory.bin) here.").strong());
+                    ui.label(RichText::new("The factory file is the like-for-like choice: the same bytes a real CYD gets when you flash it over USB.").small());
+                    ui.add_space(4.0);
+                    if *install_anyway {
+                        ui.label(RichText::new("Install anyway adds a stock ESP-IDF bootloader and ESPHome's default 4 MB partition table, then puts this app at 0x10000. That's fine for ESPHome's default layout. If your YAML has its own partitions or bootloader settings, use the factory file.").small().weak());
+                    } else {
+                        ui.label(RichText::new("It's too big for ESPHome's default 4 MB layout, so only the factory file will work.").small().weak());
+                    }
+                }
+            }
+            ui.horizontal(|ui| match &ask.kind {
+                DropKind::OnBlank { install_anyway } => {
+                    if ui.button(RichText::new("OK, I'll get the factory file").strong()).clicked() {
+                        cancel = true;
+                    }
+                    if ui.add_enabled(*install_anyway, egui::Button::new("Install anyway")).clicked() {
+                        go = true;
+                    }
+                }
+                k => {
+                    let label = if matches!(k, DropKind::IntoPartition { .. }) { "Write to app partition" } else { "Write" };
+                    if ui.button(RichText::new(label).strong()).clicked() {
+                        go = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
                 }
             });
         });
         if go {
-            match parse_offset(&ask.offset) {
-                Ok(off) => {
-                    let a = d.drop_ask.take().unwrap();
-                    d.queue_flash(false, vec![(off, a.data, a.name.clone())], a.name, true);
+            let parts: Result<Vec<(u64, Vec<u8>, String)>> = match &ask.kind {
+                DropKind::Offset { offset, .. } => parse_offset(offset).map(|off| vec![(off, std::mem::take(&mut ask.data), name.clone())]),
+                DropKind::IntoPartition { offset, otadata } => {
+                    let mut v = Vec::new();
+                    if let Some((o, len)) = otadata.filter(|(_, len)| *len <= 0x10000) {
+                        v.push((o, vec![0xFF; len as usize], "otadata (reset: boot the first app)".to_string()));
+                    }
+                    v.push((*offset, std::mem::take(&mut ask.data), name.clone()));
+                    Ok(v)
+                }
+                DropKind::OnBlank { .. } => Ok(crate::firmware::stock_layout(&std::mem::take(&mut ask.data))),
+            };
+            match parts {
+                Ok(parts) => {
+                    d.drop_ask = None;
+                    d.queue_flash(false, parts, name, true);
                 }
                 Err(e) => self.status = format!("offset: {e:#}"),
             }
@@ -734,6 +862,9 @@ impl CydLabApp {
         };
         #[allow(unused_mut)]
         let mut spec = LaunchSpec::build(&profile, &self.devices[i].dev, &self.effective_engine(), &features, boot, port, serial);
+        let (net_args, notes) = crate::network::engine_args(&self.devices[i].dev.meta.network, &self.settings.wifi, features.net(), &bind_is_free);
+        spec.args.extend(net_args);
+        spec.notes.extend(notes);
         #[cfg(windows)]
         if let Some(com) = self.devices[i].dev.meta.com_port.as_ref().filter(|_| self.settings.engine.com_bridge) {
             match serial {
@@ -760,6 +891,8 @@ impl CydLabApp {
             r
         });
         let d = &mut self.devices[i];
+        d.wifi_ap = d.dev.meta.network.effective(&self.settings.wifi);
+        d.wifi_watch = Default::default();
         d.link_up = false;
         d.link_note = if self.settings.engine.live_link { "connecting to engine --web…".into() } else { "live link disabled in Settings".into() };
         if let Err(e) = r {
@@ -955,7 +1088,7 @@ impl CydLabApp {
         });
         if create {
             let (name, pid) = (dlg.name.clone(), dlg.profile.clone());
-            match self.profiles.get(&pid).cloned().context("pick a variant").and_then(|p| self.store.create(&name, &p)) {
+            match self.profiles.get(&pid).cloned().context("pick a variant").and_then(|p| self.store.create_with(&name, &p, &self.settings.wifi)) {
                 Ok(dev) => {
                     self.status = format!("Created {} ({}), flash.bin blank at {}", dev.meta.name, dev.id, dev.flash_path().display());
                     self.devices.push(DeviceView::new(dev, self.waker.clone()));
@@ -1223,6 +1356,7 @@ impl CydLabApp {
             chip(ui, sb, "serial bridge", sb_tip);
         });
         self.serial_bridge_ui(ui, i, alive, &features);
+        self.network_ui(ui, i, alive, &features);
         ui.separator();
 
         // --- controls
@@ -1383,6 +1517,128 @@ impl CydLabApp {
 
     /// Per-device serial settings: TCP port for `--serial-tcp`, the planned COM name,
     /// and the rfc2217:// URL with a copy button.
+    /// Network: the access point the chip joins and the ports published on this PC.
+    fn network_ui(&mut self, ui: &mut egui::Ui, i: usize, alive: bool, features: &EngineFeatures) {
+        let ip = cached_lan_ip();
+        let ip_text = ip.map(|i| i.to_string()).unwrap_or_else(|| "this PC's IP".into());
+        let defaults = self.settings.wifi.clone();
+        let mut save = false;
+        let mut make_default = false;
+        let d = &mut self.devices[i];
+        let net = d.dev.meta.network.clone();
+        let eff = net.effective(&defaults);
+        let summary = if !net.wifi {
+            "Network: Wi-Fi off".to_string()
+        } else if net.lan {
+            format!("Network: Wi-Fi \"{}\" · Home Assistant: {ip_text} port {}", eff.ssid, net.api_port)
+        } else {
+            format!("Network: Wi-Fi \"{}\" · this PC only (127.0.0.1 port {})", eff.ssid, net.api_port)
+        };
+        ui.horizontal_wrapped(|ui| {
+            egui::CollapsingHeader::new(RichText::new(summary).small()).id_salt(("net", i)).show(ui, |ui| {
+                let n = &mut d.dev.meta.network;
+                ui.add_enabled_ui(!alive, |ui| {
+                    if alive {
+                        ui.label(RichText::new("Power off to change these; they apply at the next power-on.").small().weak());
+                    }
+                    save |= ui.checkbox(&mut n.wifi, "Wi-Fi: give the chip a network to join").on_hover_text("The emulator runs a virtual access point; the firmware joins it as it would join your router. Nothing changes on your real Wi-Fi.").changed();
+                    egui::Grid::new(("netgrid", i)).num_columns(2).show(ui, |ui| {
+                        ui.label("Network name");
+                        save |= ui.add(egui::TextEdit::singleline(&mut n.ssid).desired_width(200.0).hint_text(if defaults.ssid.is_empty() { "cyd-lab" } else { defaults.ssid.as_str() })).changed();
+                        ui.end_row();
+                        ui.label("Password");
+                        ui.horizontal(|ui| {
+                            save |= ui.add(egui::TextEdit::singleline(&mut n.password).password(!d.show_password).desired_width(200.0).hint_text("empty = open network")).changed();
+                            ui.checkbox(&mut d.show_password, "show");
+                        });
+                        ui.end_row();
+                    });
+                    ui.label(RichText::new("Use the same name and password as in the firmware (ESPHome: wifi ssid/password, e.g. wifi_ssid and wifi_password in secrets.yaml). Then your existing firmware works unchanged.").small().weak());
+                    if let Err(e) = crate::network::validate_wifi(&n.effective(&defaults)) {
+                        ui.label(RichText::new(format!("Can't use this: {e}.")).small().color(Color32::from_rgb(230, 120, 90)));
+                    }
+                    ui.horizontal(|ui| {
+                        let mine = crate::network::WifiDetails { ssid: n.ssid.clone(), password: n.password.clone() };
+                        if mine == defaults && !mine.ssid.is_empty() {
+                            ui.label(RichText::new("✓ new devices get these Wi-Fi details").small().weak());
+                        } else if ui.add_enabled(!mine.ssid.is_empty(), egui::Button::new("Use these Wi-Fi details for new devices").small()).on_hover_text("Saved in settings.toml, so you only type them once").clicked() {
+                            make_default = true;
+                        }
+                    });
+                    ui.separator();
+                    save |= ui.checkbox(&mut n.lan, "Reach from my network (Home Assistant on another machine)").on_hover_text("On: the ports below listen on all of this PC's addresses (0.0.0.0). Off: only on this PC (127.0.0.1).").changed();
+                    egui::Grid::new(("fwd", i)).num_columns(4).show(ui, |ui| {
+                        ui.label(RichText::new("").small());
+                        ui.label(RichText::new("this PC's port").small().weak());
+                        ui.label("");
+                        ui.label(RichText::new("firmware's port").small().weak());
+                        ui.end_row();
+                        let row = |ui: &mut egui::Ui, label: &str, host: &mut u16, guest: &mut u16| {
+                            ui.label(label);
+                            let c = ui.add(egui::DragValue::new(host).range(1..=65535)).changed();
+                            ui.label("→");
+                            let g = ui.add(egui::DragValue::new(guest).range(1..=65535)).changed();
+                            ui.end_row();
+                            c || g
+                        };
+                        save |= row(ui, "API (Home Assistant)", &mut n.api_port, &mut n.api_guest);
+                        save |= row(ui, "OTA uploads", &mut n.ota_port, &mut n.ota_guest);
+                        let mut remove = None;
+                        for (k, f) in n.extra.iter_mut().enumerate() {
+                            ui.label(if f.guest == 80 { "Web page" } else { "Extra" });
+                            save |= ui.add(egui::DragValue::new(&mut f.host).range(1..=65535)).changed();
+                            ui.label("→");
+                            ui.horizontal(|ui| {
+                                save |= ui.add(egui::DragValue::new(&mut f.guest).range(1..=65535)).changed();
+                                if ui.small_button("✕").clicked() {
+                                    remove = Some(k);
+                                }
+                            });
+                            ui.end_row();
+                        }
+                        if let Some(k) = remove {
+                            n.extra.remove(k);
+                            save = true;
+                        }
+                    });
+                    if ui.small_button("+ Add a port (e.g. 80 for ESPHome's web_server)").clicked() {
+                        let host = (8080..u16::MAX).find(|p| !n.host_ports().contains(p)).unwrap_or(8080);
+                        n.extra.push(crate::network::Forward { host, guest: 80 });
+                        save = true;
+                    }
+                    if n.api_port != n.api_guest {
+                        ui.label(RichText::new(format!("API: in Home Assistant use port {}; the firmware needs no change.", n.api_port)).small().weak());
+                    }
+                    if n.ota_port != crate::network::ESPHOME_OTA_PORT || n.ota_guest != crate::network::ESPHOME_OTA_PORT {
+                        ui.label(RichText::new(format!("OTA: ESPHome uploads to the port in your YAML, so add this to this device's YAML and set both numbers to the same value:\n  ota:\n    - platform: esphome\n      port: {}", n.ota_port)).small().weak().monospace());
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("This PC: {}", ip.map(|i| i.to_string()).unwrap_or_else(|| "no network address found".into()))).small());
+                    let mdns = if features.mdns_relay { "mDNS: announced on your network, so Home Assistant can discover it." } else { "mDNS: not available with this engine build, so add it in Home Assistant by IP." };
+                    ui.label(RichText::new(mdns).small().weak());
+                });
+            });
+            let n = &d.dev.meta.network;
+            if n.wifi {
+                ui.menu_button(RichText::new("Add to Home Assistant").small(), |ui| ha_help_ui(ui, &ip_text, n, features.mdns_relay));
+            }
+        });
+        if make_default {
+            let n = &d.dev.meta.network;
+            self.settings.wifi = crate::network::WifiDetails { ssid: n.ssid.clone(), password: n.password.clone() };
+            if let Err(e) = self.settings.save(&self.paths.settings) {
+                self.status = format!("could not save settings: {e:#}");
+            }
+        }
+        let d = &mut self.devices[i];
+        if save {
+            if let Err(e) = d.dev.save() {
+                d.lab(format!("could not save device settings: {e:#}"));
+            }
+        }
+    }
+
     fn serial_bridge_ui(&mut self, ui: &mut egui::Ui, i: usize, alive: bool, features: &EngineFeatures) {
         let live_port = self.devices[i].backend.capabilities().serial_tcp.filter(|_| alive);
         let others: Vec<u16> = self.devices.iter().enumerate().filter(|(j, _)| *j != i).filter_map(|(_, d)| d.dev.meta.serial_tcp_port).collect();
@@ -1583,6 +1839,28 @@ impl CydLabApp {
                 ui.small_button("Command line").on_hover_text(cmd.clone()).clicked().then(|| ui.ctx().copy_text(cmd));
             }
         });
+        let mut use_ssid = None;
+        if let Some(b) = d.wifi_watch.banner.clone() {
+            egui::Frame::new().fill(Color32::from_rgb(90, 60, 10)).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(b).color(Color32::WHITE));
+                    if let Some(w) = d.wifi_watch.wanted.clone().filter(|w| *w != d.dev.meta.network.ssid) {
+                        if ui.button(format!("Use \"{w}\" for this device")).on_hover_text("Sets this device's Wi-Fi network name. Check the password in Network, then power-cycle.").clicked() {
+                            use_ssid = Some(w);
+                        }
+                    }
+                });
+            });
+        }
+        if let Some(w) = use_ssid {
+            d.dev.meta.network.ssid = w;
+            d.dev.meta.network.wifi = true;
+            if let Err(e) = d.dev.save() {
+                d.lab(format!("could not save device settings: {e:#}"));
+            }
+            d.lab("Wi-Fi network name updated. Check the password under Network, then Power off and on.");
+        }
         let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
         // Reserve room for the serial input row below the log so it never falls off the window.
         let input_h = ui.spacing().interact_size.y + 2.0 * ui.spacing().item_spacing.y + 8.0;

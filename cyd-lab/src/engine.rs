@@ -161,11 +161,17 @@ pub struct EngineFeatures {
     /// `--quit-on-stdin-eof`: save and exit 0 when stdin closes. Engines with it also
     /// honour the WebSocket `{"t":"quit"}` and save on Ctrl-C / console close on Windows.
     pub quit_on_stdin_eof: bool,
+    /// `--wifi SPEC` (a virtual access point) with `--net nat`.
+    pub wifi: bool,
+    /// `--hostfwd tcp:HOST:PORT-:GUESTPORT`.
+    pub hostfwd: bool,
+    /// `--mdns-relay`: answer/forward mDNS between the LAN and the NAT'd chip.
+    pub mdns_relay: bool,
 }
 
 impl EngineFeatures {
     /// The flags cyd-lab cares about.
-    pub const FLAGS: [&'static str; 4] = ["--flash-file", "--serial-tcp", "--web-dir", "--quit-on-stdin-eof"];
+    pub const FLAGS: [&'static str; 7] = ["--flash-file", "--serial-tcp", "--web-dir", "--quit-on-stdin-eof", "--wifi", "--hostfwd", "--mdns-relay"];
 
     /// Decide from the `--help` text, falling back to the executable's bytes for a flag the
     /// help does not mention. Current esp32sim lists all of these in `--help`; older builds
@@ -178,7 +184,14 @@ impl EngineFeatures {
             serial_tcp: has("--serial-tcp"),
             web_dir: has("--web-dir"),
             quit_on_stdin_eof: has("--quit-on-stdin-eof"),
+            wifi: has("--wifi"),
+            hostfwd: has("--hostfwd"),
+            mdns_relay: has("--mdns-relay"),
         }
+    }
+
+    pub fn net(&self) -> crate::network::NetFeatures {
+        crate::network::NetFeatures { wifi: self.wifi, hostfwd: self.hostfwd, mdns_relay: self.mdns_relay }
     }
 
     /// Probe an engine executable (cached by path, size and mtime, so a rebuilt engine is
@@ -385,6 +398,8 @@ pub struct LaunchSpec {
     pub relay: Option<crate::combridge::Relay>,
     /// Shown at power-on, e.g. why the COM relay is not running.
     pub relay_note: Option<String>,
+    /// More lines for the console at power-on (network notes).
+    pub notes: Vec<String>,
 }
 
 impl LaunchSpec {
@@ -458,7 +473,7 @@ impl LaunchSpec {
         if let Some(dir) = settings.rom_dir.as_ref().filter(|d| !d.as_os_str().is_empty()) {
             env.push(("ESP32SIM_ROM_DIR".to_string(), path_str(dir)));
         }
-        LaunchSpec { program: settings.engine_exe.clone(), args: a, env, boot, web_port, flash_image: device.flash_path(), web_dir, flash_persist, serial_tcp, portable_quit, relay: None, relay_note: None,
+        LaunchSpec { program: settings.engine_exe.clone(), args: a, env, boot, web_port, flash_image: device.flash_path(), web_dir, flash_persist, serial_tcp, portable_quit, relay: None, relay_note: None, notes: Vec::new(),
             stop_grace: Duration::from_secs(settings.stop_grace_secs.clamp(1, 120) as u64) }
     }
 
@@ -826,6 +841,9 @@ impl Backend for ProcessBackend {
         if let Some(note) = &spec.relay_note {
             self.lab(format!("[cyd-lab] {note}"));
         }
+        for note in &spec.notes {
+            self.lab(format!("[cyd-lab] {note}"));
+        }
         if let Some(r) = &spec.relay {
             self.start_relay(r);
         }
@@ -1137,6 +1155,7 @@ mod tests {
                 notes: String::new(),
                 view_rotation: 0,
                 created: 0,
+                network: Default::default(),
             },
         };
         (profile, device)
@@ -1251,7 +1270,10 @@ mod tests {
         let help = "  --flash-file F  read-write flash\n  --serial-tcp PORT  raw or RFC 2217\n  --quit-on-stdin-eof  save and exit 0\n  --web-dir D";
         let f = EngineFeatures::from_probe(help, b"");
         assert!(f.flash_file && f.serial_tcp && f.quit_on_stdin_eof && f.web_dir);
-        assert!(EngineFeatures::FLAGS.iter().all(|fl| help.contains(fl)));
+        assert!(!f.wifi && !f.mdns_relay);
+        let f = EngineFeatures::from_probe("  --wifi SPEC\n  --hostfwd tcp:..\n", b"");
+        assert!(f.wifi && f.hostfwd && !f.mdns_relay);
+        assert!(EngineFeatures::from_probe("  --mdns-relay MODE\n", b"").mdns_relay);
     }
 
     #[test]
@@ -1284,7 +1306,7 @@ mod tests {
     fn flash_file_and_serial_tcp_flags() {
         let (p, d) = fixture("esp32-2432s028r");
         let s = EngineSettings::default();
-        let all = EngineFeatures { found: true, flash_file: true, serial_tcp: true, web_dir: true, quit_on_stdin_eof: true };
+        let all = EngineFeatures { found: true, flash_file: true, serial_tcp: true, web_dir: true, quit_on_stdin_eof: true, ..Default::default() };
         let spec = LaunchSpec::build(&p, &d, &s, &all, BootMode::Normal, None, Some(22171));
         assert!(spec.args.iter().any(|a| a == "--quit-on-stdin-eof") && spec.portable_quit);
         assert_eq!(PathBuf::from(value_of(&spec.args, "--flash-file").unwrap()), d.flash_path());

@@ -11,6 +11,11 @@
 //! * bootloader alone (0xE9, no app descriptor, small) → 0x1000.
 //! * partition table alone (0xAA 0x50 at 0) → 0x8000.
 //! * anything else → ask.
+//!
+//! An app image (ESPHome's "OTA format", formerly "legacy") is never written at 0x0, and on
+//! a board with no partition table it is refused with an explanation: the like-for-like
+//! file is the factory/merged image. "Install anyway" ([`stock_layout`]) adds a stock
+//! ESP-IDF bootloader and ESPHome's default 4 MB partition table around it.
 
 pub const IMAGE_MAGIC: u8 = 0xE9;
 const APP_DESC_MAGIC: u32 = 0xABCD_5432;
@@ -21,6 +26,52 @@ pub enum Placement {
     At(u64, &'static str),
     /// Probably this offset, but the user should confirm.
     Ask(u64, String),
+    /// An app-only image (OTA format) and the device already has a partition table: offer
+    /// to write it into the first app partition and reset `otadata` so it is what boots.
+    AppIntoPartition { offset: u64, otadata: Option<(u64, u64)> },
+    /// An app-only image and the device's flash has no partition table (a blank board):
+    /// refused, with the advice to use the factory format. `install_anyway`: it fits the
+    /// stock layout, so [`stock_layout`] can be offered.
+    AppOnBlank { install_anyway: bool },
+}
+
+/// Stock ESP-IDF v5.5.6 bootloader, as ESPHome 2026.10.0 builds it for esp32dev (4 MB, DIO).
+pub const STOCK_BOOTLOADER: &[u8] = include_bytes!("../assets/esp32-stock/bootloader.bin");
+/// ESPHome's default 4 MB partition table (app0/ota_0 at 0x10000, 0x1C0000 bytes each).
+pub const STOCK_PARTITIONS_4MB: &[u8] = include_bytes!("../assets/esp32-stock/partitions-4mb.bin");
+/// Size of each app slot in [`STOCK_PARTITIONS_4MB`].
+pub const STOCK_APP_SLOT: usize = 0x1C_0000;
+
+/// Is `file` an ESP-IDF application image (0xE9 header, app descriptor at 0x20)?
+#[allow(dead_code)]
+pub fn is_app_image(file: &[u8]) -> bool {
+    is_image(file, 0) && u32le(file, 0x20) == Some(APP_DESC_MAGIC)
+}
+
+/// The parts for "Install anyway": stock bootloader at 0x1000, ESPHome's default 4 MB
+/// partition table at 0x8000, a blank otadata (so ota_0 boots) and the app at 0x10000.
+pub fn stock_layout(app: &[u8]) -> Vec<(u64, Vec<u8>, String)> {
+    let (ota_off, ota_len) = otadata_range(STOCK_PARTITIONS_4MB, 0).unwrap_or((0x9000, 0x2000));
+    vec![
+        (0x1000, STOCK_BOOTLOADER.to_vec(), "stock ESP-IDF bootloader".into()),
+        (0x8000, STOCK_PARTITIONS_4MB.to_vec(), "ESPHome default 4 MB partition table".into()),
+        (ota_off, vec![0xFF; ota_len as usize], "otadata (blank: boot app0)".into()),
+        (0x10000, app.to_vec(), "app".into()),
+    ]
+}
+
+/// The `otadata` partition (type 1, subtype 0) of a partition table found at `base` in `d`.
+pub fn otadata_range(d: &[u8], base: usize) -> Option<(u64, u64)> {
+    for k in 0..95 {
+        let e = base + k * 32;
+        if !is_pt(d, e) {
+            break;
+        }
+        if d[e + 2] == 1 && d[e + 3] == 0 {
+            return Some((u32le(d, e + 4)? as u64, u32le(d, e + 8)? as u64));
+        }
+    }
+    None
 }
 
 fn u32le(d: &[u8], at: usize) -> Option<u32> {
@@ -94,11 +145,8 @@ pub fn place(file: &[u8], flash: &[u8]) -> Placement {
         }
         if u32le(file, 0x20) == Some(APP_DESC_MAGIC) {
             return match first_app_offset(flash) {
-                Some(o) => Placement::At(o, "app image (into the device's first app partition)"),
-                None => Placement::Ask(
-                    0x10000,
-                    "This is an app-only image, but the device's flash has no bootloader/partition table yet, so it will not boot alone. Use the merged/factory .bin if you have it (ESPHome: *.factory.bin, Arduino: Export Compiled Binary → *.merged.bin), or write it at 0x10000 on top of one.".into(),
-                ),
+                Some(offset) => Placement::AppIntoPartition { offset, otadata: otadata_range(flash, 0x8000) },
+                None => Placement::AppOnBlank { install_anyway: file.len() <= STOCK_APP_SLOT },
             };
         }
         if file.len() <= 0x7000 {
@@ -167,12 +215,39 @@ mod tests {
     fn app_images_follow_the_partition_table() {
         let app = image(0, true, 0x40000);
         let blank = vec![0xFFu8; 0x10000];
-        assert!(matches!(place(&app, &blank), Placement::Ask(0x10000, m) if m.contains("no bootloader")));
-        // ota_0 at 0x10000, ota_1 at 0x150000
-        assert_eq!(place(&app, &flash_with(&[(1, 2, 0x9000), (0, 0x10, 0x10000), (0, 0x11, 0x150000)])), Placement::At(0x10000, "app image (into the device's first app partition)"));
+        assert_eq!(place(&app, &blank), Placement::AppOnBlank { install_anyway: true });
+        assert_eq!(place(&image(0, true, 0x1C_0001), &blank), Placement::AppOnBlank { install_anyway: false });
+        // ota_0 at 0x10000, ota_1 at 0x150000, otadata at 0xe000
+        assert!(matches!(
+            place(&app, &flash_with(&[(1, 2, 0x9000), (1, 0, 0xe000), (0, 0x10, 0x10000), (0, 0x11, 0x150000)])),
+            Placement::AppIntoPartition { offset: 0x10000, otadata: Some((0xe000, _)) }
+        ));
         // factory wins over ota
-        assert!(matches!(place(&app, &flash_with(&[(0, 0x10, 0x10000), (0, 0, 0x200000)])), Placement::At(0x200000, _)));
+        assert!(matches!(place(&app, &flash_with(&[(0, 0x10, 0x10000), (0, 0, 0x200000)])), Placement::AppIntoPartition { offset: 0x200000, otadata: None }));
         assert!(matches!(place(&image(5, true, 0x40000), &blank), Placement::Ask(_, m) if m.contains("ESP32-C3")));
+    }
+
+    /// The bundled stock parts are what they claim: an ESP32 bootloader and a table whose
+    /// first app slot is ota_0 at 0x10000 with blank-able otadata at 0x9000.
+    #[test]
+    fn stock_layout_is_esphome_default() {
+        assert!(is_image(STOCK_BOOTLOADER, 0) && chip_id(STOCK_BOOTLOADER, 0) == Some(0));
+        let mut flash = vec![0xFFu8; 0x9000];
+        flash[0x8000..0x8000 + STOCK_PARTITIONS_4MB.len()].copy_from_slice(STOCK_PARTITIONS_4MB);
+        assert_eq!(first_app_offset(&flash), Some(0x10000));
+        assert_eq!(otadata_range(STOCK_PARTITIONS_4MB, 0), Some((0x9000, 0x2000)));
+        let parts = stock_layout(&image(0, true, 0x1000));
+        let offs: Vec<u64> = parts.iter().map(|p| p.0).collect();
+        assert_eq!(offs, vec![0x1000, 0x8000, 0x9000, 0x10000]);
+        assert!(parts[2].1.iter().all(|b| *b == 0xFF) && parts[2].1.len() == 0x2000);
+    }
+
+    /// The real ESPHome "OTA format" download from the first Windows test, when present.
+    #[test]
+    fn esphome_ota_download_is_refused_on_blank() {
+        let Ok(d) = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../gareth-esphome.bin")) else { return };
+        assert!(is_app_image(&d));
+        assert_eq!(place(&d, &vec![0xFFu8; 0x9000]), Placement::AppOnBlank { install_anyway: true });
     }
 
     #[test]

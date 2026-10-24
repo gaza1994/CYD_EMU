@@ -58,6 +58,9 @@ pub struct DeviceMeta {
     /// Unix seconds.
     #[serde(default)]
     pub created: u64,
+    /// Wi-Fi access point and published ports (`[network]`). Plain text, password included.
+    #[serde(default)]
+    pub network: crate::network::DeviceNetwork,
 }
 
 #[derive(Debug, Clone)]
@@ -124,7 +127,13 @@ impl DeviceStore {
     }
 
     /// Create a blank board of `profile`: folder, `device.toml`, `flash.bin` all 0xFF.
+    #[allow(dead_code)]
     pub fn create(&self, name: &str, profile: &Profile) -> Result<Device> {
+        self.create_with(name, profile, &crate::network::WifiDetails::default())
+    }
+
+    /// Create a device whose access point uses `wifi` (the app-wide default).
+    pub fn create_with(&self, name: &str, profile: &Profile, wifi: &crate::network::WifiDetails) -> Result<Device> {
         let name = name.trim();
         if name.is_empty() {
             bail!("device name is empty");
@@ -144,6 +153,7 @@ impl DeviceStore {
             notes: String::new(),
             view_rotation: profile.display.as_ref().map(|d| d.default_rotation).unwrap_or(0),
             created: now,
+            network: crate::network::DeviceNetwork::for_new_device(wifi, &existing.iter().map(|d| d.meta.network.clone()).collect::<Vec<_>>()),
         };
         let dev = Device { id, dir, meta };
         write_blank_flash(&dev.flash_path(), profile.flash.size_bytes())?;

@@ -20,6 +20,7 @@ mod combridge;
 mod device;
 mod engine;
 mod firmware;
+mod network;
 mod profile;
 mod rfc2217;
 mod running;
