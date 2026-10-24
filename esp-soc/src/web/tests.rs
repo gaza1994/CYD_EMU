@@ -267,3 +267,19 @@ fn closing_the_server_sends_going_away_and_fin_to_every_client() {
         expect_eof(connection);
     }
 }
+
+#[test]
+fn a_client_gone_mid_touch_releases_its_touch() {
+    let web = socket_web();
+    for (msgs, release) in [(vec![r#"{"t":"touch","x":12,"y":34,"down":"1"}"#], true),
+                            (vec![r#"{"t":"touch","x":12,"y":34,"down":"1"}"#, r#"{"t":"touch","x":12,"y":34,"down":"0"}"#], false)] {
+        let mut connection = Connection::new(&web);
+        connection.handshake(None);
+        assert!(connection.head().starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
+        for m in &msgs { connection.socket.write_all(&masked_frame(1, m.as_bytes())).unwrap(); }
+        drop(connection); // no Close frame: a dropped tab
+        let mut got = web.poll_incoming();
+        assert_eq!(got.drain(..msgs.len()).collect::<Vec<_>>(), msgs);
+        assert_eq!(got, if release { vec![r#"{"t":"touch","x":"12","y":"34","down":"0"}"#.to_string()] } else { vec![] });
+    }
+}

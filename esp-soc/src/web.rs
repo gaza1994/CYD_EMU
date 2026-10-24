@@ -236,6 +236,9 @@ fn handle_client(mut stream: TcpStream, shared: Arc<Mutex<Shared>>) {
     // A TCP read may have included the first frame after the HTTP head.
     let mut input = req[head_end..].chain(&mut stream);
     let mut read_exact = |n: usize| -> Option<Vec<u8>> { let mut v = vec![0u8; n]; input.read_exact(&mut v).ok()?; Some(v) };
+    // This client's touch still pressed, `{"t":"touch",…,"down":"1"}` with x/y: released when it goes,
+    // so a tab closed or dropped mid-drag cannot leave the panel pressed.
+    let mut held: Option<(String, String)> = None;
     while let Some(h) = read_exact(2) {
         let op = h[0] & 0xf; let masked = h[1] & 0x80 != 0; let mut len = (h[1] & 0x7f) as u64;
         if op >= 8 && (h[0] & 0x80 == 0 || len > 125) { break; }
@@ -249,12 +252,20 @@ fn handle_client(mut stream: TcpStream, shared: Arc<Mutex<Shared>>) {
             // Echo the status code: the closing handshake the client waits for (RFC 6455 5.5.1).
             8 => { reply(frame(8, &data[..data.len().min(2)])); break; }
             9 => { if !reply(frame(10, &data)) { break; } }
-            1 => { shared.lock().unwrap().incoming.push_back(String::from_utf8_lossy(&data).to_string()); }
+            1 => {
+                let msg = String::from_utf8_lossy(&data).to_string();
+                if json_str(&msg, "t").as_deref() == Some("touch") {
+                    held = (json_str(&msg, "down").as_deref() == Some("1")).then(|| (json_str(&msg, "x").unwrap_or_default(), json_str(&msg, "y").unwrap_or_default()));
+                }
+                shared.lock().unwrap().incoming.push_back(msg);
+            }
             2 => { let mut sh = shared.lock().unwrap(); if sh.incoming_bin.len() < 4 { sh.incoming_bin.push_back(data); } }
             _ => {}
         }
     }
-    shared.lock().unwrap().clients.retain(|c| c.peer != me);
+    let mut sh = shared.lock().unwrap();
+    sh.clients.retain(|c| c.peer != me);
+    if let Some((x, y)) = held { sh.incoming.push_back(format!("{{\"t\":\"touch\",\"x\":\"{}\",\"y\":\"{}\",\"down\":\"0\"}}", json_escape(&x), json_escape(&y))); }
 }
 
 /// Tiny JSON helpers for the few message shapes the UI sends.
