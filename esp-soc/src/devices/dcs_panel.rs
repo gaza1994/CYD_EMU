@@ -13,6 +13,11 @@ pub struct DcsPanel {
     /// `LV_COLOR_16_SWAP`); Waveshare's driver for the 1.47" module does (`0xB0: 0x00, 0xE8`).
     pub little_endian: bool,
     ramctrl: bool,
+    /// ILI9341 Display Function Control (B6h) second parameter: GS (bit 6) scans the gate lines
+    /// G320→G1 and SS (bit 5) the source outputs S720→S1, so the glass shows the RAM's rows or
+    /// columns in reverse. Power-on 0x82: both forward. The board applies them; RAM is unchanged.
+    pub gate_reversed: bool, pub source_reversed: bool,
+    dfc: bool,
     /// the D/C line: low = command, high = parameter or pixel data. Idles low, as the GPIO does.
     pub dc: bool,
     cmd: u8, args: [u8; 4], argn: u8,
@@ -22,6 +27,9 @@ pub struct DcsPanel {
     pub frames: u64,
     pub pixels_written: u64,
     pub resets: u64,
+    /// MADCTL values as written, a repeat of the last one not recorded, the first 16 kept (a
+    /// driver that rotates mid-run shows up here; the report prints it)
+    pub madctl_writes: Vec<u8>,
 }
 
 impl DcsPanel {
@@ -29,8 +37,8 @@ impl DcsPanel {
     /// 18-bit colour, the window the whole RAM).
     pub fn new(cols: usize, rows: usize) -> Self {
         DcsPanel { cols, rows, gram: vec![0; cols * rows], madctl: 0, colmod: 0x66, inverted: false, sleeping: true, on: false, dc: false,
-                   little_endian: false, ramctrl: false, cmd: 0, args: [0; 4], argn: 0, x0: 0, x1: cols as u16 - 1, y0: 0, y1: rows as u16 - 1, xc: 0, yc: 0,
-                   pixel_hi: None, frames: 0, pixels_written: 0, resets: 0 }
+                   little_endian: false, ramctrl: false, gate_reversed: false, source_reversed: false, dfc: false, cmd: 0, args: [0; 4], argn: 0, x0: 0, x1: cols as u16 - 1, y0: 0, y1: rows as u16 - 1, xc: 0, yc: 0,
+                   pixel_hi: None, frames: 0, pixels_written: 0, resets: 0, madctl_writes: Vec::new() }
     }
     /// ST7735: 132 × 162 of RAM behind the 0.96" and 1.8" modules.
     pub fn st7735() -> Self { Self::new(132, 162) }
@@ -38,13 +46,13 @@ impl DcsPanel {
     pub fn st7789() -> Self { let mut p = Self::new(240, 320); p.ramctrl = true; p }
     /// ILI9341: 240 × 320 of RAM behind the 2.4" and 2.8" modules. Its B0h is the RGB interface
     /// control, not RAMCTRL, so pixels always arrive high byte first.
-    pub fn ili9341() -> Self { Self::new(240, 320) }
+    pub fn ili9341() -> Self { let mut p = Self::new(240, 320); p.dfc = true; p }
 
     /// A hardware or software reset: every register back to power-on, the RAM kept (as on silicon).
     pub fn reset(&mut self) {
-        let (gram, resets, dc, ramctrl) = (std::mem::take(&mut self.gram), self.resets + 1, self.dc, self.ramctrl);
+        let (gram, resets, dc, ramctrl, dfc, writes) = (std::mem::take(&mut self.gram), self.resets + 1, self.dc, self.ramctrl, self.dfc, std::mem::take(&mut self.madctl_writes));
         *self = Self::new(self.cols, self.rows);
-        self.gram = gram; self.resets = resets; self.dc = dc; self.ramctrl = ramctrl;
+        self.gram = gram; self.resets = resets; self.dc = dc; self.ramctrl = ramctrl; self.dfc = dfc; self.madctl_writes = writes;
     }
 
     /// One byte from the SPI master, a command or data depending on `dc`.
@@ -70,8 +78,9 @@ impl DcsPanel {
                     if self.cmd == 0x2a { self.x0 = s; self.x1 = e; self.xc = s; } else { self.y0 = s; self.y1 = e; self.yc = s; }
                 }
             }
-            0x36 => self.madctl = b,
+            0x36 => { self.madctl = b; if self.madctl_writes.len() < 16 && self.madctl_writes.last() != Some(&b) { self.madctl_writes.push(b); } }
             0x3a => self.colmod = b,
+            0xb6 if self.dfc => { if self.argn == 1 { self.gate_reversed = b & 0x40 != 0; self.source_reversed = b & 0x20 != 0; } self.argn = self.argn.saturating_add(1); }
             0xb0 if self.ramctrl => { if self.argn == 1 { self.little_endian = b & 0x08 != 0; } self.argn = self.argn.saturating_add(1); }
             0x2c => match self.pixel_hi.take() {
                 None => self.pixel_hi = Some(b),
@@ -141,6 +150,25 @@ mod tests {
         cmd(&mut p, 0x01, &[]);
         assert!(p.sleeping && p.madctl == 0 && p.colmod == 0x66 && p.dc && p.resets == 1);
         assert_eq!((p.gram[0], p.cols, p.rows), (0xabcd, 132, 162));
+    }
+
+    /// ILI9341 B6h: LovyanGFX's `Panel_ILI9341` sends `08 C2 27` (GS), TFT_eSPI and Adafruit
+    /// `08 82 27`; the scan bits are recorded, MADCTL is logged once per change, RAM is untouched,
+    /// a reset restores the power-on scan, and a panel without the command ignores B6h.
+    #[test]
+    fn ili9341_display_function_control_and_madctl_log() {
+        let mut p = DcsPanel::ili9341();
+        cmd(&mut p, 0xb6, &[0x08, 0xc2, 0x27]);
+        assert!(p.gate_reversed && !p.source_reversed);
+        cmd(&mut p, 0xb6, &[0x08, 0xa2, 0x27]);
+        assert!(!p.gate_reversed && p.source_reversed);
+        for m in [0x08, 0x08, 0x48, 0x28] { cmd(&mut p, 0x36, &[m]); }
+        assert_eq!(p.madctl_writes, [0x08, 0x48, 0x28]);
+        cmd(&mut p, 0x01, &[]);
+        assert!(!p.gate_reversed && !p.source_reversed && p.madctl_writes.len() == 3);
+        let mut q = DcsPanel::st7789();
+        cmd(&mut q, 0xb6, &[0x08, 0xc2, 0x27]);
+        assert!(!q.gate_reversed);
     }
 
     /// RAMCTRL's endian bit, as Waveshare's ST7789 driver sets it (`0xB0: 0x00, 0xE8`): pixels

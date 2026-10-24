@@ -49,8 +49,12 @@ pub const LCD_ROWS: usize = 320;
 
 /// What the glass shows, as a portrait 240×320 frame. The panel shows the controller's whole RAM,
 /// with the columns mirrored: the drivers' upright portrait (rotation 0) is MADCTL 0x48, MX | BGR,
-/// in Adafruit_ILI9341, TFT_eSPI's ILI9341 driver and LovyanGFX's `Panel_ILI9341`, so the
-/// driver's column 0 lands in RAM column 239 and that is the glass's left edge. Red and blue are
+/// in Adafruit_ILI9341 and TFT_eSPI's ILI9341 drivers, so the driver's column 0 lands in RAM
+/// column 239 and that is the glass's left edge. Display Function Control (B6h) can reverse the
+/// scans: GS shows the rows bottom to top, SS undoes the column mirror (its effect on the R/B dot
+/// order is not modelled). LovyanGFX's `Panel_ILI9341` sends GS with MADCTL 0x08 as rotation 0,
+/// which is why CYD setups for it use `offset_rotation = 2` (MX | MY): unadjusted, as in openHASP's
+/// `esp32-2432s028r` build, the picture is upside down (rotated 180°) until its `rotate` is 2. Red and blue are
 /// exchanged unless MADCTL's BGR bit is set (all three drivers set it). INVON inverts every pixel:
 /// unlike the T-Display's IPS glass, this TN panel shows colours as sent with inversion off
 /// (TFT_eSPI's CYD setups leave `TFT_INVERSION_ON` undefined). Asleep or off, the glass is black.
@@ -60,9 +64,9 @@ pub fn lcd_visible(p: &DcsPanel) -> Vec<u16> {
     let exchange = p.madctl & 0x08 == 0;
     let blank = !p.on || p.sleeping;
     for y in 0..LCD_ROWS {
-        let row = y * p.cols;
+        let row = if p.gate_reversed { LCD_ROWS - 1 - y } else { y } * p.cols;
         for x in 0..LCD_COLS {
-            let mut px = p.gram[row + LCD_COLS - 1 - x];
+            let mut px = p.gram[row + if p.source_reversed { x } else { LCD_COLS - 1 - x }];
             if exchange { px = (px & 0x07e0) | ((px & 0xf800) >> 11) | ((px & 0x001f) << 11); }
             if p.inverted { px = !px; }
             if blank { px = 0; }
@@ -178,8 +182,8 @@ impl BoardModel for Cyd2432S028R {
     fn leds(&self) -> Option<(&[[u8; 3]], u64)> { Some((&self.led, self.led_updates)) }
     fn report(&self) -> String {
         let p = &self.panel;
-        format!("[emu] cyd-2432s028r: {} RAMWR, {} pixels, madctl={:#x} colmod={:#x} inverted={} on={} backlight={} bbox={:?}; spi {} bytes to the panel, {} dropped (CS high or off GPIO 14/13); rgb led={:?}; touch {} conversions, {} spi bytes, pen={:?}; gpio events {}",
-                p.frames, p.pixels_written, p.madctl, p.colmod, p.inverted, p.on, self.backlight, p.bbox(), self.spi_bytes, self.spi_dropped, self.led[0],
+        format!("[emu] cyd-2432s028r: {} RAMWR, {} pixels, madctl={:#x} (written {:x?}) gs={} ss={} colmod={:#x} inverted={} on={} backlight={} bbox={:?}; spi {} bytes to the panel, {} dropped (CS high or off GPIO 14/13); rgb led={:?}; touch {} conversions, {} spi bytes, pen={:?}; gpio events {}",
+                p.frames, p.pixels_written, p.madctl, p.madctl_writes, p.gate_reversed, p.source_reversed, p.colmod, p.inverted, p.on, self.backlight, p.bbox(), self.spi_bytes, self.spi_dropped, self.led[0],
                 self.touch.conversions, self.touch_bytes, self.touch.pen, self.gpio_events)
     }
 }
@@ -244,6 +248,29 @@ mod tests {
         for (x, y) in [(0, 0), (319, 239)] { window(&mut b, x, x, y, y); cmd(&mut b, 0x2c, &[0xff, 0xff]); }
         let (_, _, px, _) = b.display().unwrap();
         assert_eq!((px[239], px[319 * 240]), (0xffff, 0xffff), "landscape (0,0) top-right, (319,239) bottom-left");
+    }
+
+    /// LovyanGFX's `Panel_ILI9341` bring-up: B6h `08 C2 27` (GS) and MADCTL 0x08 as rotation 0
+    /// show the picture rotated 180° (openHASP's CYD build); its CYD `offset_rotation = 2`, MADCTL 0xD4 |
+    /// BGR (MY | MX | ML | MH), is upright. SS undoes the column mirror.
+    #[test]
+    fn display_function_control_reverses_the_scans() {
+        let mut b = Cyd2432S028R::new();
+        bring_up(&mut b, 0x08);
+        cmd(&mut b, 0xb6, &[0x08, 0xc2, 0x27]);
+        window(&mut b, 0, 1, 0, 0);
+        cmd(&mut b, 0x2c, &[0xf8, 0x00, 0x07, 0xe0]);
+        let px = b.display().unwrap().2;
+        assert_eq!((px[319 * 240 + 239], px[319 * 240 + 238]), (0xf800, 0x07e0), "MADCTL 0x08 with GS: rotated 180 degrees");
+        cmd(&mut b, 0x2c, &[0, 0, 0, 0]); cmd(&mut b, 0x36, &[0xdc]);
+        window(&mut b, 0, 1, 0, 0);
+        cmd(&mut b, 0x2c, &[0xf8, 0x00, 0x07, 0xe0]);
+        let px = b.display().unwrap().2;
+        assert_eq!((px[0], px[1]), (0xf800, 0x07e0), "MX | MY with GS: upright");
+        cmd(&mut b, 0xb6, &[0x08, 0xa2, 0x27]);
+        let px = b.display().unwrap().2;
+        assert_eq!((px[319 * 240 + 239], px[319 * 240 + 238]), (0xf800, 0x07e0), "SS without GS: MY's flip and MX shown as written");
+        assert!(b.report().contains("(written [8, dc])"), "{}", b.report());
     }
 
     #[test]
