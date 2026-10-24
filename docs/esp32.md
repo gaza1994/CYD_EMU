@@ -118,9 +118,13 @@ pins (CLK 25, MOSI 32, MISO 39, CS 33, IRQ 36). `esp32/src/board/cyd.rs` is the 
 GPIO 15 is low (IO_MUX function 1 and the GPIO matrix both count, so either host works); reads on
 MISO return 0xff (no ILI9341 read commands are modelled).
 
-The glass is the controller's RAM with its columns mirrored: Adafruit_ILI9341, TFT_eSPI and
-LovyanGFX all use MADCTL 0x48 (MX|BGR) as rotation 0, portrait with the connector side at the
-bottom, and 0x28 as rotation 1, so `--tft-png` and the page show what those drivers call upright.
+The glass is the controller's RAM with its columns mirrored: Adafruit_ILI9341 and TFT_eSPI use
+MADCTL 0x48 (MX|BGR) as rotation 0, portrait with the connector side at the bottom, and 0x28 as
+rotation 1, so `--tft-png` and the page show what those drivers call upright. Display Function
+Control (B6h) GS reverses the row scan and SS the column scan: LovyanGFX's `Panel_ILI9341` sends
+GS with MADCTL 0x08 as rotation 0, so its CYD setups use `offset_rotation = 2`, and openHASP's
+`esp32-2432s028r` build is upside down until its display rotation is set to 2 (`config/gui
+{"rotate":2}` on the console). The report lists the MADCTL values written and GS/SS.
 Red and blue are exchanged unless MADCTL's BGR bit is set; INVON shows the inverted colours (the
 TN glass, unlike the IPS ST7789 boards, has no inversion to compensate); DISPOFF and sleep show
 black. The backlight level is reported but does not dim the frame (drivers PWM it through LEDC).
