@@ -1797,7 +1797,7 @@ impl CydLabApp {
                 }
                 ui.end_row();
                 ui.label("Variant");
-                egui::ComboBox::from_id_salt("profile").selected_text(self.profiles.get(&dlg.profile).map(|p| p.name.as_str()).unwrap_or("?")).show_ui(ui, |ui| {
+                egui::ComboBox::from_id_salt("profile").height(600.0).selected_text(self.profiles.get(&dlg.profile).map(|p| p.name.as_str()).unwrap_or("?")).show_ui(ui, |ui| {
                     // Yellow boards first (smallest screen first), then the rest.
                     let mut list: Vec<&Profile> = self.profiles.profiles.values().collect();
                     list.sort_by_key(|p| (!p.engine.board.starts_with("cyd-"), p.id.clone()));
