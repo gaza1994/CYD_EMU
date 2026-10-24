@@ -179,6 +179,16 @@ fn hostfwd_is_repeatable_and_kept_with_wifi() {
 }
 
 #[test]
+fn ap_client_and_ap_fwd_default_to_the_hotspot_gateway() {
+    let o = parse(&["esp32sim".into(), "--ap-client".into(), "ssid=NerdMinerAP,psk=MineYourCoins".into(),
+        "--ap-fwd".into(), "tcp:127.0.0.1:0-:80".into(), "--ap-fwd".into(), "tcp::0-10.0.0.7:23".into()], "esp32");
+    assert_eq!((o.ap_client.as_deref(), o.ap_fwd.len()), (Some("ssid=NerdMinerAP,psk=MineYourCoins"), 2));
+    assert_eq!(ap_fwd_spec(&o.ap_fwd[0]).unwrap().guest_ip, [192, 168, 4, 1]);
+    assert_eq!(ap_fwd_spec(&o.ap_fwd[1]).unwrap().guest_ip, [10, 0, 0, 7]);
+    assert!(ap_fwd_spec("udp::0-:80").is_err());
+}
+
+#[test]
 fn analog_scripts_validate_inputs_and_keep_panel_touch_separate() {
     use esp_soc::ScriptAction;
     let mut m = esp32::machine([0; 6], 4 << 20);

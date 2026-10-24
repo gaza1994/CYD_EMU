@@ -31,6 +31,8 @@ fn help(chip: &str, code: i32) -> ! {
     eprintln!("  --console usb|uart0|both|none   which consoles to print (uart0 shows the ROM and bootloader)");
     eprintln!("  --wifi ssid=…,psk=…   a virtual access point with DHCP, DNS, NTP and NAT to the host network");
     eprintln!("  --hostfwd tcp:H:HP-G:GP  publish a guest TCP port on the host (repeatable; needs --wifi)");
+    eprintln!("  --ap-client ssid=…,psk=…  a phone that joins the guest's own hotspot (SoftAP setup portals; classic ESP32)");
+    eprintln!("  --ap-fwd tcp:H:HP-G:GP  publish a port on the guest's hotspot through the phone (repeatable; G defaults to 192.168.4.1)");
     eprintln!("  --mdns-relay IP|auto  publish the guest's mDNS on the host LAN as IP (with --hostfwd: Home Assistant discovery)");
     eprintln!("  --script F            host actions at emulated times (button presses, touches, serial input, stop)");
     eprintln!("  --tft-png F, --wav F  save the display / the audio at the end of the run");
@@ -170,7 +172,7 @@ pub struct Opts {
     pub flash_octal: bool,
     pub boot: Option<String>, pub flash_mb: Option<usize>, pub psram_mb: Option<usize>,
     pub mac: Option<[u8; 6]>, pub strap: Option<u32>, pub reset_cause: Option<u32>, pub efuse_regs: Option<String>, pub regs_init: Option<String>,
-    pub board: String, pub board_config: Option<String>, pub wifi: Option<String>, pub wifi_nearby: Vec<String>, pub ble: bool, pub ble_full: bool, pub ble_observe: bool, pub ble_scan: bool, pub net: String, pub hostfwd: Vec<String>, pub mdns_relay: Option<String>, pub cam_image: Option<String>, pub cam_stream: Option<String>, pub cam_size: Option<String>, pub cam_fps: f64,
+    pub board: String, pub board_config: Option<String>, pub wifi: Option<String>, pub wifi_nearby: Vec<String>, pub ble: bool, pub ble_full: bool, pub ble_observe: bool, pub ble_scan: bool, pub net: String, pub hostfwd: Vec<String>, pub ap_client: Option<String>, pub ap_fwd: Vec<String>, pub mdns_relay: Option<String>, pub cam_image: Option<String>, pub cam_stream: Option<String>, pub cam_size: Option<String>, pub cam_fps: f64,
     pub spi2_timing: bool, pub measured_te: bool,
     pub max_insns: u64, pub max_seconds: Option<f64>, pub script: Option<String>, pub serial: Option<String>,
     pub console: Option<String>, pub console_prefix: bool, pub realtime: bool, pub web_port: Option<u16>, pub web_dir: Option<String>, pub no_reboot: bool, pub serial_tcp: Option<String>, pub quit_on_stdin_eof: bool,
@@ -221,6 +223,8 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--wifi" => o.wifi = Some(next()),
             "--wifi-nearby" => o.wifi_nearby.push(next()),
             "--hostfwd" => o.hostfwd.push(next()),
+            "--ap-client" => o.ap_client = Some(next()),
+            "--ap-fwd" => o.ap_fwd.push(next()),
             "--mdns-relay" => o.mdns_relay = Some(next()),
             "--ble-scan" => o.ble_scan = true,
             "--ble-observe" => o.ble_observe = true,
@@ -297,6 +301,14 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
     if !o.hostfwd.is_empty() && o.net != "nat" && o.net != "user" { usage_error("--hostfwd requires --net nat"); }
     for spec in &o.hostfwd {
         if let Err(e) = esp_soc::nat::HostFwdSpec::parse(spec) { usage_error(&format!("--hostfwd: {e}")); }
+    }
+    if !o.ap_fwd.is_empty() && o.ap_client.is_none() { usage_error("--ap-fwd requires --ap-client"); }
+    if let Some(spec) = &o.ap_client {
+        if let Err(e) = esp_soc::wifi::phone::PhoneConfig::parse(spec) { usage_error(&format!("--ap-client: {e}")); }
+        if o.chip != "esp32" { usage_error("--ap-client is only wired up on the classic ESP32 so far"); }
+    }
+    for spec in &o.ap_fwd {
+        if let Err(e) = ap_fwd_spec(spec) { usage_error(&format!("--ap-fwd: {e}")); }
     }
     if let Some(ip) = &o.mdns_relay {
         if o.wifi.is_none() || (o.net != "nat" && o.net != "user") { usage_error("--mdns-relay requires --wifi and --net nat"); }
@@ -448,6 +460,29 @@ fn attach_nearby_networks(link: &mut esp_soc::wifi::StationLink, o: &Opts) {
     }
 }
 
+/// `--ap-fwd tcp:H:HP-G:GP`: a `--hostfwd` form whose guest address defaults to ESP-IDF's SoftAP
+/// address, 192.168.4.1 (`esp_netif` default `IP4_ADDR(&ip, 192, 168, 4, 1)`), not the station's.
+fn ap_fwd_spec(spec: &str) -> Result<esp_soc::nat::HostFwdSpec, String> {
+    let mut parsed = esp_soc::nat::HostFwdSpec::parse(spec)?;
+    if spec.rsplit_once('-').is_some_and(|(_, g)| g.starts_with(':')) { parsed.guest_ip = [192, 168, 4, 1]; }
+    Ok(parsed)
+}
+
+/// `--ap-client SPEC` and its `--ap-fwd` ports: the phone that joins the guest's own hotspot.
+fn attach_phone(link: &mut esp_soc::wifi::StationLink, o: &Opts, log: bool) {
+    let Some(spec) = &o.ap_client else { return };
+    let cfg = esp_soc::wifi::phone::PhoneConfig::parse(spec).unwrap_or_else(|e| usage_error(&format!("--ap-client: {e}")));
+    let mut phone = esp_soc::wifi::phone::Phone::new(cfg.clone(), log);
+    for spec in &o.ap_fwd {
+        let parsed = ap_fwd_spec(spec).unwrap_or_else(|e| usage_error(&format!("--ap-fwd: {e}")));
+        let bound = phone.forward(&parsed).unwrap_or_else(|e| usage_error(&format!("--ap-fwd {spec}: {e}")));
+        let g = parsed.guest_ip;
+        eprintln!("[emu] ap-fwd tcp {} -> {}.{}.{}.{}:{} on the device hotspot", bound, g[0], g[1], g[2], g[3], parsed.guest_port);
+    }
+    eprintln!("[emu] phone {} joins {}{}", esp_soc::wifi::mac_str(&phone.mac), cfg.ssid.as_deref().map_or("the first open device hotspot".into(), |s| format!("'{s}'")), if cfg.psk.is_some() { " with a password" } else { "" });
+    link.set_phone(Some(phone));
+}
+
 /// `--wifi SPEC` with `--net`: the virtual access point's configuration and, for `--net nat`,
 /// the NAT to the host, the same for every chip.
 fn wifi_config(spec: &str, nat: bool, net_log: bool, hostfwd: &[String], mdns_relay: Option<&str>) -> (esp_soc::wifi::ApConfig, Option<esp_soc::nat::Nat>) {
@@ -516,6 +551,8 @@ fn setup_esp32(o: &Opts) -> esp32::Machine {
         m.bus.attach_wifi(cfg, nat).unwrap_or_else(|e| { eprintln!("--wifi: {e}"); std::process::exit(2) });
     }
     attach_nearby_networks(&mut m.bus.periph.wifi.link, o);
+    let log = m.bus.debug.has("wifi-frames");
+    attach_phone(&mut m.bus.periph.wifi.link, o, log);
     for (flag, on) in [("--cam-image", o.cam_image.is_some()), ("--psram-mb", o.psram_mb.is_some()), ("--flash-octal", o.flash_octal), ("--efuse-regs", o.efuse_regs.is_some()), ("--regs-init", o.regs_init.is_some()), ("--regstat", o.regstat.is_some())] {
         if on { eprintln!("{} is not available on the classic ESP32", flag); std::process::exit(2); }
     }
