@@ -45,6 +45,10 @@ const WDEV_RND: u32 = 0x3ff7_5144;
 /// hardware clears it, then read the 28-bit clock in 312.5 µs half-slots. Modelled as the cycle
 /// counter at 3.2 kHz with the sample always complete; nothing else of the baseband is.
 const BT_CLKN_SAMPLE: [u32; 2] = [0x3ff7_101c, 0x3ff7_121c];
+/// Fine counters of the same cores (read-only): µs left in the current 625 µs slot, 624 down to 0,
+/// on the native clock's time base. r_rwip_check_wakeup_boundary (0x400558fc) lets the controller
+/// sleep only above 467; a constant 0 kept btdm_controller_task re-posting itself (btdm_slp_err 5).
+const BT_FINECNT: [u32; 2] = [0x3ff7_1020, 0x3ff7_1220];
 /// BLE core version (read-only): r_lld_core_reset (0x40048a9c) asserts it reads 0x0800_0900
 /// (lld.c:289 ASSERT_PARAM otherwise), the literal at 0x40048a94.
 const BLE_VERSION: (u32, u32) = (0x3ff7_1204, 0x0800_0900);
@@ -236,6 +240,8 @@ impl SocBus {
             BLE_VERSION.1
         } else if BT_CLKN_SAMPLE.contains(&a) {
             ((self.cycles as u128 * 3200 / crate::periph::CPU_HZ as u128) as u32) & 0x0fff_ffff
+        } else if BT_FINECNT.contains(&a) {
+            624 - ((self.cycles as u128 * 1_000_000 / crate::periph::CPU_HZ as u128) % 625) as u32
         } else {
             self.periph.read32(a)
         };
@@ -252,7 +258,7 @@ impl SocBus {
             return;
         }
         let a = Self::ahb_to_apb(addr & !3).unwrap_or(addr & !3);
-        if a == WDEV_RND || BT_CLKN_SAMPLE.contains(&a) {
+        if a == WDEV_RND || BT_CLKN_SAMPLE.contains(&a) || BT_FINECNT.contains(&a) {
             return;
         }
         let v = if size == 4 { value } else { merge(self.periph.read32(a), value, addr, size) };
@@ -775,6 +781,12 @@ mod tests {
         }
         b.write32(BLE_VERSION.0, 0).unwrap();
         assert_eq!(b.read32(BLE_VERSION.0), Ok(0x0800_0900));
+        for a in BT_FINECNT {
+            assert_eq!(b.read32(a), Ok(624), "{a:#x}: a slot starts on the second");
+            b.cycles = crate::periph::CPU_HZ + crate::periph::CPU_HZ / 10_000; // +100 µs
+            assert_eq!(b.read32(a), Ok(524));
+            b.cycles = crate::periph::CPU_HZ;
+        }
     }
 
     #[test]
