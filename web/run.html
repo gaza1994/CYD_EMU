@@ -219,7 +219,7 @@ const lcdRaw = document.createElement('canvas');
 let lcdRotation = 0;
 // what the panel header says once a frame has arrived, and the rotation that reads upright for a
 // board's usual firmware (the T-Display is used landscape, MADCTL MV|MX: its top is the glass's right edge)
-const PANEL_TEXT = { 'waveshare-c6-lcd147': 'ST7789 172×320 over SPI2 + GDMA', 'ttgo-tdisplay': 'ST7789 135×240 over VSPI', 'cyd-2432s028r': 'ILI9341 240×320 over HSPI', stopwatch: 'CO5300 468×466 QSPI · CST820 touch' };
+const PANEL_TEXT = { 'waveshare-c6-lcd147': 'ST7789 172×320 over SPI2 + GDMA', 'ttgo-tdisplay': 'ST7789 135×240 over VSPI', 'cyd-2432s028r': 'ILI9341 240×320 over HSPI · XPT2046 touch', stopwatch: 'CO5300 468×466 QSPI · CST820 touch' };
 const PANEL_ROTATE = { 'ttgo-tdisplay': 270 };
 function paintLcd() {
   const c = $('#lcd'), w = lcdRaw.width, h = lcdRaw.height; if (!w || !h) return;

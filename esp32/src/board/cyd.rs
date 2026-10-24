@@ -14,11 +14,16 @@
 //! as well as matrix routes), and bytes whose SCLK/MOSI are on GPIO 14/13 while CS is low reach
 //! the controller from either host; everything else (the TF card on VSPI) is counted and dropped.
 //!
-//! TODO: the XPT2046. Its pins are not on either SPI host's IO_MUX set (drivers bit-bang it or
-//! route VSPI through the matrix); for now T_IRQ (GPIO 36) reads high, not touched, and touch
-//! transactions are dropped with the other off-panel bytes.
-use esp_soc::board::SpiPins;
-use esp_soc::devices::DcsPanel;
+//! The XPT2046 is on pins neither host has in IO_MUX, so drivers either route VSPI to them through
+//! the GPIO matrix (XPT2046_Touchscreen with `SPIClass(VSPI)` in the usual CYD sketches,
+//! MicroPython's `SPI(2, sck=25, ...)`) or bit-bang them (`SoftSPI`): both reach the same
+//! `Xpt2046`, transactions on CLK 25 / MOSI 32 while CS 33 is low, or the GPIO levels themselves,
+//! with DOUT on GPIO 39 driven as a board input. A touch from the page or a `touch x y 0|1` script
+//! action is in glass pixels (240×320 portrait) and becomes raw readings with the calibration the
+//! common CYD sketches carry: on rotation 1 (landscape) they map XPT2046_Touchscreen's x
+//! (channel 001) 200..3700 onto 0..319 and y (channel 101) 240..3800 onto 0..239.
+use esp_soc::board::{BoardEdge, SpiPins, VirtualCycle};
+use esp_soc::devices::{DcsPanel, Xpt2046};
 use esp_soc::BoardModel;
 
 pub const PIN_LCD_SCLK: u8 = 14;
@@ -33,6 +38,11 @@ pub const PIN_LED_B: u8 = 17;
 pub const PIN_LDR: u8 = 34;
 pub const PIN_BOOT: u8 = 0;
 pub const PIN_TOUCH_IRQ: u8 = 36;
+pub const PIN_TOUCH_CLK: u8 = 25;
+pub const PIN_TOUCH_MOSI: u8 = 32;
+pub const PIN_TOUCH_MISO: u8 = 39;
+pub const PIN_TOUCH_CS: u8 = 33;
+const TOUCH_PINS: (u8, u8, u8) = (PIN_TOUCH_CLK, PIN_TOUCH_MOSI, PIN_TOUCH_CS);
 
 pub const LCD_COLS: usize = 240;
 pub const LCD_ROWS: usize = 320;
@@ -75,11 +85,27 @@ pub struct Cyd2432S028R {
     pub gpio_events: u64,
     /// SPI bytes delivered to the controller / dropped (CS high, or not on GPIO 14/13)
     pub spi_bytes: u64, pub spi_dropped: u64,
+    /// the XPT2046 and the bytes it took over hardware SPI
+    pub touch: Xpt2046, pub touch_bytes: u64,
+    cycle: VirtualCycle, edges: Vec<BoardEdge>, irq: bool, dout: bool,
 }
 impl Default for Cyd2432S028R { fn default() -> Self { Self::new() } }
 impl Cyd2432S028R {
     pub fn new() -> Self {
-        Cyd2432S028R { panel: DcsPanel::ili9341(), cs_high: true, backlight: false, led: [[0; 3]], led_updates: 0, gpio_events: 0, spi_bytes: 0, spi_dropped: 0 }
+        Cyd2432S028R { panel: DcsPanel::ili9341(), cs_high: true, backlight: false, led: [[0; 3]], led_updates: 0, gpio_events: 0, spi_bytes: 0, spi_dropped: 0,
+                       touch: Xpt2046::new(), touch_bytes: 0, cycle: 0, edges: Vec::new(), irq: true, dout: false }
+    }
+    /// Glass pixel (portrait, as `display()`) to the controller's raw (X, Y): channel 101 runs
+    /// 3800..240 across the portrait width, channel 001 200..3700 down its height.
+    pub fn touch_raw(x: u16, y: u16) -> (u16, u16) {
+        let (x, y) = (u32::from(x.min(LCD_COLS as u16 - 1)), u32::from(y.min(LCD_ROWS as u16 - 1)));
+        ((3800 - x * 3560 / (LCD_COLS as u32 - 1)) as u16, (200 + y * 3500 / (LCD_ROWS as u32 - 1)) as u16)
+    }
+    /// Queue edges for PENIRQ (GPIO 36) and DOUT (GPIO 39) where the controller changed them.
+    fn sync_touch_pins(&mut self) {
+        let (irq, dout) = (self.touch.irq(), self.touch.dout());
+        if irq != self.irq { self.irq = irq; self.edges.push(BoardEdge { cycle: self.cycle, pin: PIN_TOUCH_IRQ, level: irq }); }
+        if dout != self.dout { self.dout = dout; self.edges.push(BoardEdge { cycle: self.cycle, pin: PIN_TOUCH_MISO, level: dout }); }
     }
     /// Whether a transaction with these routes is on the panel's wires; undecodable routes are
     /// taken as the panel's, as on the T-Display.
@@ -104,12 +130,25 @@ impl BoardModel for Cyd2432S028R {
                 PIN_LED_R => self.set_led(0, level),
                 PIN_LED_G => self.set_led(1, level),
                 PIN_LED_B => self.set_led(2, level),
+                PIN_TOUCH_CLK | PIN_TOUCH_MOSI | PIN_TOUCH_CS => { self.touch.pin(TOUCH_PINS, pin, level); }
                 _ => {}
             }
         }
+        self.sync_touch_pins();
     }
     fn uses_spi_pins(&self) -> bool { true }
     fn spi_transfer_pins(&mut self, _host: u8, pins: SpiPins, tx: &[u8], rx_len: usize) -> Vec<u8> {
+        if pins.sclk & (1 << PIN_TOUCH_CLK) != 0 && pins.mosi & (1 << PIN_TOUCH_MOSI) != 0 {
+            self.touch.select(pins.cs & (1 << PIN_TOUCH_CS) != 0);
+            if !self.touch.selected() { self.spi_dropped += tx.len() as u64; return vec![0; rx_len]; }
+            // full duplex (MOSI and MISO phases together) unless the read phase is the longer one,
+            // which is a half-duplex read clocked after the write
+            let n = if rx_len > tx.len() { tx.len() + rx_len } else { tx.len() };
+            let rx: Vec<u8> = (0..n).map(|i| self.touch.byte(tx.get(i).copied().unwrap_or(0))).collect();
+            self.touch_bytes += n as u64;
+            self.sync_touch_pins();
+            return if rx_len > tx.len() { rx[tx.len()..].to_vec() } else { rx[..rx_len].to_vec() };
+        }
         if !self.cs_high && Self::on_panel_wires(&pins) {
             self.spi_bytes += tx.len() as u64;
             for &b in tx { self.panel.byte(b); }
@@ -119,7 +158,14 @@ impl BoardModel for Cyd2432S028R {
         vec![0xff; rx_len]   // MISO is wired (GPIO 12) but the controller's read commands are not modelled
     }
     fn gpio_events(&self) -> u64 { self.gpio_events }
-    fn input_levels(&self) -> Vec<(u8, bool)> { vec![(PIN_BOOT, true), (PIN_TOUCH_IRQ, true)] }
+    fn input_levels(&self) -> Vec<(u8, bool)> { vec![(PIN_BOOT, true), (PIN_TOUCH_IRQ, self.irq), (PIN_TOUCH_MISO, self.dout)] }
+    fn touch(&mut self, x: u16, y: u16, down: bool) {
+        self.touch.pen = down.then(|| Self::touch_raw(x, y));
+        self.sync_touch_pins();
+    }
+    fn touch_at(&mut self, cycle: VirtualCycle, x: u16, y: u16, down: bool) { self.cycle = self.cycle.max(cycle); self.touch(x, y, down); }
+    fn advance_to(&mut self, cycle: VirtualCycle) { self.cycle = cycle; }
+    fn take_edges(&mut self) -> Vec<BoardEdge> { std::mem::take(&mut self.edges) }
     fn named_pin(&self, name: &str) -> Option<u8> {
         match name { "boot" | "btn1" => Some(PIN_BOOT), "ldr" => Some(PIN_LDR), "touch-irq" => Some(PIN_TOUCH_IRQ), _ => None }
     }
@@ -132,8 +178,9 @@ impl BoardModel for Cyd2432S028R {
     fn leds(&self) -> Option<(&[[u8; 3]], u64)> { Some((&self.led, self.led_updates)) }
     fn report(&self) -> String {
         let p = &self.panel;
-        format!("[emu] cyd-2432s028r: {} RAMWR, {} pixels, madctl={:#x} colmod={:#x} inverted={} on={} backlight={} bbox={:?}; spi {} bytes to the panel, {} dropped (CS high or off GPIO 14/13); rgb led={:?}; gpio events {}",
-                p.frames, p.pixels_written, p.madctl, p.colmod, p.inverted, p.on, self.backlight, p.bbox(), self.spi_bytes, self.spi_dropped, self.led[0], self.gpio_events)
+        format!("[emu] cyd-2432s028r: {} RAMWR, {} pixels, madctl={:#x} colmod={:#x} inverted={} on={} backlight={} bbox={:?}; spi {} bytes to the panel, {} dropped (CS high or off GPIO 14/13); rgb led={:?}; touch {} conversions, {} spi bytes, pen={:?}; gpio events {}",
+                p.frames, p.pixels_written, p.madctl, p.colmod, p.inverted, p.on, self.backlight, p.bbox(), self.spi_bytes, self.spi_dropped, self.led[0],
+                self.touch.conversions, self.touch_bytes, self.touch.pen, self.gpio_events)
     }
 }
 
@@ -234,7 +281,7 @@ mod tests {
         assert_eq!(b.leds(), Some((&[[0, 255, 0]][..], 1)));
         b.gpio_changes(&[(PIN_LED_G, true), (PIN_LED_B, false)]);
         assert_eq!(b.leds(), Some((&[[0, 0, 255]][..], 3)));
-        assert_eq!(b.input_levels(), vec![(PIN_BOOT, true), (PIN_TOUCH_IRQ, true)], "BOOT released, touch IRQ not asserted");
+        assert_eq!(b.input_levels(), vec![(PIN_BOOT, true), (PIN_TOUCH_IRQ, true), (PIN_TOUCH_MISO, false)], "BOOT released, touch IRQ not asserted");
         assert_eq!((b.named_pin("boot"), b.named_pin("ldr"), b.named_pin("touch-irq"), b.named_pin("knob")), (Some(0), Some(34), Some(36), None));
         assert!(b.report().starts_with("[emu] cyd-2432s028r: 0 RAMWR"));
     }
@@ -277,5 +324,36 @@ mod tests {
         assert_eq!(b.periph.spi[0].transfers, 12, "7 commands, 5 parameter blocks on SPI2");
         let report = b.board.report();
         assert!(report.contains("1 RAMWR, 2 pixels, madctl=0x48") && report.contains("backlight=true") && report.contains("spi 21 bytes to the panel, 0 dropped"), "{report}");
+    }
+
+    #[test]
+    fn touch_reads_over_routed_vspi_and_bit_banged_pins() {
+        let mut b = Cyd2432S028R::new();
+        let vspi = SpiPins { sclk: 1 << PIN_TOUCH_CLK, mosi: 1 << PIN_TOUCH_MOSI, miso: Some(PIN_TOUCH_MISO), cs: 1 << PIN_TOUCH_CS };
+        b.touch_at(100, 120, 160, true);
+        assert_eq!(b.take_edges(), vec![BoardEdge { cycle: 100, pin: PIN_TOUCH_IRQ, level: false }], "pressed: PENIRQ falls");
+        let (x, y) = Cyd2432S028R::touch_raw(120, 160);
+        assert_eq!((x, y), (2013, 1955));
+        let rx = b.spi_transfer_pins(3, vspi, &[0xd0, 0, 0], 3);
+        assert_eq!(u16::from_be_bytes([rx[1], rx[2]]) >> 3, x, "full duplex: X behind the control byte");
+        assert_eq!(b.spi_transfer_pins(3, vspi, &[0x90], 2), vec![(y << 3 >> 8) as u8, (y << 3) as u8], "half duplex read after the write");
+        assert_eq!(b.spi_transfer_pins(3, SpiPins { cs: 0, ..vspi }, &[0x90], 2), vec![0; 2], "CS high: dropped");
+        // SoftSPI mode 0 on the same pins: 0x90, then 16 clocks reading DOUT on GPIO 39's edges
+        let mut level = false;
+        let mut clock = |b: &mut Cyd2432S028R, bit: bool| -> bool {
+            b.gpio_changes(&[(PIN_TOUCH_MOSI, bit), (PIN_TOUCH_CLK, true)]);
+            let sample = level;
+            b.gpio_changes(&[(PIN_TOUCH_CLK, false)]);
+            for e in b.take_edges() { if e.pin == PIN_TOUCH_MISO { level = e.level; } }
+            sample
+        };
+        b.gpio_changes(&[(PIN_TOUCH_CS, true)]);
+        b.gpio_changes(&[(PIN_TOUCH_CS, false)]);
+        for i in 0..8 { clock(&mut b, 0x90 & (0x80 >> i) != 0); }
+        let word = (0..16).fold(0u16, |w, _| w << 1 | clock(&mut b, false) as u16);
+        assert_eq!(word >> 3, y);
+        b.touch(0, 0, false);
+        assert!(b.take_edges().iter().any(|e| e.pin == PIN_TOUCH_IRQ && e.level), "released: PENIRQ rises");
+        assert!(b.report().contains("touch 3 conversions, 6 spi bytes, pen=None"), "{}", b.report());
     }
 }

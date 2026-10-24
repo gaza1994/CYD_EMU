@@ -224,7 +224,7 @@ Selected with `--chip esp32 --board ttgo-tdisplay` (alias `tdisplay`); [esp32.md
 | RGB LED | GPIO 4 R, 16 G, 17 B, active low | the page's ring (one LED), digital levels |
 | LDR | GPIO 34 (ADC1 channel 6) | `--adc-raw 34=N` |
 | BOOT button | GPIO 0, active low | `press boot 150` |
-| XPT2046 touch | CLK 25, MOSI 32, MISO 39, CS 33, IRQ 36 | IRQ idles high (not touched) |
+| XPT2046 touch | CLK 25, MOSI 32, MISO 39, CS 33, IRQ 36 | X/Y/Z1/Z2 conversions over VSPI routed through the matrix or bit-banged; page and `touch x y` input become raw readings with the usual CYD calibration (X 3800..240 across, Y 200..3700 down); PENIRQ low while pressed |
 | TF card, speaker, CN1 | SPI3 on 18/19/23/5, GPIO 26 | not modelled |
 
 Selected with `--chip esp32 --board cyd-2432s028r` (alias `cyd`); [esp32.md](esp32.md#the-board---board-cyd-2432s028r).

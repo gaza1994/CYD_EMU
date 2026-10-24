@@ -126,7 +126,22 @@ TN glass, unlike the IPS ST7789 boards, has no inversion to compensate); DISPOFF
 black. The backlight level is reported but does not dim the frame (drivers PWM it through LEDC).
 COLMOD 0x66 (18-bit) is not decoded: the shared `DcsPanel` reads 16-bit pixels.
 
+The XPT2046 (`esp_soc::devices::Xpt2046`) sits on pins neither host has in IO_MUX: a transaction
+whose routes are CLK 25 / MOSI 32 while GPIO 33 is low goes to it byte by byte (VSPI through the
+GPIO matrix, as the usual CYD sketches' `SPIClass(VSPI)` and MicroPython's
+`SPI(2, sck=Pin(25), mosi=Pin(32), miso=Pin(39))`), and GPIO writes on those pins are clocked in
+as SPI mode 0 with DOUT driven onto GPIO 39 (bit-banged drivers, `SoftSPI`). Each result is
+queued behind the bytes still pending, so the overlapped control bytes of XPT2046_Touchscreen and
+TFT_eSPI line up. A transaction with a longer read than write is taken as half duplex (the read
+clocked after the write); otherwise the read is the bytes clocked with the write. A press from the
+page or a `touch x y 1` script action (glass pixels, 240×320 portrait) becomes raw X (channel
+101, 3800..240 across the portrait width), Y (channel 001, 200..3700 down it), Z1 600 and Z2 3400:
+the calibration CYD sketches carry for rotation 1, so `map(p.x, 200, 3700, 0, 320)` lands on the
+touched landscape pixel. PENIRQ (GPIO 36) is low while pressed unless the last control byte
+powered the interrupt down (PD0 = 1).
+
 Checked with official MicroPython v1.29.0 (`ESP32_GENERIC`) and a pure-Python ILI9341 driver on
 `machine.SPI(1)` (HSPI) drawing a test pattern from a LittleFS image at 0x200000, as for the
 T-Display above: the window and pixel writes land where the driver addresses them and the LED
-follows GPIO 4/16/17.
+follows GPIO 4/16/17. With a polling XPT2046 reader on `SPI(2)` and on `SoftSPI`, scripted
+touches at (120,160), (30,280) and (200,60) read back as those pixels.
