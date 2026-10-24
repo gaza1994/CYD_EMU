@@ -80,6 +80,8 @@ pub struct GenericDisplay {
     /// what an I2C touch controller reports
     pub touch_state: Arc<Mutex<TouchState>>,
     cycle: VirtualCycle, edges: Vec<BoardEdge>, irq: bool, dout: bool,
+    /// I2C touch: the UI finger, and a release still owed a pulse once the guest has read the press
+    finger: bool, release_owed: bool,
 }
 impl Default for GenericDisplay { fn default() -> Self { Self::new() } }
 impl GenericDisplay {
@@ -88,7 +90,7 @@ impl GenericDisplay {
     pub fn from_profile(profile: Profile) -> Self {
         let panel = DcsPanel::by_name(&profile.controller).expect("profile controller");
         GenericDisplay { profile, panel, cs_high: true, backlight: false, backlight_duty: None, backlight_changes: 0, led: [[0; 3]], led_updates: 0, gpio_events: 0, spi_bytes: 0, spi_dropped: 0,
-                         touch: Xpt2046::new(), touch_bytes: 0, touch_state: Default::default(), cycle: 0, edges: Vec::new(), irq: true, dout: false }
+                         touch: Xpt2046::new(), touch_bytes: 0, touch_state: Default::default(), cycle: 0, edges: Vec::new(), irq: true, dout: false, finger: false, release_owed: false }
     }
     /// Glass pixel to the XPT2046's raw (X, Y), from the profile's readings at the first and last
     /// pixel; the ESP32-2432S028R's channel 101 runs 3800..240 across the portrait width, channel
@@ -154,6 +156,11 @@ impl GenericDisplay {
         let v = if level == self.profile.led_high { 255 } else { 0 };
         if self.led[0][channel] != v { self.led[0][channel] = v; self.led_updates += 1; }
     }
+    fn int_pulse(&mut self) {
+        if let Touch::I2c { int: Some(pin), .. } = self.profile.touch {
+            self.edges.extend([false, true].map(|level| BoardEdge { cycle: self.cycle, pin, level }));
+        }
+    }
     fn touch_irq_pin(&self) -> Option<u8> {
         match self.profile.touch { Touch::Xpt2046 { irq, .. } => Some(irq), Touch::I2c { int, .. } => int, Touch::None => None }
     }
@@ -207,7 +214,7 @@ impl BoardModel for GenericDisplay {
         let mut v = vec![(self.profile.boot, true)];
         match self.profile.touch {
             Touch::Xpt2046 { irq, miso, .. } => { v.push((irq, self.irq)); v.push((miso, self.dout)); }
-            Touch::I2c { int: Some(int), .. } => v.push((int, !self.touch_state.lock().unwrap().down)),
+            Touch::I2c { int: Some(int), .. } => v.push((int, true)),
             _ => {}
         }
         v
@@ -229,20 +236,28 @@ impl BoardModel for GenericDisplay {
     fn touch(&mut self, x: u16, y: u16, down: bool) {
         match self.profile.touch {
             Touch::Xpt2046 { .. } => { self.touch.pen = down.then(|| self.touch_raw(x, y)); self.sync_touch_pins(); }
-            Touch::I2c { swap_xy, invert_x, invert_y, int, .. } => {
+            Touch::I2c { swap_xy, invert_x, invert_y, .. } => {
                 let (w, h) = (self.profile.width as u16, self.profile.height as u16);
                 let (x, y) = (x.min(w - 1), y.min(h - 1));
                 let (x, y) = (if invert_x { w - 1 - x } else { x }, if invert_y { h - 1 - y } else { y });
                 let (x, y) = if swap_xy { (y, x) } else { (x, y) };
-                let was = self.touch_state.lock().unwrap().down;
-                self.touch_state.lock().unwrap().update(x, y, down);
-                if let Some(pin) = int.filter(|_| was != down) { self.edges.push(BoardEdge { cycle: self.cycle, pin, level: !down }); }
+                let mut t = self.touch_state.lock().unwrap();
+                t.update(x, y, down);
+                self.release_owed = t.release_pending;
+                drop(t);
+                // CST816 / GT911 report each sample (press, move, release) with a short low pulse on INT.
+                if self.finger || down { self.int_pulse(); }
+                self.finger = down;
             }
             Touch::None => {}
         }
     }
     fn touch_at(&mut self, cycle: VirtualCycle, x: u16, y: u16, down: bool) { self.cycle = self.cycle.max(cycle); self.touch(x, y, down); }
-    fn advance_to(&mut self, cycle: VirtualCycle) { self.cycle = cycle; }
+    fn advance_to(&mut self, cycle: VirtualCycle) {
+        self.cycle = cycle;
+        // a tap shorter than the guest's first read: pulse again once the press was seen, to report the release
+        if self.release_owed && self.touch_state.lock().unwrap().seen { self.release_owed = false; self.int_pulse(); }
+    }
     fn take_edges(&mut self) -> Vec<BoardEdge> { std::mem::take(&mut self.edges) }
     fn named_pin(&self, name: &str) -> Option<u8> {
         match name { "boot" | "btn1" => Some(self.profile.boot), "ldr" => self.profile.ldr, "touch-irq" => self.touch_irq_pin(), "backlight" => self.profile.backlight, _ => None }
@@ -522,7 +537,7 @@ mod tests {
         assert_eq!(b.display().unwrap().2[0], !0xf800);
     }
 
-    /// GT911 on I2C (both buses, both addresses), reporting glass pixels; INT falls while pressed.
+    /// GT911 on I2C (both buses, both addresses), reporting glass pixels; INT pulses low per report.
     #[test]
     fn capacitive_boards_report_glass_pixels_over_i2c() {
         let mut b = variant("cyd-3248s035c");
@@ -530,9 +545,21 @@ mod tests {
         assert_eq!(devs.iter().map(|d| (d.0, d.1)).collect::<Vec<_>>(), [(0, 0x5d), (0, 0x14), (1, 0x5d), (1, 0x14)]);
         assert_eq!(b.input_levels(), vec![(0, true), (21, true)]);
         b.touch_at(5, 300, 470, true);
-        assert_eq!(b.take_edges(), vec![BoardEdge { cycle: 5, pin: 21, level: false }]);
+        let pulse = |cycle| vec![BoardEdge { cycle, pin: 21, level: false }, BoardEdge { cycle, pin: 21, level: true }];
+        assert_eq!(b.take_edges(), pulse(5), "a report is a low pulse on INT");
         let t = *b.touch_state.lock().unwrap();
         assert_eq!((t.down, t.x, t.y), (true, 300, 470));
+        b.touch_at(9, 300, 470, false);
+        assert_eq!(b.take_edges(), pulse(9), "so is the release (ESPHome reads on the falling edge)");
+        b.touch_at(12, 300, 470, false);
+        assert!(b.take_edges().is_empty(), "no report while idle");
+        b.advance_to(13);
+        assert!(b.take_edges().is_empty(), "the unseen press holds; nothing owed until the guest reads it");
+        b.touch_state.lock().unwrap().observe();
+        b.advance_to(14);
+        assert_eq!(b.take_edges(), pulse(14), "the press was read: one more pulse reports the release");
+        b.advance_to(15);
+        assert!(b.take_edges().is_empty());
         assert_eq!(b.display().unwrap().0, 320);
         assert_eq!(variant("cyd-2432s024c").i2c_devices().len(), 2, "CST816S at 0x15 on each bus");
     }
