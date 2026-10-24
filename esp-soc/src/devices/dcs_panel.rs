@@ -26,6 +26,8 @@ pub struct DcsPanel {
     /// RAMWR commands seen
     pub frames: u64,
     pub pixels_written: u64,
+    /// pixels whose address fell outside the RAM (dropped, as the datasheet says)
+    pub pixels_out_of_range: u64,
     pub resets: u64,
     /// MADCTL values as written, a repeat of the last one not recorded, the first 16 kept (a
     /// driver that rotates mid-run shows up here; the report prints it)
@@ -38,7 +40,7 @@ impl DcsPanel {
     pub fn new(cols: usize, rows: usize) -> Self {
         DcsPanel { cols, rows, gram: vec![0; cols * rows], madctl: 0, colmod: 0x66, inverted: false, sleeping: true, on: false, dc: false,
                    little_endian: false, ramctrl: false, gate_reversed: false, source_reversed: false, dfc: false, cmd: 0, args: [0; 4], argn: 0, x0: 0, x1: cols as u16 - 1, y0: 0, y1: rows as u16 - 1, xc: 0, yc: 0,
-                   pixel_hi: None, frames: 0, pixels_written: 0, resets: 0, madctl_writes: Vec::new() }
+                   pixel_hi: None, frames: 0, pixels_written: 0, pixels_out_of_range: 0, resets: 0, madctl_writes: Vec::new() }
     }
     /// ST7735: 132 × 162 of RAM behind the 0.96" and 1.8" modules.
     pub fn st7735() -> Self { Self::new(132, 162) }
@@ -95,9 +97,15 @@ impl DcsPanel {
         // MX / MY mirror
         let (mut col, mut row) = (self.xc as usize, self.yc as usize);
         if self.madctl & 0x20 != 0 { std::mem::swap(&mut col, &mut row); }
-        if self.madctl & 0x40 != 0 { col = self.cols - 1 - col.min(self.cols - 1); }
-        if self.madctl & 0x80 != 0 { row = self.rows - 1 - row.min(self.rows - 1); }
-        if col < self.cols && row < self.rows { self.gram[row * self.cols + col] = px; self.pixels_written += 1; }
+        // ILI9341 datasheet 8.2.20/8.2.21: addresses beyond 0xEF/0x13F (0x13F/0xEF with MV) are
+        // ignored, so drop them before mirroring instead of clamping them onto the edge column/row
+        // (the clamp piled a 320-wide MV=0 window's last 80 columns onto RAM column 0).
+        let in_range = col < self.cols && row < self.rows;
+        if in_range {
+            if self.madctl & 0x40 != 0 { col = self.cols - 1 - col; }
+            if self.madctl & 0x80 != 0 { row = self.rows - 1 - row; }
+            self.gram[row * self.cols + col] = px; self.pixels_written += 1;
+        } else { self.pixels_out_of_range += 1; }
         // advance within the window, x fastest, wrapping to the window's origin
         if self.xc >= self.x1 { self.xc = self.x0; if self.yc >= self.y1 { self.yc = self.y0; } else { self.yc += 1; } } else { self.xc += 1; }
     }
@@ -140,6 +148,20 @@ mod tests {
         cmd(&mut p, 0x36, &[0x20]);                       // MV: the column counter walks rows
         cmd(&mut p, 0x2a, &[0, 1, 0, 1]); cmd(&mut p, 0x2b, &[0, 2, 0, 2]); cmd(&mut p, 0x2c, &[0, 9]);
         assert_eq!(p.gram[3 + 2], 9, "row 1, col 2");
+    }
+
+    #[test]
+    fn columns_past_the_ram_are_dropped_not_clamped() {
+        // ESPHome ili9xxx with `dimensions: 320x240` and no transform: MADCTL 0x48 (MX, no MV)
+        // but 320-wide windows. Columns 240..319 must vanish, not pile onto RAM column 0.
+        let mut p = DcsPanel::ili9341();
+        cmd(&mut p, 0x11, &[]); cmd(&mut p, 0x36, &[0x48]); cmd(&mut p, 0x3a, &[0x55]);
+        cmd(&mut p, 0x2a, &[0, 0, 0x01, 0x3f]); cmd(&mut p, 0x2b, &[0, 0, 0, 0]);
+        let data: Vec<u8> = (0..320u16).flat_map(|c| (c + 1).to_be_bytes()).collect();
+        cmd(&mut p, 0x2c, &data);
+        assert_eq!(p.gram[0], 240);               // logical column 239 (value 240) under MX, not 319's 320
+        assert_eq!(p.gram[239], 1);
+        assert_eq!((p.pixels_written, p.pixels_out_of_range), (240, 80));
     }
 
     #[test]
