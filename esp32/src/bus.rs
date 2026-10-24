@@ -233,6 +233,7 @@ impl SocBus {
             return self.mmu[cpu][n];
         }
         let a = Self::ahb_to_apb(addr & !3).unwrap_or(addr & !3);
+        if a & !0xfff == 0x3ff7_1000 { self.periph.bt.advance_to(self.cycles); }
         let w = if a == WDEV_RND {
             self.rng.now = self.cycles as u32;
             self.rng.read(0)
@@ -264,6 +265,7 @@ impl SocBus {
         let v = if size == 4 { value } else { merge(self.periph.read32(a), value, addr, size) };
         let old_enable = self.periph.gpio.gpio.enable;
         if (0x3ff4_8800..=0x3ff4_88ff).contains(&a) { self.periph.adc.now_cycles = self.cycles; }
+        if a & !0xfff == 0x3ff7_1000 { self.periph.bt.advance_to(self.cycles); }
         self.periph.write32(a, v);
         // IDF v5.5.4 esp32/rtc_cntl_reg.h:2017-2039. Only a CRC START write
         // touches RTC memory; no new state or work in reads, ticks or instruction execution.

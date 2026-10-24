@@ -22,6 +22,7 @@ pub(crate) const NUM_SOURCES: usize = 69;
 
 // ESP-IDF v5.5.4 components/soc/esp32/include/soc/interrupts.h:32-86.
 const SRC_WIFI_MAC: usize = 0;
+const SRC_RWBT: usize = 6;
 const SRC_TG0_T0: usize = 14;
 const SRC_TG0_T1: usize = 15;
 const SRC_TG0_WDT: usize = 16;
@@ -708,6 +709,7 @@ pub struct Peripherals {
     pub fe: crate::wifi::FrontEnd,
     pub adc: ClassicAdc,
     pub i2s: [crate::i2s::ClassicI2s; 2],
+    pub bt: crate::bt::BtBaseband,
 }
 
 device_set! { Peripherals; clock: (clock) CPU_HZ, [(ClockDomain::RtcSlow, 1600)];
@@ -723,6 +725,7 @@ device_set! { Peripherals; clock: (clock) CPU_HZ, [(ClockDomain::RtcSlow, 1600)]
     0x6d "I2S1" (i2s[1]) => [33];
     0x46 "FE" (fe) => [];
     0x4e "I2C_MST" (analog) => [];
+    0x71 "BT" (bt) => [SRC_RWBT];
     0x73 "WIFI_MAC" (wifi) => [SRC_WIFI_MAC];
     0x74 "WIFI_MAC" alias (wifi) delta 0x1000 => [];
     0x75 "WIFI_MAC" alias (wifi) delta 0x2000 => [];
@@ -795,6 +798,7 @@ impl Peripherals {
             fe: crate::wifi::FrontEnd::default(),
             adc: ClassicAdc::new(),
             i2s: Default::default(),
+            bt: Default::default(),
         };
         for uart in &mut p.uart { uart.write(0x20, 1 << 27); }
         p.sync_crypto();
@@ -832,6 +836,7 @@ impl Peripherals {
             0x5f => "TIMG0",
             0x60 => "TIMG1",
             0x6e => "UART2",
+            0x71 => "BT",
             _ => "?",
         }
     }
@@ -895,6 +900,8 @@ impl Peripherals {
         }
         // IDF v5.5.4 dport_reg.h:1064,1069: DPORT_CORE_RST_EN_REG bit 2 is DPORT_WIFIMAC_RST.
         if addr == 0x3ff0_00d0 && v & (1 << 2) != 0 { self.wifi.reset(); }
+        // libbtdm_app btdm_lpclk_set_div: DPORT 0x3ff0_00d4 bits 0-11 divide the BT sleep clock.
+        if addr == 0x3ff0_00d4 { self.bt.lp_div = (v & 0xfff) as u64 + 1; }
         if addr == 0x3ff0_00c4 && v & (1 << 11) != 0 {
             self.ledc = ClassicLedc::new();
         }
@@ -933,6 +940,9 @@ impl Peripherals {
     pub fn tick(&mut self, cycles: u64) -> bool {
         let gpio_before = self.gpio.raw_status();
         let mut irq_changed = Dispatch::tick(self, cycles);
+        let bt_before = self.bt.irq_sources();
+        self.bt.advance_to(self.clock.cycles());
+        irq_changed |= bt_before != self.bt.irq_sources();
         let phase = self.apb_phase + cycles * (6 / self.apb_divider());
         self.apb_phase = phase % 6;
         let ticks = phase / 6;
@@ -999,6 +1009,7 @@ impl Peripherals {
     }
     pub fn cycles_until_timer(&self) -> u32 {
         let mut best = self.rtc.next_deadline().map_or(u64::MAX, |t| t.saturating_sub(1) * 1600);
+        if let Some(t) = self.bt.cycles_until_wake() { best = best.min(t); }
         for timer in &self.timg {
             if let Some(t) = timer.next_deadline() {
                 best = best.min(t.saturating_sub(1).saturating_mul(self.apb_divider()));
