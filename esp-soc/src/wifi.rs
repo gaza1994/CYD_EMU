@@ -637,6 +637,28 @@ pub struct StationLink {
     rx_dropped: u64,
     /// relayed frames that were too long or found the relay queue full
     tx_dropped: u64,
+    /// The guest's own hotspots heard on the air without a phone (`announce_hotspot`).
+    heard: Vec<HeardAp>,
+}
+
+/// A hotspot the guest put on the air (its SoftAP's beacon).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeardAp { pub bssid: [u8; 6], pub ssid: String, pub channel: u8, pub secure: bool }
+
+/// The guest hotspot a beacon or probe response announces, if `f` is one with an SSID.
+pub fn heard_ap(f: &[u8], default_channel: u8) -> Option<HeardAp> {
+    if f.len() < 36 || f[0] & 0x0c != 0 || !matches!(f[0] >> 4, 8 | 5) { return None; }
+    let el = ies(f, 36);
+    let ssid = el.iter().find(|(id, _)| *id == 0).map(|(_, d)| String::from_utf8_lossy(d).into_owned()).filter(|s| !s.is_empty())?;
+    let channel = el.iter().find(|(id, d)| *id == 3 && d.len() == 1).map_or(default_channel, |(_, d)| d[0]);
+    Some(HeardAp { bssid: f[10..16].try_into().unwrap(), ssid, channel, secure: u16::from_le_bytes([f[34], f[35]]) & 0x0010 != 0 })
+}
+
+/// The console line for a guest hotspot, the phone's wording (cyd-lab reads the name from it).
+pub fn hotspot_line(h: &HeardAp, was: Option<&str>) -> String {
+    let mut l = format!("[emu] device hotspot: '{}' bssid {} channel {} ({})", h.ssid, mac_str(&h.bssid), h.channel, if h.secure { "WPA2-PSK" } else { "open" });
+    if let Some(w) = was { l.push_str(&format!(", was '{w}'")); }
+    l
 }
 
 /// A receive descriptor's `has_data` bit (word 0 bit 30), the same on the S3, C3 and C6 MACs: the
@@ -722,10 +744,32 @@ impl StationLink {
     /// data goes to the network or the relay.
     pub fn station_tx(&mut self, frame: &[u8], now_us: u64) {
         self.tx_frames += 1;
-        if let Some(p) = &mut self.phone { p.on_guest_tx(frame, now_us); }
+        match &mut self.phone {
+            Some(p) => p.on_guest_tx(frame, now_us),
+            None => { self.announce_hotspot(frame); }
+        }
         let Some(ap) = &mut self.ap else { return };
         let Some(eth) = ap.on_station_tx(frame, now_us).and_then(|data| data_to_eth(&data)) else { return };
         if !self.relay || (eth.len() <= RELAY_FRAME_MAX && self.eth_tx.len() < RELAY_QUEUE) { self.eth_tx.push(eth); } else { self.tx_dropped += 1; }
+    }
+
+    /// Without a phone nobody else reports the guest's own hotspot (setup portals that print
+    /// nothing a tool recognises, e.g. `AP 'CYD-4578' up`), so say so once per network, in the
+    /// phone's words. Returns the line, for tests.
+    fn announce_hotspot(&mut self, frame: &[u8]) -> Option<String> {
+        let h = heard_ap(frame, self.ap.as_ref().map_or(1, |a| a.cfg.channel))?;
+        let line = match self.heard.iter_mut().find(|k| k.bssid == h.bssid) {
+            Some(k) if k.ssid == h.ssid && k.secure == h.secure => { k.channel = h.channel; return None; }
+            Some(k) => { let l = hotspot_line(&h, Some(&k.ssid)); *k = h; l }
+            None => {
+                if self.heard.len() >= 8 { self.heard.remove(0); }
+                let l = hotspot_line(&h, None);
+                self.heard.push(h);
+                l
+            }
+        };
+        eprintln!("{line}");
+        Some(line)
     }
 
     /// True while the last received frame's airtime lasts: no frame is due, whatever the ring holds.

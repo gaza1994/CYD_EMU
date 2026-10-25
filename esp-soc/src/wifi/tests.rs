@@ -569,3 +569,35 @@ fn a_fixed_access_point_records_but_does_not_answer_other_ssids() {
     assert_eq!(ap.wanted, Some(Wanted { ssid: "cyd-lab".into(), secure: None }));
     assert_eq!(ap.cfg.ssid, "esp32sim");
 }
+
+/// A SoftAP beacon from the guest, as `heard_ap` reads it.
+fn guest_beacon(bssid: [u8; 6], ssid: &str, secure: bool, channel: u8) -> Vec<u8> {
+    let mut f = vec![0x80, 0, 0, 0];
+    f.extend_from_slice(&[0xff; 6]); f.extend_from_slice(&bssid); f.extend_from_slice(&bssid); f.extend_from_slice(&[0, 0]);
+    f.extend_from_slice(&[0; 8]); f.extend_from_slice(&100u16.to_le_bytes());
+    f.extend_from_slice(&(0x0001u16 | if secure { 0x10 } else { 0 }).to_le_bytes());
+    f.push(0); f.push(ssid.len() as u8); f.extend_from_slice(ssid.as_bytes());
+    f.extend_from_slice(&[3, 1, channel]);
+    f
+}
+
+#[test]
+fn guest_hotspot_is_announced_once_without_a_phone() {
+    let b = [0x24, 0x6f, 0x28, 0, 0x11, 0x23];
+    let mut l = StationLink::default();
+    l.attach(Some(VirtualAp::new(config(), false)), None);
+    // IDF's default AP first, then the firmware's name on the same radio (CYD Weather Dashboard).
+    assert_eq!(l.announce_hotspot(&guest_beacon(b, "ESP_001123", false, 1)).as_deref(), Some("[emu] device hotspot: 'ESP_001123' bssid 24:6f:28:00:11:23 channel 1 (open)"));
+    assert_eq!(l.announce_hotspot(&guest_beacon(b, "CYD-2211", true, 1)).as_deref(), Some("[emu] device hotspot: 'CYD-2211' bssid 24:6f:28:00:11:23 channel 1 (WPA2-PSK), was 'ESP_001123'"));
+    for _ in 0..5 { assert_eq!(l.announce_hotspot(&guest_beacon(b, "CYD-2211", true, 1)), None); }
+    // Not beacons: the station's own frames, a hidden SSID.
+    assert_eq!(l.announce_hotspot(&station_frame(11 << 4, &[0; 40])), None);
+    assert_eq!(l.announce_hotspot(&guest_beacon([2, 0, 0, 0, 0, 9], "", false, 1)), None);
+    // A guest reboot forgets it, so the next run's hotspot is announced again.
+    let mut l = l.surviving_reboot();
+    assert!(l.announce_hotspot(&guest_beacon(b, "CYD-2211", true, 1)).is_some());
+    // station_tx reaches it; with a phone on the air the phone reports instead.
+    let mut l = StationLink::default();
+    l.station_tx(&guest_beacon(b, "HASP-001122", false, 1), 0);
+    assert_eq!(l.heard.len(), 1);
+}
