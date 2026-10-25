@@ -1,86 +1,59 @@
 name: ci
+# CYD_EMU's checks on every push and pull request: the esp32sim engine's tests at the
+# repository root, and cyd-lab's (its own Cargo workspace in cyd-lab/). Upstream esp32sim's
+# much larger CI (evidence checks, clippy, wasm, Node tests) is esp32sim-ci.yml, run by hand.
 on:
   push:
     branches: ['**']
   pull_request:
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
 jobs:
-  test:
+  engine:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - name: Evidence privacy patterns
-        run: node tools/check-evidence-privacy.mjs
-      - name: Retained x5 receipt contracts
-        run: |
-          node --test docs/evidence/perf-x5-2026-09-22/verify-results.test.mjs
-          node docs/evidence/perf-x5-2026-09-22/verify-results.mjs
-          node --test docs/evidence/perf-x5-2026-09-22/m1-before-after/verify.test.mjs
-          node docs/evidence/perf-x5-2026-09-22/m1-before-after/verify.mjs
-          node --test docs/evidence/perf-x5-2026-09-22/historical-before-after/verify.test.mjs
-          node docs/evidence/perf-x5-2026-09-22/historical-before-after/verify.mjs
-      # Pinned by release and SHA-256 in the script, which is also the cache key: a cached roms/ is
-      # re-verified and costs no download, and nothing here goes through the GitHub API.
+      # Pinned by release and SHA-256 in the script, which is also the cache key.
       - uses: actions/cache@v4
         with:
           path: roms
           key: rom-elfs-${{ hashFiles('tools/fetch-rom-elfs.sh') }}
-      - name: Fetch the ESP32, ESP32-S3, ESP32-C3 and ESP32-C6 mask ROM ELFs
-        run: tools/fetch-rom-elfs.sh roms && ls -la roms/*.elf
-      # The T-Display demo boots the official MicroPython image (MIT, micropython.org, 1.8 MB), pinned
-      # by SHA-256 in the script, cached the same way.
-      - uses: actions/cache@v4
-        with:
-          path: web/wasm/fw/ESP32_GENERIC-20260824-v1.29.0.bin
-          key: micropython-${{ hashFiles('tools/fetch-micropython.sh') }}
-      - name: Fetch the MicroPython ESP32_GENERIC image
-        run: tools/fetch-micropython.sh
-      - name: Build
-        run: cargo build --release --workspace
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Clippy (WASM JIT and differential tests)
-        run: cargo clippy --release --target wasm32-unknown-unknown -p esp32sim-wasm --features jit-tests -- -D warnings
-      - name: Test (hermetic + golden outputs)
-        run: ESP32SIM_ROM_DIR=$PWD/roms cargo test --release --workspace -- --include-ignored --skip external_
-      - name: Virtual-quantum scheduler (native opt-in)
-        run: ESP32SIM_VQ_NATIVE=1 cargo test --release -p esp32s3 --test machine --test virtual_stops
-      - name: Build the wasm module
-        run: tools/wasm-build.sh
-      - name: Production WASM sections (no DWARF, profile names retained)
-        run: node tools/check-wasm-sections.mjs web/wasm/esp32sim.wasm
-      - name: Test the wasm module (the real build, under Node, through the page's manifests)
-        run: ESP32SIM_ROM_DIR=$PWD/roms node tools/wasm-test.mjs hello c3-hello c6-hello c6-energy-scan c6-contiki c6-contiki-net c6-rpl-net panel tdisplay-prices
-      - name: Timing and BLE observation ABI (real wasm exports)
-        run: |
-          node wasm/tests/timing-api.mjs web/wasm/esp32sim.wasm
-          node wasm/tests/ble-api.mjs web/wasm/esp32sim.wasm web/wasm/fw/public roms/esp32c3_rev3_rom.elf
-          node wasm/tests/ble-connection.mjs web/wasm/esp32sim.wasm web/wasm/fw/public roms/esp32c3_rev3_rom.elf
-      - name: Worker pacing, channel and experiment tests
-        run: |
-          node tools/worker-pacing-test.mjs
-          node tools/worker-channel-test.mjs
-          node --test tools/touch-input-test.mjs
-          node --test tools/stopwatch-ui-test.mjs
-      - name: Browser benchmark verdict, configuration and receipt tests
-        run: |
-          node --test tools/wasm-build-policy.test.mjs
-          node --test tools/browser-benchmark/*.test.mjs
-          python3 -m unittest discover -s tools/browser-benchmark -p 'test_*.py'
-      - name: Differential tests for generated WASM blocks
-        run: tools/wasm-jit-test.sh
-      - name: Compile WASM profiling features with production flags
-        run: |
-          . ./tools/wasm-rustflags.sh
-          cargo build --release --target wasm32-unknown-unknown -p esp32sim-wasm --features jit-profile,cpu-profile
-  native-aarch64:
-    runs-on: ubuntu-24.04-arm
+      - name: Fetch the mask ROM ELFs (Apache-2.0, espressif/esp-rom-elfs; not committed)
+        run: tools/fetch-rom-elfs.sh roms
+      - name: Test the engine
+        run: ESP32SIM_ROM_DIR=$PWD/roms cargo test --release --locked --workspace
+  cyd-lab:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cyd-lab
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Native AArch64 core and JIT memory tests
-        run: cargo test --release -p xtensa-lx7
+        with:
+          workspaces: cyd-lab
+      - name: Test cyd-lab
+        run: cargo test --locked
+  windows-cross:
+    # The release zip's build: catches Windows-only compile errors on every push.
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cyd-lab
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cyd-lab
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64
+      - name: Check cyd-lab for Windows
+        run: cargo check --locked --bins --target x86_64-pc-windows-gnu

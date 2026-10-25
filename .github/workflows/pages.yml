@@ -4,9 +4,8 @@ name: pages
 # local checkout needs: the mask ROM ELFs (Apache-2.0, espressif/esp-rom-elfs), xterm.js for the
 # Terminal tab (MIT, pinned by version and hash) and the Linux-on-esp32-S3 flash image (GPL-3.0,
 # svermigo/Linux-on-esp32-S3, pinned by commit and hash).
+# Manual only in CYD_EMU: enable GitHub Pages (Settings > Pages > GitHub Actions) first.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 permissions:
   contents: read

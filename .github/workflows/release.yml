@@ -1,84 +1,119 @@
 name: release
-# Pushing a v* tag builds the release assets and attaches them to the maintainer's draft release
-# for that tag (created before the push, so the release is attributed to a person); the notes and
-# the Latest flag stay manual.
-# workflow_dispatch rebuilds the assets for a tag that already exists.
+# Builds the Windows release zip, cyd-lab-windows-x64.zip: cyd-lab.exe, esp32sim.exe (this
+# repository's engine), the Arduino tools and example, README-QUICKSTART.txt and LICENSES/.
+# Cross-built on Linux for x86_64-pc-windows-gnu with a static CRT, the same recipe as the
+# hand-built zips, then smoke-run on a real Windows runner.
+#
+# Actions > release > Run workflow: the zip as a build artifact.
+# Push a tag like v1.0.0: the zip is also attached to that tag's GitHub Release.
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
-    inputs:
-      tag:
-        description: an existing v* tag to build assets for
-        required: true
 permissions:
-  contents: write
+  contents: read
+env:
+  TARGET: x86_64-pc-windows-gnu
+  ZIP: cyd-lab-windows-x64.zip
+  CARGO_TERM_COLOR: always
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            platform: macos-arm64
-          - runner: ubuntu-24.04
-            platform: linux-x86_64
-          - runner: ubuntu-24.04-arm
-            platform: linux-arm64
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
       - uses: Swatinem/rust-cache@v2
-      # A tag that disagrees with the workspace version would ship mislabelled binaries.
-      - name: The tag and the workspace version agree
+        with:
+          key: ${{ env.TARGET }}
+          workspaces: |
+            .
+            cyd-lab
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+      - name: Build the engine (esp32sim.exe, static CRT)
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cargo build --release --locked -p esp32sim --bin esp32sim --target "$TARGET"
+      - name: Build cyd-lab (cyd-lab.exe, discovery, monitor; static CRT via cyd-lab/.cargo/config.toml)
+        working-directory: cyd-lab
+        run: cargo build --release --locked --bins --target "$TARGET"
+      - name: Check DLL imports (Windows system DLLs only)
         run: |
-          tag='${{ inputs.tag || github.ref_name }}'
-          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          test "$tag" = "v$version" || { echo "tag $tag does not match workspace version $version"; exit 1; }
-      - name: Build
-        run: cargo build --release --workspace
-      - name: Package
+          bad=0
+          for exe in "target/$TARGET/release/esp32sim.exe" "cyd-lab/target/$TARGET/release/"cyd-lab*.exe; do
+            dlls=$(x86_64-w64-mingw32-objdump -p "$exe" | sed -n 's/.*DLL Name: //p' | tr '[:upper:]' '[:lower:]' | sort -u | tr '\n' ' ')
+            echo "$exe -> $dlls"
+            for d in $dlls; do
+              case $d in libgcc*|libwinpthread*|libstdc*|vcruntime*|msvcp*) echo "::error::$exe imports $d"; bad=1 ;; esac
+            done
+          done
+          exit $bad
+      - name: Package the zip
         run: |
-          tag='${{ inputs.tag || github.ref_name }}'
-          dir="esp32sim-${tag#v}-${{ matrix.platform }}"
-          mkdir -p "dist/$dir"
-          mkdir -p "dist/$dir/docs" "dist/$dir/tools"
-          cp target/release/esp32sim target/release/esp32sim-c3 target/release/esp32sim-c6 LICENSE README.md "dist/$dir/"
-          cp docs/quick-start.md docs/getting-started.md docs/cli.md "dist/$dir/docs/"
-          cp tools/fetch-rom-elfs.sh "dist/$dir/tools/"
-          tar -czf "dist/$dir.tar.gz" -C dist "$dir"
-          tar -tzf "dist/$dir.tar.gz"
+          python3 cyd-lab/tools/package_windows.py --target "$TARGET" \
+            --bin-dir "cyd-lab/target/$TARGET/release" \
+            --engine "target/$TARGET/release/esp32sim.exe" --engine-src . \
+            --strip x86_64-w64-mingw32-strip --out "release/$ZIP"
+      - name: Check the zip's contents
+        run: |
+          unzip -Z1 "release/$ZIP" > contents.txt
+          for f in cyd-lab/cyd-lab.exe cyd-lab/esp32sim.exe cyd-lab/README-QUICKSTART.txt \
+                   cyd-lab/arduino/tools/cyd-lab-discovery.exe cyd-lab/arduino/tools/cyd-lab-monitor.exe \
+                   cyd-lab/LICENSES/esp32sim-LICENSE.txt; do
+            grep -qx "$f" contents.txt || { echo "::error::$f missing from the zip"; exit 1; }
+          done
+          grep -q '^cyd-lab/arduino/examples/' contents.txt || { echo "::error::no Arduino examples in the zip"; exit 1; }
+          sha256sum "release/$ZIP" | tee "release/$ZIP.sha256"
+          ls -l release
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.platform }}
-          path: dist/*.tar.gz
-  publish:
+          name: cyd-lab-windows-x64
+          path: |
+            release/${{ env.ZIP }}
+            release/${{ env.ZIP }}.sha256
+          if-no-files-found: error
+
+  smoke:
+    # The exes start on real Windows (the build above never runs them).
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: dist
-          merge-multiple: true
-      - name: Checksums
+          name: cyd-lab-windows-x64
+      - name: Run esp32sim.exe and the Arduino discovery tool
         run: |
-          tag='${{ inputs.tag || github.ref_name }}'
-          cd dist && sha256sum *.tar.gz | tee "esp32sim-${tag#v}-SHA256SUMS.txt"
-      # The maintainer creates the (draft) release before pushing the tag, so the release is
-      # attributed to a person and not to github-actions; this job only attaches the assets.
-      - name: Attach the assets to the maintainer's release
+          unzip -q "$ZIP"
+          ./cyd-lab/esp32sim.exe --help > /dev/null
+          ./cyd-lab/esp32sim.exe --list-boards | grep -q cyd-2432s028r
+          printf 'HELLO 1 "ci"\nQUIT\n' | ./cyd-lab/arduino/tools/cyd-lab-discovery.exe | grep -q '"hello"'
+
+  publish:
+    # Tag pushes only: attach the zip to the tag's GitHub Release (created if it doesn't exist).
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: cyd-lab-windows-x64
+      - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
         run: |
-          tag='${{ inputs.tag || github.ref_name }}'
-          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft >/dev/null 2>&1; then
-            echo "::error::no release for $tag yet. Create the draft first, as CONTRIBUTING.md says:"
-            echo "::error::  gh release create $tag --draft --target <merge commit> --title 'esp32sim ${tag#v}' --notes-file notes.md"
-            echo "::error::then rerun this workflow (workflow_dispatch with tag=$tag)."
-            exit 1
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" "$ZIP" "$ZIP.sha256" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            pre=; case $TAG in *-*) pre=--prerelease ;; esac
+            notes="Windows x64 build of cyd-lab with the esp32sim engine: unzip cyd-lab-windows-x64.zip and run cyd-lab.exe (SHA-256 in the .sha256 file). CYD_EMU releases start at v1.0.0; esp32sim's upstream v0.x tags are not part of this repository."
+            gh release create "$TAG" "$ZIP" "$ZIP.sha256" $pre --verify-tag --generate-notes --notes "$notes" \
+              --title "cyd-lab $TAG" --repo "$GITHUB_REPOSITORY"
           fi
-          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber dist/*.tar.gz dist/*SHA256SUMS.txt
-          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
