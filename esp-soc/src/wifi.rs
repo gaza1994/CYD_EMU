@@ -38,32 +38,90 @@ pub fn is_beacon(f: &[u8]) -> bool { f.len() >= 2 && f[0] & 0x0c == 0 && (f[0] >
 /// RSN information element advertised in beacons and echoed in handshake message 3: WPA2-PSK, CCMP.
 pub const RSN_IE: &[u8] = &[48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0];
 
+/// `--wifi`: the access point's SSID (1 to 32 bytes, any characters), BSSID, channel and WPA2
+/// passphrase (open without one). With `any` the SSID is empty until the station asks for one
+/// (`VirtualAp::on_wanted`).
 #[derive(Clone, Debug)]
-pub struct ApConfig { pub ssid: String, pub bssid: [u8; 6], pub channel: u8, pub psk: Option<String> }
+pub struct ApConfig { pub ssid: String, pub bssid: [u8; 6], pub channel: u8, pub psk: Option<String>, pub any: bool }
+
+/// A `key=value,...` spec's entries: `\,` is a comma inside a value and `\\` a backslash.
+pub fn split_spec(spec: &str) -> Vec<String> {
+    let (mut out, mut cur, mut it) = (Vec::new(), String::new(), spec.chars());
+    while let Some(c) = it.next() {
+        match c {
+            '\\' => match it.next() { Some(n @ (',' | '\\')) => cur.push(n), Some(n) => { cur.push('\\'); cur.push(n); } None => cur.push('\\') },
+            ',' => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
 
 impl ApConfig {
     /// Parse the shared CLI/browser AP configuration. Unknown keys are errors so a
-    /// misspelled passphrase option cannot silently configure an open network.
+    /// misspelled passphrase option cannot silently configure an open network. `any` or
+    /// `ssid=*` is match-any; an empty `psk=` is open; a passphrase is 8 to 63 bytes, or 64
+    /// hexadecimal digits for the PMK itself (IEEE 802.11-2020 J.4.1).
     pub fn parse(spec: &str) -> Result<Self, String> {
         let mut cfg = Self {
-            ssid: "esp32sim".into(), bssid: [0x02, 0x53, 0x49, 0x4d, 0x00, 0x01], channel: 6, psk: None,
+            ssid: "esp32sim".into(), bssid: [0x02, 0x53, 0x49, 0x4d, 0x00, 0x01], channel: 6, psk: None, any: false,
         };
         if spec.is_empty() { return Ok(cfg); }
-        for entry in spec.split(',') {
+        let mut named = false;
+        for entry in split_spec(spec) {
+            if entry == "any" { cfg.any = true; continue; }
             let (key, value) = entry.split_once('=')
                 .ok_or_else(|| format!("invalid WiFi option '{entry}': expected key=value"))?;
             match key {
-                "ssid" => cfg.ssid = value.to_string(),
+                "ssid" if value == "*" => cfg.any = true,
+                "ssid" => { cfg.ssid = value.to_string(); named = true; }
                 "chan" | "channel" | "ch" => {
                     cfg.channel = value.parse::<u8>().ok().filter(|n| (1..=14).contains(n))
                         .ok_or_else(|| format!("invalid WiFi channel '{value}': expected 1 through 14"))?;
                 }
-                "psk" | "password" | "pass" => cfg.psk = Some(value.to_string()),
+                "psk" | "password" | "pass" => cfg.psk = (!value.is_empty()).then(|| value.to_string()),
                 "bssid" => cfg.bssid = parse_bssid(value)?,
                 _ => return Err(format!("unknown WiFi option '{key}'")),
             }
         }
+        if cfg.any {
+            if named { return Err("WiFi 'any' (or ssid=*) takes the SSID the firmware asks for: give no other ssid".into()); }
+            cfg.ssid.clear();
+        } else if !(1..=32).contains(&cfg.ssid.len()) {
+            return Err(format!("invalid WiFi ssid '{}': expected 1 to 32 bytes, got {}", cfg.ssid, cfg.ssid.len()));
+        }
+        if let Some(p) = &cfg.psk {
+            if !((8..=63).contains(&p.len()) || (p.len() == 64 && p.bytes().all(|b| b.is_ascii_hexdigit()))) {
+                return Err(format!("invalid WiFi psk: expected 8 to 63 bytes or 64 hexadecimal digits, got {} bytes", p.len()));
+            }
+        }
         Ok(cfg)
+    }
+}
+
+/// The PMK for `psk` on `ssid`: PBKDF2-SHA1 of the passphrase, or 64 hexadecimal digits taken as is.
+pub fn pmk(psk: &str, ssid: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 32];
+    if psk.len() == 64 && psk.bytes().all(|b| b.is_ascii_hexdigit()) {
+        for (i, b) in k.iter_mut().enumerate() { *b = u8::from_str_radix(&psk[2 * i..2 * i + 2], 16).unwrap_or(0); }
+    } else { k.copy_from_slice(&esp_periph::crypto::pbkdf2_sha1(psk.as_bytes(), ssid, 4096, 32)); }
+    k
+}
+
+/// The BSSID a match-any access point serves WPA2 on, next to the open one at `bssid`.
+pub fn secure_bssid(bssid: &[u8; 6]) -> [u8; 6] { let mut b = *bssid; b[5] ^= 0x80; b }
+
+/// The network the station asked for: its SSID (from a directed probe request, or the one it
+/// authenticated to) and, once it picked a BSSID, whether that one was secured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Wanted { pub ssid: String, pub secure: Option<bool> }
+
+impl Wanted {
+    /// `{"t":"wifi_wanted","ssid":..,"secure":true|false|null,"served":true|false}`: `served` is
+    /// whether this access point can complete the join.
+    pub fn json(&self, served: bool) -> String {
+        format!("{{\"t\":\"wifi_wanted\",\"ssid\":\"{}\",\"secure\":{},\"served\":{served}}}", crate::web::json_escape(&self.ssid), self.secure.map_or("null".into(), |b| b.to_string()))
     }
 }
 
@@ -177,45 +235,90 @@ pub struct VirtualAp {
     pub pn: u64,                  // CCMP packet number for frames we send
     /// The networks around, beacon-only and not joinable (`set_beacons`).
     pub beacons: Vec<BeaconAp>,
+    /// The BSSID of the station's session and whether it is WPA2: the configured ones, or in
+    /// match-any mode the profile (`profiles`) the station authenticated to.
+    pub bssid: [u8; 6],
+    pub secure: bool,
+    /// The network the station last asked for (`on_wanted`), for the web channel's `wifi_wanted`.
+    pub wanted: Option<Wanted>,
 }
 
 impl VirtualAp {
     pub fn new(cfg: ApConfig, log: bool) -> Self {
-        let mut wpa = Wpa::default();
-        if let Some(psk) = &cfg.psk {
-            wpa.pmk.copy_from_slice(&esp_periph::crypto::pbkdf2_sha1(psk.as_bytes(), cfg.ssid.as_bytes(), 4096, 32));
-            // deterministic nonces/GTK: the emulator must replay identically run to run
-            let seed = esp_periph::crypto::sha1(&[&wpa.pmk[..], &cfg.bssid[..]].concat());
-            for i in 0..32 { wpa.anonce[i] = seed[i % 20] ^ (i as u8); }
-            for i in 0..16 { wpa.gtk[i] = seed[(i + 3) % 20] ^ 0x5a; }
+        let (bssid, secure) = (cfg.bssid, cfg.psk.is_some());
+        let mut ap = VirtualAp { cfg, wpa: Wpa::default(), state: StaState::Idle, sta: [0; 6], aid: 1, next_beacon_us: 100_000, beacon_interval_us: 102_400, seq: 0,
+                    queue: Vec::new(), pn: 0, log, stats: (0, 0, 0), beacons: Vec::new(), bssid, secure, wanted: None };
+        ap.derive_keys();
+        ap
+    }
+    /// The PMK for the configured passphrase on the current SSID, and the nonce and GTK from it.
+    fn derive_keys(&mut self) {
+        let Some(psk) = &self.cfg.psk else { return };
+        self.wpa.pmk = pmk(psk, self.cfg.ssid.as_bytes());
+        // deterministic nonces/GTK: the emulator must replay identically run to run
+        let seed = esp_periph::crypto::sha1(&[&self.wpa.pmk[..], &self.cfg.bssid[..]].concat());
+        for i in 0..32 { self.wpa.anonce[i] = seed[i % 20] ^ (i as u8); }
+        for i in 0..16 { self.wpa.gtk[i] = seed[(i + 3) % 20] ^ 0x5a; }
+    }
+    /// The BSSIDs this access point is on the air as, each with whether it is WPA2: the
+    /// configured one; in match-any mode, once there is an SSID, the configured one open and
+    /// `secure_bssid` with WPA2, so a station that wants an open network takes the first and one
+    /// that wants WPA2 (IDF's auth-mode threshold leaves the open one out) the second.
+    pub fn profiles(&self) -> Vec<([u8; 6], bool)> {
+        if !self.cfg.any { return vec![(self.cfg.bssid, self.cfg.psk.is_some())]; }
+        if self.cfg.ssid.is_empty() { return Vec::new(); }
+        vec![(self.cfg.bssid, false), (secure_bssid(&self.cfg.bssid), true)]
+    }
+    /// The profile a frame to `a1` is for: the broadcast address means the first.
+    fn profile(&self, a1: &[u8]) -> Option<([u8; 6], bool)> {
+        self.profiles().into_iter().find(|p| a1 == p.0 || a1 == [0xff; 6])
+    }
+    /// Whether a join to a profile with `secure` can complete: open always, WPA2 with a passphrase.
+    pub fn serves(&self, secure: bool) -> bool { !secure || self.cfg.psk.is_some() }
+    /// The station asked for `ssid` in a probe request. Record it; in match-any mode, with no
+    /// station joined and no network around by that name, take it as this access point's SSID.
+    fn on_wanted(&mut self, ssid: &[u8]) {
+        let name = String::from_utf8_lossy(ssid).into_owned();
+        if self.wanted.as_ref().is_some_and(|w| w.ssid == name) || self.beacons.iter().any(|b| b.ssid.as_bytes() == ssid) { return; }
+        self.wanted = Some(Wanted { ssid: name.clone(), secure: None });
+        if !self.cfg.any {
+            if self.cfg.ssid != name { eprintln!("[emu] wifi: the firmware is looking for '{name}', but the access point is '{}': use --wifi ssid={name}[,psk=PASS] or --wifi any", self.cfg.ssid); }
+            return;
         }
-        VirtualAp { cfg, wpa, state: StaState::Idle, sta: [0; 6], aid: 1, next_beacon_us: 100_000, beacon_interval_us: 102_400, seq: 0,
-                    queue: Vec::new(), pn: 0, log, stats: (0, 0, 0), beacons: Vec::new() }
+        if self.state != StaState::Idle || self.cfg.ssid == name { return; }
+        if std::str::from_utf8(ssid).is_err() { eprintln!("[emu] wifi: the firmware is looking for a network whose SSID is not UTF-8 ({ssid:02x?}); match-any cannot serve it"); return; }
+        self.cfg.ssid = name;
+        self.derive_keys();
+        eprintln!("[emu] wifi: the firmware is looking for '{}': the match-any access point now serves it, open as {} and WPA2 as {}{}", self.cfg.ssid, mac_str(&self.cfg.bssid), mac_str(&secure_bssid(&self.cfg.bssid)),
+                  if self.cfg.psk.is_some() { " with the given psk" } else { " (no psk given: a WPA2 join will be refused)" });
     }
     fn hdr(&mut self, fc: u16, a1: &[u8; 6], a3: &[u8; 6]) -> Vec<u8> {
+        let bssid = self.bssid;
+        self.hdr_as(fc, a1, &bssid, a3)
+    }
+    fn hdr_as(&mut self, fc: u16, a1: &[u8; 6], a2: &[u8; 6], a3: &[u8; 6]) -> Vec<u8> {
         let mut f = Vec::with_capacity(128);
         f.extend_from_slice(&fc.to_le_bytes()); f.extend_from_slice(&[0, 0]);   // fc, duration
-        f.extend_from_slice(a1); f.extend_from_slice(&self.cfg.bssid); f.extend_from_slice(a3);
+        f.extend_from_slice(a1); f.extend_from_slice(a2); f.extend_from_slice(a3);
         f.extend_from_slice(&(self.seq << 4).to_le_bytes()); self.seq = self.seq.wrapping_add(1);
         f
     }
-    fn capability(&self) -> u16 { 0x0001 | if self.cfg.psk.is_some() { 0x0010 } else { 0 } | 0x0400 }   // ESS, privacy, short slot
-    fn common_ies(&self, f: &mut Vec<u8>) {
+    fn capability(secure: bool) -> u16 { 0x0001 | if secure { 0x0010 } else { 0 } | 0x0400 }   // ESS, privacy, short slot
+    fn common_ies(&self, f: &mut Vec<u8>, secure: bool) {
         f.push(0); f.push(self.cfg.ssid.len() as u8); f.extend_from_slice(self.cfg.ssid.as_bytes());
         f.extend_from_slice(&[1, 8, 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24]);      // supported rates 1 2 5.5 11 (basic) 6 9 12 18
         f.extend_from_slice(&[3, 1, self.cfg.channel]);                                     // DS parameter set
         f.extend_from_slice(&[5, 4, 0, 1, 0, 0]);                                           // TIM
         f.extend_from_slice(&[7, 6, b'S', b'E', b' ', 1, 13, 20]);                          // country
         f.extend_from_slice(&[50, 4, 0x30, 0x48, 0x60, 0x6c]);                              // extended rates 24 36 48 54
-        if self.cfg.psk.is_some() { f.extend_from_slice(RSN_IE); }                          // RSN: WPA2-PSK, CCMP
+        if secure { f.extend_from_slice(RSN_IE); }                                          // RSN: WPA2-PSK, CCMP
     }
-    fn beacon_like(&mut self, subtype: u16, dst: &[u8; 6], now_us: u64) -> Vec<u8> {
-        let bssid = self.cfg.bssid;
-        let mut f = self.hdr(subtype << 4, dst, &bssid);
+    fn beacon_like(&mut self, subtype: u16, dst: &[u8; 6], now_us: u64, (bssid, secure): ([u8; 6], bool)) -> Vec<u8> {
+        let mut f = self.hdr_as(subtype << 4, dst, &bssid, &bssid);
         f.extend_from_slice(&now_us.to_le_bytes());                                         // timestamp
         f.extend_from_slice(&100u16.to_le_bytes());                                          // beacon interval (TU)
-        f.extend_from_slice(&self.capability().to_le_bytes());
-        self.common_ies(&mut f);
+        f.extend_from_slice(&Self::capability(secure).to_le_bytes());
+        self.common_ies(&mut f, secure);
         f
     }
     /// A probe response from a network around, as its own BSSID: the fixed fields (timestamp,
@@ -243,10 +346,12 @@ impl VirtualAp {
     /// descriptor (`rssi` and `channel` of `wifi_pkt_rx_ctrl_t`, IDF v5.5.5
     /// components/esp_wifi/include/local/esp_wifi_types_native.h:36 and :59-60; v4.4.8
     /// components/esp_wifi/include/esp_wifi_types.h:387 and :408-409): a network around's own for
-    /// a frame from its BSSID, this access point's channel and -40 dBm otherwise.
+    /// a frame from its BSSID, this access point's channel and -40 dBm otherwise (-46 dBm for
+    /// match-any's WPA2 profile, so a station that takes either prefers the open one).
     pub fn rx_meta(&self, frame: &[u8]) -> (u8, i8) {
         if frame.len() >= 16 {
             if let Some(b) = self.beacons.iter().find(|b| frame[10..16] == b.bssid) { return (b.channel, b.rssi); }
+            if self.cfg.any && frame[10..16] == secure_bssid(&self.cfg.bssid) { return (self.cfg.channel, -46); }
         }
         (self.cfg.channel, -40)
     }
@@ -264,8 +369,10 @@ impl VirtualAp {
         if now_us >= self.next_beacon_us && !mgmt_pending {
             self.next_beacon_us += self.beacon_interval_us;
             if self.next_beacon_us <= now_us { self.next_beacon_us = now_us + self.beacon_interval_us; }
-            let b = self.beacon_like(8, &[0xff; 6], now_us); self.stats.0 += 1;
-            self.queue.push(AirFrame { at_us: now_us, frame: b });
+            for p in self.profiles() {
+                let b = self.beacon_like(8, &[0xff; 6], now_us, p); self.stats.0 += 1;
+                self.queue.push(AirFrame { at_us: now_us, frame: b });
+            }
         }
         let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.queue).into_iter().partition(|a| a.at_us <= now_us);
         self.queue = later;
@@ -277,15 +384,18 @@ impl VirtualAp {
         let fc = u16::from_le_bytes([f[0], f[1]]);
         let (ty, st) = ((fc >> 2) & 3, (fc >> 4) & 0xf);
         let mut a2 = [0u8; 6]; a2.copy_from_slice(&f[10..16]);
-        let to_us = |a1: &[u8]| a1 == [0xff; 6] || a1 == self.cfg.bssid;
         match (ty, st) {
             (0, 4) => {                                                                      // probe request: for us or wildcard?
-                let ssid_ok = ies(f, 24).iter().any(|(id, d)| *id == 0 && (d.is_empty() || *d == self.cfg.ssid.as_bytes()));
-                if ssid_ok && to_us(&f[4..10]) { let r = self.beacon_like(5, &a2, now_us); self.stats.1 += 1; self.send(now_us + 1500, r); }
+                let asked: Vec<Vec<u8>> = ies(f, 24).into_iter().filter(|(id, _)| *id == 0).map(|(_, d)| d.to_vec()).collect();
+                if let Some(s) = asked.iter().find(|s| !s.is_empty()) { self.on_wanted(&s.clone()); }
+                let ssid_ok = asked.iter().any(|d| d.is_empty() || *d == self.cfg.ssid.as_bytes());
+                for (i, p) in self.profiles().into_iter().enumerate() {
+                    if !ssid_ok || !(f[4..10] == [0xff; 6] || f[4..10] == p.0) { continue; }
+                    let r = self.beacon_like(5, &a2, now_us, p); self.stats.1 += 1; self.send(now_us + 1500 + 300 * i as u64, r);
+                }
                 // the networks around answer a wildcard probe, or one for their SSID, sent to the
                 // broadcast address or their own with a wildcard BSSID or their own (IEEE
                 // 802.11-2020 11.1.4.3.4)
-                let asked: Vec<Vec<u8>> = ies(f, 24).into_iter().filter(|(id, _)| *id == 0).map(|(_, d)| d.to_vec()).collect();
                 let addressed = |b: &BeaconAp| [&f[4..10], &f[16..22]].iter().all(|a| *a == [0xff; 6] || *a == b.bssid);
                 let around: Vec<BeaconAp> = self.beacons.iter()
                     .filter(|b| addressed(b) && asked.iter().any(|s| s.is_empty() || *s == b.ssid.as_bytes())).cloned().collect();
@@ -294,31 +404,45 @@ impl VirtualAp {
                     self.send(now_us + 1900 + 400 * i as u64, r);
                 }
             }
-            (0, 11) if f.len() >= 30 && to_us(&f[4..10]) => {                                // authentication (open system)
+            (0, 11) if f.len() >= 30 && self.profile(&f[4..10]).is_some() => {              // authentication (open system)
                 let (alg, seq) = (u16::from_le_bytes([f[24], f[25]]), u16::from_le_bytes([f[26], f[27]]));
                 if self.log { eprintln!("[wifi] station AUTH req alg={} seq={} status={} hex={:02x?}", alg, seq, u16::from_le_bytes([f[28],f[29]]), f); }
+                let Some((bssid, secure)) = self.profile(&f[4..10]) else { return None };
                 if alg == 0 && seq == 1 {
+                    // the station picked a profile: now its security is known
+                    let w = Some(Wanted { ssid: self.cfg.ssid.clone(), secure: Some(secure) });
+                    let news = self.wanted != w;
+                    self.wanted = w;
+                    if !self.serves(secure) {
+                        if news { eprintln!("[emu] wifi: the firmware wants '{}' as a WPA2 network; give its passphrase with --wifi ssid=*,psk=PASS (or ssid={},psk=PASS). Refusing the join", self.cfg.ssid, self.cfg.ssid); }
+                        let mut r = self.hdr_as(11 << 4, &a2, &bssid, &bssid);
+                        r.extend_from_slice(&[0, 0, 2, 0, 1, 0]);                            // open, seq 2, status 1: unspecified failure
+                        self.send(now_us + 300, r);
+                        return None;
+                    }
+                    if (bssid, secure) != (self.bssid, self.secure) { self.wpa.state = WpaState::Idle; }
+                    (self.bssid, self.secure) = (bssid, secure);
                     self.sta = a2; self.state = StaState::Authenticated;
-                    let mut r = self.hdr(11 << 4, &a2, &self.cfg.bssid.clone());
+                    let mut r = self.hdr(11 << 4, &a2, &bssid);
                     r.extend_from_slice(&[0, 0, 2, 0, 0, 0]);                                // open, seq 2, status success
                     self.send(now_us + 300, r);
                 }
             }
-            (0, 0) | (0, 2) if to_us(&f[4..10]) && self.state != StaState::Idle => {         // (re)association request
+            (0, 0) | (0, 2) if f[4..10] == self.bssid && self.state != StaState::Idle => {   // (re)association request
                 self.state = StaState::Associated;
-                let mut r = self.hdr(1 << 4, &a2, &self.cfg.bssid.clone());
-                r.extend_from_slice(&self.capability().to_le_bytes()); r.extend_from_slice(&[0, 0]); r.extend_from_slice(&(0xc000 | self.aid).to_le_bytes());
+                let mut r = self.hdr(1 << 4, &a2, &self.bssid.clone());
+                r.extend_from_slice(&Self::capability(self.secure).to_le_bytes()); r.extend_from_slice(&[0, 0]); r.extend_from_slice(&(0xc000 | self.aid).to_le_bytes());
                 r.extend_from_slice(&[1, 8, 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24]); r.extend_from_slice(&[50, 4, 0x30, 0x48, 0x60, 0x6c]);
                 self.send(now_us + 300, r);
-                if self.cfg.psk.is_some() {                       // WPA2: start the four-way handshake
+                if self.secure {                                  // WPA2: start the four-way handshake
                     self.wpa.replay += 1;
                     let m1 = self.eapol(0x008a, self.wpa.anonce, &[], None);
                     self.send(now_us + 30_000, m1);
                     self.wpa.state = WpaState::AwaitingMessage2;
                 }
             }
-            (0, 12) | (0, 10) if to_us(&f[4..10]) => { self.state = StaState::Idle; }
-            (2, _) if self.state == StaState::Associated && f[4..10] == self.cfg.bssid => {  // data to the DS
+            (0, 12) | (0, 10) if self.profile(&f[4..10]).is_some() => { self.state = StaState::Idle; }
+            (2, _) if self.state == StaState::Associated && f[4..10] == self.bssid => {  // data to the DS
                 if st == 4 || st == 12 { return None; }                                       // null frames (power save)
                 let hdr = if st & 8 != 0 { 26 } else { 24 };
                 // Protected frame: the MAC would have encrypted in place, so the descriptor holds
@@ -344,7 +468,7 @@ impl VirtualAp {
     /// Build an EAPOL-Key frame (802.1X over LLC/SNAP in an 802.11 data frame from the DS).
     fn eapol(&mut self, key_info: u16, nonce: [u8; 32], key_data: &[u8], mic_key: Option<&[u8]>) -> Vec<u8> {
         let body = eapol_key(key_info, self.wpa.replay, nonce, key_data, mic_key);
-        let sta = self.sta; let bssid = self.cfg.bssid;
+        let sta = self.sta; let bssid = self.bssid;
         let mut f = self.hdr(0x0208, &sta, &bssid);                      // data, from-DS
         f[16..22].copy_from_slice(&bssid);
         f.extend_from_slice(&[0xaa, 0xaa, 0x03, 0, 0, 0, 0x88, 0x8e]);
@@ -367,7 +491,7 @@ impl VirtualAp {
         if !secure && self.wpa.state == WpaState::AwaitingMessage2 {
             // message 2: take the SNonce and derive the pairwise key
             let mut snonce = [0u8; 32]; snonce.copy_from_slice(&body[17..49]);
-            let (aa, spa) = (self.cfg.bssid, self.sta);
+            let (aa, spa) = (self.bssid, self.sta);
             let (lo_mac, hi_mac) = if aa <= spa { (aa, spa) } else { (spa, aa) };
             let (an, sn) = (self.wpa.anonce, snonce);
             let (lo_n, hi_n) = if an <= sn { (an, sn) } else { (sn, an) };
@@ -412,7 +536,7 @@ impl VirtualAp {
     pub fn data_from_ds(&mut self, eth: &[u8]) -> Option<Vec<u8>> {
         if self.state != StaState::Associated || eth.len() < 14 { return None; }
         let mut dst = [0u8; 6]; dst.copy_from_slice(&eth[0..6]); let mut src = [0u8; 6]; src.copy_from_slice(&eth[6..12]);
-        let bssid = self.cfg.bssid;
+        let bssid = self.bssid;
         // Once the keys are installed the frame must look encrypted: protected bit, CCMP header and
         // room for the MIC. The payload stays in the clear — as far as firmware is concerned the MAC
         // decrypted it in place.

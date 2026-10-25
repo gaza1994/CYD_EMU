@@ -30,6 +30,7 @@ fn help(chip: &str, code: i32) -> ! {
     eprintln!("  --max-seconds S       stop after S emulated seconds (always give one: the run returns)");
     eprintln!("  --console usb|uart0|both|none   which consoles to print (uart0 shows the ROM and bootloader)");
     eprintln!("  --wifi ssid=…,psk=…   a virtual access point with DHCP, DNS, NTP and NAT to the host network");
+    eprintln!("                        (no psk: open; any SSID or passphrase, \\, for a comma; `any` or ssid=*: the SSID the firmware asks for)");
     eprintln!("  --hostfwd tcp:H:HP-G:GP  publish a guest TCP port on the host (repeatable; needs --wifi)");
     eprintln!("  --ap-client ssid=…,psk=…  a phone that joins the guest's own hotspot (SoftAP setup portals; classic ESP32)");
     eprintln!("  --ap-fwd tcp:H:HP-G:GP  publish a port on the guest's hotspot through the phone (repeatable; G defaults to 192.168.4.1)");
@@ -483,7 +484,11 @@ fn attach_phone(link: &mut esp_soc::wifi::StationLink, o: &Opts, log: bool) {
 /// the NAT to the host, the same for every chip.
 fn wifi_config(spec: &str, nat: bool, net_log: bool, hostfwd: &[String], mdns_relay: Option<&str>) -> (esp_soc::wifi::ApConfig, Option<esp_soc::nat::Nat>) {
     let cfg = esp_soc::wifi::ApConfig::parse(spec).unwrap_or_else(|e| { eprintln!("--wifi: {e}"); std::process::exit(2) });
-    eprintln!("[emu] virtual AP '{}' bssid {} channel {} ({})", cfg.ssid, esp_soc::wifi::mac_str(&cfg.bssid), cfg.channel, if cfg.psk.is_some() { "WPA2-PSK" } else { "open" });
+    if cfg.any {
+        eprintln!("[emu] virtual AP: match-any, the SSID the firmware asks for, bssid {} channel {} (open, and WPA2-PSK {})", esp_soc::wifi::mac_str(&cfg.bssid), cfg.channel, if cfg.psk.is_some() { "with the given psk" } else { "refused: no psk" });
+    } else {
+        eprintln!("[emu] virtual AP '{}' bssid {} channel {} ({})", cfg.ssid, esp_soc::wifi::mac_str(&cfg.bssid), cfg.channel, if cfg.psk.is_some() { "WPA2-PSK" } else { "open" });
+    }
     let mut nat = nat.then(|| esp_soc::nat::Nat::new(net_log));
     if let Some(nat) = &mut nat {
         eprintln!("[emu] NAT to the host network enabled (DNS via {}.{}.{}.{})", nat.resolver[0], nat.resolver[1], nat.resolver[2], nat.resolver[3]);

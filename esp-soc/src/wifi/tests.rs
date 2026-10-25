@@ -1,7 +1,7 @@
 use super::*;
 
 fn config() -> ApConfig {
-    ApConfig { ssid: "esp32sim".into(), bssid: [2, 0x53, 0x49, 0x4d, 0, 1], channel: 6, psk: None }
+    ApConfig { ssid: "esp32sim".into(), bssid: [2, 0x53, 0x49, 0x4d, 0, 1], channel: 6, psk: None, any: false }
 }
 
 fn station_frame(fc: u16, payload: &[u8]) -> Vec<u8> {
@@ -143,11 +143,11 @@ fn ap_configuration_keeps_defaults_and_recognizes_aliases() {
     assert!(cfg.psk.is_none());
     for channel in ["chan", "channel", "ch"] {
         for psk in ["psk", "password", "pass"] {
-            let spec = format!("ssid=test,{channel}=11,{psk}=s=ecret,bssid=02:ab:CD:00:12:ff");
+            let spec = format!("ssid=test,{channel}=11,{psk}=s=ecret!,bssid=02:ab:CD:00:12:ff");
             let cfg = ApConfig::parse(&spec).unwrap();
             assert_eq!(cfg.ssid, "test");
             assert_eq!(cfg.channel, 11);
-            assert_eq!(cfg.psk.as_deref(), Some("s=ecret"));
+            assert_eq!(cfg.psk.as_deref(), Some("s=ecret!"));
             assert_eq!(cfg.bssid, [2, 0xab, 0xcd, 0, 0x12, 0xff]);
         }
     }

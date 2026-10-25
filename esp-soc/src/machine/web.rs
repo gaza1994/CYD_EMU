@@ -100,6 +100,9 @@ impl<S: Soc> Machine<S> {
             w.send_text(&format!("{{\"t\":\"ap_status\",\"bound\":null,\"phone\":{ap}}}"));
             self.ws.ap_sent = ap;
         }
+        // the network the firmware asks for, on every change (`--wifi any` takes it as its SSID)
+        let wanted = self.bus.station_link().and_then(|l| l.ap()).and_then(|ap| ap.wanted.as_ref().map(|w| w.json(w.secure.is_none_or(|s| ap.serves(s)) && (ap.cfg.any || w.ssid == ap.cfg.ssid))));
+        if let Some(j) = wanted.filter(|j| *j != self.ws.wanted_sent) { w.send_text(&j); self.ws.wanted_sent = j; }
         // clients of forwarded ports, both networks, as connect/disconnect events
         let fwd: Vec<(&'static str, crate::nat::FwdClient)> = self.bus.station_link().map_or(Vec::new(), |l| {
             let host = l.net().and_then(|n| n.nat.as_ref()).map_or(Vec::new(), |n| n.forward_clients());
@@ -125,6 +128,7 @@ impl<S: Soc> Machine<S> {
             if let Some((leds, _)) = board.leds() { hello.push(frame(1, format!("{{\"t\":\"ring\",\"leds\":[{}]}}", leds_json(leds)).as_bytes())); }
             for (id, leds, _) in board.led_grids() { hello.push(frame(1, format!("{{\"t\":\"grid\",\"id\":\"{}\",\"leds\":[{}]}}", id, leds_json(leds)).as_bytes())); }
             for (i, e) in self.ws.fwd_sent.iter().enumerate() { hello.push(frame(1, fwd_event("connect", e.0, &e.1, count(&self.ws.fwd_sent[..=i], e)).as_bytes())); }
+            if !self.ws.wanted_sent.is_empty() { hello.push(frame(1, self.ws.wanted_sent.as_bytes())); }
             if !self.ws.ap_sent.is_empty() { hello.push(frame(1, format!("{{\"t\":\"ap_status\",\"bound\":null,\"phone\":{}}}", self.ws.ap_sent).as_bytes())); }
             w.set_hello(hello);
         }
