@@ -1440,9 +1440,41 @@ pub struct CydLabApp {
     catalog_note: String,
     catalog_job: Option<std::sync::mpsc::Receiver<Result<crate::catalog::Catalog, String>>>,
     thumbs: std::collections::HashMap<String, TextureHandle>,
+    /// The window has been checked against the monitor once (see `fit_window_to_monitor`).
+    window_fitted: bool,
 }
 
 impl CydLabApp {
+    /// Once, when the monitor size is known: shrink and re-centre a window that does not fit
+    /// the screen with room for a taskbar (eframe clamps only to the whole monitor, and a
+    /// remembered size can come from a bigger screen).
+    fn fit_window_to_monitor(&mut self, ctx: &egui::Context) {
+        if self.window_fitted {
+            return;
+        }
+        let (monitor, outer, inner, maximized) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.monitor_size, v.outer_rect, v.inner_rect, v.maximized.unwrap_or(false) || v.fullscreen.unwrap_or(false))
+        });
+        let (Some(monitor), Some(inner)) = (monitor, inner) else {
+            if ctx.cumulative_frame_nr() > 30 {
+                self.window_fitted = true; // never reported (some Wayland setups): leave it
+            }
+            return;
+        };
+        self.window_fitted = true;
+        if maximized || monitor.x < 100.0 || monitor.y < 100.0 {
+            return;
+        }
+        let outer = outer.unwrap_or(inner);
+        let frame = outer.size() - inner.size(); // title bar and borders
+        if let Some(size) = fit_size(inner.size(), frame, monitor) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            let pos = ((monitor - (size + frame) - egui::vec2(0.0, TASKBAR_ROOM)) * 0.5).max(egui::Vec2::ZERO);
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos.to_pos2()));
+        }
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Paths) -> CydLabApp {
         let ctx = cc.egui_ctx.clone();
         let waker: Waker = Arc::new(move || ctx.request_repaint());
@@ -1473,6 +1505,7 @@ impl CydLabApp {
         let (catalog, catalog_note) = crate::catalog::load(&paths.root, &settings.catalog);
         let catalog_note = catalog_note.unwrap_or_default();
         let mut app = CydLabApp {
+            window_fitted: false,
             paths,
             settings,
             settings_draft: None,
@@ -4386,6 +4419,7 @@ fn status_of(s: RunState, chip: ChipStatus) -> (Color32, &'static str) {
 impl eframe::App for CydLabApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.fit_window_to_monitor(&ctx);
         self.poll_backends(&ctx);
         self.poll_rom();
         for i in 0..self.devices.len() {
@@ -4475,9 +4509,26 @@ impl eframe::App for CydLabApp {
         }
     }
 
+    /// Window size and position are saved (eframe, `window.ron`); egui's own memory is
+    /// not, so collapsed sections and scroll offsets start fresh.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop_all();
     }
+}
+
+/// Height kept free for a taskbar or dock when fitting the window to the monitor.
+const TASKBAR_ROOM: f32 = 64.0;
+
+/// The inner size that makes a window fit `monitor` (all in points) with room for a taskbar,
+/// or None when it already fits.
+fn fit_size(inner: Vec2, frame: Vec2, monitor: Vec2) -> Option<Vec2> {
+    let room = monitor - frame - egui::vec2(16.0, TASKBAR_ROOM + 16.0);
+    let fit = inner.min(room).max(egui::vec2(800.0, 500.0).min(room));
+    (fit.x < inner.x - 0.5 || fit.y < inner.y - 0.5).then_some(fit)
 }
 
 /// How long the finished checklist shows "All set" before folding into one line.
@@ -4568,6 +4619,19 @@ mod tests {
         assert_eq!(short_board_name("ESP32-2432S028R (two USB)"), "2432S028R two USB");
         assert_eq!(short_board_name("TTGO T-Display (test)"), "TTGO T-Display test");
         assert_eq!(short_board_name("Plain board"), "Plain board");
+    }
+
+    #[test]
+    fn window_fits_the_monitor() {
+        let f = egui::vec2(16.0, 39.0);
+        // 1400x900 fits a 1080p screen with a taskbar.
+        assert_eq!(fit_size(egui::vec2(1400.0, 900.0), f, egui::vec2(1920.0, 1080.0)), None);
+        // A 1366x768 laptop: shrunk to fit, taskbar room kept.
+        let s = fit_size(egui::vec2(1400.0, 900.0), f, egui::vec2(1366.0, 768.0)).unwrap();
+        assert!(s.x + f.x <= 1366.0 && s.y + f.y + TASKBAR_ROOM <= 768.0, "{s:?}");
+        // 1080p at 150% scaling is 1280x720 points.
+        let s = fit_size(egui::vec2(1400.0, 900.0), f, egui::vec2(1280.0, 720.0)).unwrap();
+        assert!(s.y + f.y + TASKBAR_ROOM <= 720.0 && s.x >= 800.0, "{s:?}");
     }
 
     #[test]

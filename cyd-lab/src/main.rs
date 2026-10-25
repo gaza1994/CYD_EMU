@@ -41,15 +41,21 @@ fn main() -> eframe::Result {
             std::process::exit(1);
         }
     };
-    let options = |renderer: eframe::Renderer| eframe::NativeOptions {
+    let options = |renderer: eframe::Renderer, paths: &app::Paths| eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("cyd-lab — emulated Cheap Yellow Display boards")
-            .with_inner_size([1180.0, 760.0])
+            // Fits a 1080p screen with a taskbar (screen, checklist and console side by side);
+            // smaller screens are fitted on the first frame. The last size and position are
+            // remembered in window.ron in the data folder.
+            .with_inner_size([1400.0, 900.0])
             .with_min_inner_size([800.0, 500.0]),
+        // Centred the first time only (eframe's centring would override a remembered position).
+        centered: !paths.root.join("window.ron").exists(),
+        persistence_path: Some(paths.root.join("window.ron")),
         renderer,
         ..Default::default()
     };
-    let run = |renderer, paths: app::Paths| eframe::run_native("cyd-lab", options(renderer), Box::new(move |cc| Ok(Box::new(app::CydLabApp::new(cc, paths)))));
+    let run = |renderer, paths: app::Paths| eframe::run_native("cyd-lab", options(renderer, &paths), Box::new(move |cc| Ok(Box::new(app::CydLabApp::new(cc, paths)))));
     #[cfg(windows)]
     {
         // DirectX 12 (or WARP) first; plain OpenGL if that cannot start.
