@@ -518,7 +518,14 @@ struct DeviceView {
     dev: Device,
     backend: Box<dyn Backend>,
     console: VecDeque<(Stream, String)>,
+    /// Lines dropped off the front of `console`: gives each line a stable id, so a text
+    /// selection stays on its line while new output arrives.
+    console_dropped: u64,
+    /// `console.log` in the device folder.
+    console_log: crate::consolelog::ConsoleLog,
     autoscroll: bool,
+    /// Autoscroll held last frame (text selected or being selected in the console).
+    console_held: bool,
     /// BOOT checkbox (latched). The momentary BOOT button ORs into this.
     boot_latched: bool,
     /// GPIO0 level last sent over the live link (BOOT pressed).
@@ -933,10 +940,14 @@ enum WebMsg {
 impl DeviceView {
     fn new(dev: Device, waker: Waker) -> DeviceView {
         let flash_blank = flash_is_blank(&dev.flash_path());
+        let console_log = crate::consolelog::ConsoleLog::new(&dev.dir);
         DeviceView {
             dev,
             backend: Box::new(ProcessBackend::new(waker)),
             console: VecDeque::new(),
+            console_dropped: 0,
+            console_log,
+            console_held: false,
             autoscroll: true,
             boot_latched: false,
             boot_pin_low: false,
@@ -1213,9 +1224,6 @@ impl DeviceView {
     }
 
     fn log(&mut self, stream: Stream, line: String) {
-        if self.console.len() >= CONSOLE_LINES {
-            self.console.pop_front();
-        }
         let line = strip_ansi(&line);
         if stream != Stream::Lab {
             if let Some(c) = crate::network::api_client_connected(&line) {
@@ -1240,11 +1248,26 @@ impl DeviceView {
             }
             if self.wifi_watch.banner != before {
                 if let Some(b) = self.wifi_watch.banner.clone() {
-                    self.console.push_back((Stream::Lab, format!("[cyd-lab] {b}")));
+                    self.push_line(Stream::Lab, format!("[cyd-lab] {b}"));
                 }
             }
         }
+        self.push_line(stream, line);
+    }
+
+    fn push_line(&mut self, stream: Stream, line: String) {
+        self.console_log.line(&line);
+        if self.console.len() >= CONSOLE_LINES {
+            self.console.pop_front();
+            self.console_dropped += 1;
+        }
         self.console.push_back((stream, line));
+    }
+
+    /// Clear the on-screen console (the log file keeps everything).
+    fn dropped_before_clear(&mut self) {
+        self.console_dropped += self.console.len() as u64;
+        self.console.clear();
     }
 
     fn lab(&mut self, msg: impl Into<String>) {
@@ -1732,6 +1755,7 @@ impl CydLabApp {
         });
         let hotspot_ok = self.engine_features().ap_client;
         let d = &mut self.devices[i];
+        d.console_log.line(&format!("----- power on{} {} -----", if boot_held { " (download mode)" } else { "" }, crate::consolelog::now_stamp()));
         d.improv = ImprovUi::default();
         d.hotspot_ssids.clear();
         d.ap.new_run();
@@ -2501,6 +2525,8 @@ impl CydLabApp {
                 let mut d = self.devices.remove(i);
                 d.web_job = None;
                 d.pending_flash = None;
+                // Windows can't remove a folder with an open file in it.
+                d.console_log.close();
                 match power_off_and_delete(&self.store, d.backend.as_mut(), &mut d.ap.proxy, &d.dev) {
                     Ok(()) => {
                         self.status = format!("Deleted {}", d.dev.meta.name);
@@ -3806,15 +3832,24 @@ impl CydLabApp {
         let wifi_defaults = self.settings.wifi.clone();
         let d = &mut self.devices[i];
         let mut send = false;
+        let mut jump_to_end = false;
         ui.horizontal(|ui| {
             ui.label(RichText::new("Console (UART0)").strong());
-            ui.checkbox(&mut d.autoscroll, "autoscroll");
-            if ui.small_button("Clear").clicked() {
-                d.console.clear();
+            if ui.checkbox(&mut d.autoscroll, "autoscroll").changed() && d.autoscroll {
+                jump_to_end = true;
             }
-            if ui.small_button("Copy").clicked() {
+            if ui.small_button("Clear").on_hover_text("Clears the console here (console.log in the device folder keeps it).").clicked() {
+                d.dropped_before_clear();
+            }
+            if ui.small_button("Copy").on_hover_text("Copy the whole console to the clipboard.\nOr select lines with the mouse and press Ctrl+C.").clicked() {
                 let text = d.console.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
                 ui.ctx().copy_text(text);
+                self.status = format!("{}: copied {} console lines", d.dev.meta.name, d.console.len());
+            }
+            if ui.small_button("Open log folder").on_hover_text(format!("The full console is also written to {} (about 2 MB, plus one {} backup).", d.console_log.path().display(), crate::consolelog::OLD_NAME)).clicked() {
+                if let Err(e) = crate::consolelog::open_folder(&d.dev.dir) {
+                    self.status = format!("could not open {}: {e}", d.dev.dir.display());
+                }
             }
             if let Some(cmd) = d.backend.last_command() {
                 ui.small_button("Command line").on_hover_text(format!("{}\n\nClick to copy (includes the Wi-Fi password).", crate::engine::mask_secrets(&cmd))).clicked().then(|| ui.ctx().copy_text(cmd));
@@ -3854,25 +3889,47 @@ impl CydLabApp {
         // Reserve room for the serial input row below the log so it never falls off the window.
         let input_h = ui.spacing().interact_size.y + 2.0 * ui.spacing().item_spacing.y + 8.0;
         let log_h = (ui.available_height() - input_h - 8.0).max(80.0);
-        egui::Frame::new().fill(Color32::from_gray(16)).inner_margin(4.0).show(ui, |ui| {
+        // Selecting text holds autoscroll, so the lines don't run away under the mouse; it
+        // resumes (back at the end) once the selection is cleared.
+        let selecting = ui.ctx().plugin_opt::<egui::text_selection::LabelSelectionState>().is_some_and(|p| p.lock().has_selection());
+        let console_id = ui.make_persistent_id(("console-area", &d.dev.id));
+        // (Not nested: reading memory inside `input` would deadlock on the context lock.)
+        let last_rect = ui.ctx().data(|m| m.get_temp::<egui::Rect>(console_id));
+        let pressing = ui.input(|inp| inp.pointer.primary_down() && inp.pointer.press_origin().zip(last_rect).is_some_and(|(p, r)| r.contains(p)));
+        let held = selecting || pressing;
+        if d.console_held && !held && d.autoscroll {
+            jump_to_end = true;
+        }
+        d.console_held = held;
+        let frame = egui::Frame::new().fill(Color32::from_gray(16)).inner_margin(4.0).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            egui::ScrollArea::both()
+            let mut area = egui::ScrollArea::both()
                 .id_salt(("console", &d.dev.id))
                 .auto_shrink(false)
                 .max_height(log_h)
                 .min_scrolled_height(log_h)
-                .stick_to_bottom(d.autoscroll)
-                .show_rows(ui, row_h, d.console.len(), |ui, range| {
-                    for (s, line) in d.console.range(range) {
-                        let color = match s {
-                            Stream::Stdout => Color32::from_gray(220),
-                            Stream::Stderr => Color32::from_rgb(230, 170, 90),
-                            Stream::Lab => Color32::from_rgb(120, 170, 240),
-                        };
-                        ui.label(RichText::new(line).monospace().color(color));
-                    }
-                });
+                // Dragging selects text; the wheel and scroll bars scroll.
+                .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR | egui::scroll_area::ScrollSource::MOUSE_WHEEL)
+                .stick_to_bottom(d.autoscroll && !held);
+            if jump_to_end {
+                area = area.vertical_scroll_offset(f32::MAX);
+            }
+            let first = d.console_dropped;
+            area.show_rows(ui, row_h, d.console.len(), |ui, range| {
+                for (k, (s, line)) in d.console.range(range.clone()).enumerate() {
+                    let color = match s {
+                        Stream::Stdout => Color32::from_gray(220),
+                        Stream::Stderr => Color32::from_rgb(230, 170, 90),
+                        Stream::Lab => Color32::from_rgb(120, 170, 240),
+                    };
+                    // Id by line number, not row position, so a selection stays on its text.
+                    ui.push_id(first + (range.start + k) as u64, |ui| {
+                        ui.add(egui::Label::new(RichText::new(line).monospace().color(color)).selectable(true).extend());
+                    });
+                }
+            });
         });
+        ui.ctx().data_mut(|m| m.insert_temp(console_id, frame.response.rect));
         ui.horizontal(|ui| {
             let r = ui.add_enabled(d.link_up, egui::TextEdit::singleline(&mut d.serial_input).desired_width(ui.available_width() - 60.0).hint_text("type a line for UART0 RX (needs live link)"));
             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {

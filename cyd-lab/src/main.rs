@@ -19,6 +19,7 @@ mod catalog;
 mod catalog_assets;
 mod arduino_setup;
 mod combridge;
+mod consolelog;
 mod device;
 mod engine;
 mod firmware;
