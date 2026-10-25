@@ -808,6 +808,11 @@ impl DeviceView {
             if was_on {
                 self.wifi_watch.begin_rejoin(Instant::now());
             }
+            // What Improv said was about the old network.
+            self.improv.state = None;
+            self.improv.outcome = None;
+            self.improv.error = None;
+            self.improv.url = None;
             self.lab(format!("Wi-Fi updated to {what}, the firmware will reconnect (no power cycle)."));
             self.wifi_live_note = Some((Instant::now(), "Wi-Fi updated, the firmware will reconnect".into(), true));
         }
