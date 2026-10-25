@@ -23,10 +23,43 @@ adopts whatever you give it. The AP is WPA2-PSK when `psk=` is present and open 
 
 | Key | Meaning | Default |
 | --- | --- | --- |
-| `ssid=NAME` | network name the AP beacons | `esp32sim` |
-| `psk=PASS` | WPA2-PSK passphrase; omit for an open network | none (open) |
+| `ssid=NAME` | network name the AP beacons: 1 to 32 bytes, spaces and UTF-8 allowed; `*` for match-any | `esp32sim` |
+| `psk=PASS` | WPA2-PSK passphrase, 8 to 63 characters, or 64 hex digits for a raw PMK; omit (or leave empty) for an open network | none (open) |
 | `chan=N` | channel in beacons and probe responses | 6 |
 | `bssid=xx:xx:..` | AP MAC | `02:53:49:4d:00:01` |
+
+Values run to the next comma, so write `\,` for a comma and `\\` for a backslash; quote the whole
+spec for the shell: `--wifi 'ssid=Café Lab ☕,psk=pässword\, with spaces'`. An open network (no
+`psk`) beacons no RSN element and associates without a four-way handshake, which is what an ESPHome
+`wifi: ssid: cyd-lab` with no `password:` expects (IDF's threshold is then OPEN).
+
+### Any network the firmware asks for
+
+`--wifi any` (the same as `--wifi ssid=*`) serves whatever SSID the firmware is built for, so an
+image with credentials you do not know still joins:
+
+```sh
+esp32sim --board cyd --flash-file flash.bin --wifi any                    # open joins only
+esp32sim --board cyd --flash-file flash.bin --wifi 'ssid=*,psk=PASS'      # open, and WPA2 with PASS
+```
+
+The AP is silent (no beacons, no answers to wildcard probes) until the station sends a probe naming
+a network, as ESPHome's scan and IDF's connect to a configured SSID do. It then beacons as that
+SSID with two profiles, open on the AP's BSSID (`02:53:49:4d:00:01`, -40 dBm) and WPA2-PSK on
+`02:53:49:4d:00:81` (-46 dBm), and the station picks the one its security threshold allows. WPA2
+needs the passphrase, because the four-way handshake proves the station knows it: with no `psk=`
+the WPA2 join is refused and the log names the network:
+
+```
+[emu] wifi: the firmware is looking for 'esp32sim': the match-any access point now serves it, open as 02:53:49:4d:00:01 and WPA2 as 02:53:49:4d:00:81 (no psk given: a WPA2 join will be refused)
+[emu] wifi: the firmware wants 'esp32sim' as a WPA2 network; give its passphrase with --wifi ssid=*,psk=PASS (or ssid=esp32sim,psk=PASS). Refusing the join
+```
+
+The SSID is taken while the station is not associated, so a reboot into new credentials (a setup
+portal) follows the new name. With a fixed `ssid=`, a probe for another name is not answered but is
+logged (`the firmware is looking for 'X', but the access point is 'Y'`). Either way, the web
+channel's `wifi_wanted` event carries the name, its security once known and whether it is served
+([web-ui.md](web-ui.md)).
 
 `--net none` keeps the emulated subnet (DHCP, DNS, SNTP still answer) but refuses anything past the
 gateway with an immediate RST, so applications fail fast instead of hanging — useful when you want a
@@ -139,7 +172,9 @@ for the station are dropped by the guest's AP.
 
 - **`Send disconnect event, reason=210`** — the firmware has a passphrase compiled in and refuses an
   open AP (`NO_AP_FOUND_W_COMPATIBLE_SECURITY`). Pass a matching `psk=`.
-- **No beacons seen / scan finds nothing** — check the SSID matches exactly, including case.
+- **No beacons seen / scan finds nothing** — check the SSID matches exactly, including case; the
+  `[emu] wifi: the firmware is looking for` line names what it wants, or use `--wifi any`.
+- **`the firmware wants 'X' as a WPA2 network`** — match-any with no passphrase: add `psk=`.
 - **Connects but no IP** — look for the DHCP exchange with `ESP_EMU_DEBUG_NET=1`; if the four-way
   handshake did not finish, the station is not yet decrypting anything.
 - **TLS fails or hangs** — the accelerators are the usual suspects; the `[emu] crypto:` counters

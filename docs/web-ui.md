@@ -39,6 +39,7 @@ Text frames (JSON):
 | `serial` | `src` (`usb`/`uart0`), `data` | console output (ANSI colours stripped by the page) |
 | `ring` | `leds` `[[r,g,b]…]` | ring changed |
 | `fwd` | `event` (`connect` or `disconnect`), `via` (`hostfwd` or `ap-fwd`), `port` (the host port), `peer` (the client's `ip:port`), `clients` (how many that port has open now) | a client of a forwarded port connects or goes. Connect means the guest accepted the connection; disconnect means either side closed it or it was reset (a refused connection never shows as connected). A late joiner gets one `connect` per open client |
+| `wifi_wanted` | `ssid` (the network the firmware probed for), `secure` (`true` WPA2, `false` open, `null` not known yet: the station has only probed), `served` (whether this access point lets that join through) — e.g. `{"t":"wifi_wanted","ssid":"cyd-lab","secure":true,"served":false}` | the firmware asks for a network by name (a directed probe) or picks its security (authenticates to the open or the WPA2 profile). Sent on change only; with `--wifi any` it is what the AP serves, with a fixed `ssid=` a different name is reported with `served` false. A late joiner gets the latest one |
 | `stat` | `time`, `insns`, `frames`, `behind`, `resyncs`, `speed` (emulated seconds per wall second over the last second, `null` before the first second and when not paced), `cam`, `gpio_in` | every 20 ms emulated |
 
 Binary frames (first byte = type):
