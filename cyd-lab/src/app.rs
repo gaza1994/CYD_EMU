@@ -625,6 +625,9 @@ struct DeviceView {
     tag_win_new: bool,
     /// Where the docked screen was last drawn (with its bezel), so tag windows stay off it.
     screen_rect: Option<Rect>,
+    /// The app window and screen rects the tag window was last placed for: a change (window
+    /// resized, zoom changed) places it again.
+    tag_win_for: Option<(Rect, Option<Rect>)>,
     /// The live device-hotspot session over the control channel.
     ap: ApUi,
     install: InstallUi,
@@ -1051,6 +1054,17 @@ impl TagWin {
 
 /// Where a tag window opens: to the right of the screen (over the console) when there is
 /// room, else below it, never over it. Returns (top-left, width, max height).
+/// Moves a tag window. `Window::current_pos` alone only works the first time: in egui 0.37 a
+/// window with a title bar puts back its stored position after `current_pos` (the title-bar drag
+/// handling in `Window::show`), so the stored position is moved too.
+fn move_tag_window<'o>(ctx: &egui::Context, win: egui::Window<'o>, id: egui::Id, pos: Pos2) -> egui::Window<'o> {
+    if let Some(mut st) = egui::AreaState::load(ctx, id) {
+        st.set_left_top_pos(pos);
+        ctx.memory_mut(|m| m.areas_mut().set_state(egui::LayerId::new(egui::Order::Middle, id), st));
+    }
+    win.current_pos(pos)
+}
+
 fn tag_window_place(content: Rect, screen: Option<Rect>, want: f32) -> (Pos2, f32, f32) {
     const GAP: f32 = 10.0;
     const MIN_W: f32 = 300.0;
@@ -1266,6 +1280,7 @@ impl DeviceView {
             tag_win: None,
             tag_win_new: false,
             screen_rect: None,
+            tag_win_for: None,
             guide_reopened: false,
             guide_wifi_seen: false,
             guide_needs_user: false,
@@ -3529,19 +3544,29 @@ impl CydLabApp {
         let mut status = None;
         let mut open = true;
         let d = &mut self.devices[i];
+        let win_id = egui::Id::unique(("tag-win", d.dev.id.clone()));
         let mut win = egui::Window::new(format!("{} – {}", which.title(), d.dev.meta.name))
-            .id(egui::Id::unique(("tag-win", d.dev.id.clone())))
+            .id(win_id)
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
-            .vscroll(true);
+            .auto_sized();
         let content = ctx.content_rect();
         let (pos, width, max_h) = tag_window_place(content, d.screen_rect, which.width());
-        win = win.min_width(width.min(300.0)).max_width(width).max_height(max_h);
-        if std::mem::take(&mut d.tag_win_new) {
-            win = win.current_pos(pos);
+        // A fixed width, and no egui constraint: egui shifts a window left to fit the size it
+        // remembers from its first (sizing) pass, which pushed it over the screen.
+        // tag_window_place already keeps it inside the app window.
+        // Our own scroll area, not the window's: egui's window scroll keeps the smallest height
+        // it was ever given, so after a resize it stayed a sliver.
+        win = win.min_width(width).max_width(width).constrain(false);
+        let placed_for = (content, d.screen_rect);
+        if d.tag_win_for != Some(placed_for) {
+            d.tag_win_new = true;
         }
-        win.show(&ctx, |ui| match which {
+        if std::mem::take(&mut d.tag_win_new) {
+            d.tag_win_for = Some(placed_for);
+            win = move_tag_window(&ctx, win, win_id, pos);
+        }
+        let shown = win.show(&ctx, |ui| egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| match which {
             TagWin::Firmware => self.firmware_popover(ui, i, busy, &fw_full, &mut act),
             TagWin::Wifi => {
                 if let Some(ssid) = &wanted_ssid {
@@ -3585,7 +3610,16 @@ impl CydLabApp {
             }
             TagWin::Serial => self.serial_bridge_ui(ui, i, alive, features),
             TagWin::Hotspot => self.wifi_setup_ui(ui, i, alive, features, WifiPart::Hotspot),
-        });
+        }));
+        // Dragged over the screen: back beside it once let go. The screen stays visible.
+        if let (Some(w), Some(sr)) = (shown.as_ref().map(|r| r.response.rect), self.devices[i].screen_rect) {
+            // (Unless there is no room beside or below it, so it doesn't jump every frame.)
+            let fits = !Rect::from_min_size(pos, Vec2::new(width, 10.0)).intersects(sr);
+            if fits && w.intersects(sr) && !ctx.input(|inp| inp.pointer.any_down()) {
+                self.devices[i].tag_win_new = true;
+                ctx.request_repaint();
+            }
+        }
         // Only its × or Escape close it: clicks on the screen or the console leave it open.
         let escape = ctx.input(|inp| inp.key_pressed(egui::Key::Escape));
         if !open || escape || std::mem::take(&mut act.close) {
@@ -5354,6 +5388,80 @@ mod tests {
             assert!(crate::device::remove_dir_retrying(&dir, std::time::Duration::from_millis(300)).is_err());
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    /// A tag window opened at one place moves when placed again (the app window resized):
+    /// in egui 0.37 `current_pos` alone leaves an open window where it was.
+    #[test]
+    fn tag_window_moves_when_placed_again() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::unique("tag-win-test");
+        let frame = |ctx: &egui::Context, size: Vec2, pos: Option<Pos2>| {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), ..Default::default() };
+            let mut rect = None;
+            let mut out = ctx.run_ui(input, |ui| {
+                let ctx = ui.ctx().clone();
+                let mut win = egui::Window::new("Device hotspot").id(id).collapsible(false).resizable(false).vscroll(true).min_width(400.0).max_width(400.0).constrain(false);
+                if let Some(p) = pos {
+                    win = move_tag_window(&ctx, win, id, p);
+                }
+                rect = win.show(&ctx, |ui| {
+                    ui.label("Network");
+                }).map(|r| r.response.rect);
+            });
+            out.textures_delta.clear();
+            rect.unwrap()
+        };
+        let small = Vec2::new(960.0, 700.0);
+        frame(&ctx, small, Some(egui::pos2(500.0, 253.0)));
+        for _ in 0..3 {
+            frame(&ctx, small, None);
+        }
+        assert_eq!(frame(&ctx, small, None).min, egui::pos2(500.0, 253.0));
+        let big = Vec2::new(1400.0, 900.0);
+        frame(&ctx, big, Some(egui::pos2(740.0, 192.0)));
+        let r = frame(&ctx, big, None);
+        assert_eq!(r.min, egui::pos2(740.0, 192.0), "{r:?}");
+    }
+
+    /// After a frame with little room (the app window being resized), a tag window grows back
+    /// to its content: egui's own window scroll kept the smallest height and stayed a sliver.
+    #[test]
+    fn tag_window_grows_back_after_a_small_frame() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::unique("tag-win-grow-test");
+        let frame = |ctx: &egui::Context, max_h: f32| {
+            let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))), ..Default::default() };
+            let mut rect = None;
+            let mut out = ctx.run_ui(input, |ui| {
+                let ctx = ui.ctx().clone();
+                let win = egui::Window::new("Device hotspot").id(id).collapsible(false).auto_sized().min_width(400.0).max_width(400.0).constrain(false);
+                rect = win
+                    .show(&ctx, |ui| {
+                        egui::ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
+                            for n in 0..20 {
+                                ui.label(format!("line {n}"));
+                            }
+                        })
+                    })
+                    .map(|r| r.response.rect);
+            });
+            out.textures_delta.clear();
+            rect.unwrap()
+        };
+        for _ in 0..3 {
+            frame(&ctx, 600.0);
+        }
+        let tall = frame(&ctx, 600.0).height();
+        for _ in 0..3 {
+            frame(&ctx, 60.0);
+        }
+        assert!(frame(&ctx, 60.0).height() < 150.0);
+        for _ in 0..3 {
+            frame(&ctx, 600.0);
+        }
+        let again = frame(&ctx, 600.0).height();
+        assert!(tall > 300.0 && (again - tall).abs() < 1.0, "tall {tall} again {again}");
     }
 
     #[test]
