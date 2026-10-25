@@ -741,7 +741,7 @@ fn quiet_backstop_keeps_the_original_cadence_for_active_devices() {
         ("gdma-out", |p| p.gdma.out[0].running = true),
         ("wifi-tx", |p| p.wifi.tx_pending.push((0, 0))),
         ("wifi-ap", |p| p.wifi.link.attach(Some(crate::wifi::VirtualAp::new(crate::wifi::ApConfig {
-            ssid: "test".into(), bssid: [0; 6], channel: 1, psk: None,
+            ssid: "test".into(), bssid: [0; 6], channel: 1, psk: None, any: false,
         }, false)), None)),
         ("network", |p| p.wifi.link.attach(None, Some(crate::net::VirtualNet::new(false)))),
         ("aes", |p| p.aes.dma_pending = true),
@@ -848,7 +848,7 @@ fn periodic_tick_notifies_wifi_tx_and_air_rx() {
 
     let mut bus = SocBus::new(1024, 1024, [0; 6]);
     bus.periph.wifi.link.attach(Some(crate::wifi::VirtualAp::new(crate::wifi::ApConfig {
-        ssid: "test".into(), bssid: [2, 0, 0, 0, 0, 1], channel: 1, psk: None,
+        ssid: "test".into(), bssid: [2, 0, 0, 0, 0, 1], channel: 1, psk: None, any: false,
     }, false)), None);
     bus.periph.wifi.link.ap_mut().unwrap().queue.push(crate::wifi::AirFrame { at_us: 0, frame: vec![0; 24] });
     bus.periph.wifi.rx_next = FIRST_DESC & 0xfffff;
