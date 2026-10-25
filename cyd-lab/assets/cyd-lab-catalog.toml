@@ -191,7 +191,6 @@ group = "programming"
 name = "Touch test example"
 description = "Basics/2-TouchTest from the ESP32-Cheap-Yellow-Display examples (flashed from their web installer page): shows where you touch the screen. No Wi-Fi or web page."
 first_setup = { note = "none: it has no Wi-Fi" }
-first_setup = { note = "no Wi-Fi" }
 
 [[overrides]]
 id = "wm-lvgl9"
