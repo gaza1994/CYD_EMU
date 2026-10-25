@@ -312,6 +312,79 @@ pub fn strip_ansi(s: &str) -> String {
 /// The device hotspot driven live over the engine's control channel (`ap_client` /
 /// `ap_status`). Newer engines push `ap_status` on every change; older ones only answer,
 /// so the panel polls them while it is open.
+/// Where an install came from: what "try again" offers when it fails.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum InstallSource {
+    #[default]
+    Catalog,
+    Web,
+    File,
+}
+
+/// An install's progress and result, shown in the device panel (the "Install firmware…"
+/// window closes as soon as Install is clicked).
+#[derive(Default)]
+struct InstallUi {
+    what: String,
+    stage: String,
+    step: u8,
+    since: Option<Instant>,
+    finished: Option<Instant>,
+    outcome: Option<Result<String, String>>,
+    source: InstallSource,
+}
+
+impl InstallUi {
+    const STEPS: f32 = 5.0;
+    fn begin(&mut self, what: impl Into<String>, source: InstallSource) {
+        *self = InstallUi { what: what.into(), stage: "starting".into(), step: 0, since: Some(Instant::now()), source, ..Default::default() };
+    }
+    fn active(&self) -> bool {
+        self.since.is_some() && self.outcome.is_none()
+    }
+    /// A progress line from the download/verify thread.
+    fn line(&mut self, l: &str) {
+        let step = if l.contains("SHA-256 OK") || l.contains("verified copy") || l.contains("not pinned") {
+            3
+        } else if l.starts_with("downloading") {
+            2
+        } else if l.starts_with("fetching") {
+            1
+        } else {
+            self.step
+        };
+        self.step = self.step.max(step);
+        self.stage = l.to_string();
+    }
+    fn writing(&mut self, powering_off: bool) {
+        self.step = 4;
+        self.stage = if powering_off { "powering off to write the flash".into() } else { "writing the flash".into() };
+    }
+    fn done(&mut self, msg: String) {
+        self.step = 5;
+        self.outcome = Some(Ok(msg));
+        self.finished = Some(Instant::now());
+    }
+    fn fail(&mut self, err: String) {
+        if self.since.is_none() {
+            self.since = Some(Instant::now());
+        }
+        self.outcome = Some(Err(err));
+        self.finished = Some(Instant::now());
+    }
+    fn fraction(&self) -> f32 {
+        (self.step as f32 + 0.5).min(Self::STEPS) / Self::STEPS
+    }
+    /// What the panel shows: the running install, a failure until dismissed, a success for a minute.
+    fn visible(&self) -> bool {
+        match &self.outcome {
+            None => self.since.is_some(),
+            Some(Err(_)) => true,
+            Some(Ok(_)) => self.finished.is_some_and(|t| t.elapsed() < Duration::from_secs(60)),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ApUi {
     /// The newest `ap_status`.
@@ -511,6 +584,7 @@ struct DeviceView {
     hotspot_form: (String, String, String),
     /// The live device-hotspot session over the control channel.
     ap: ApUi,
+    install: InstallUi,
     /// Live clients on forwarded ports (engines that send `fwd` events).
     fwd: crate::hotspot::FwdClients,
     /// After installing a firmware with a first-setup guide (the Home Assistant entry):
@@ -883,6 +957,7 @@ impl DeviceView {
             hotspot_open_at: None,
             hotspot_form: (String::new(), String::new(), crate::hotspot::GUEST_AP_IP.to_string()),
             ap: ApUi::default(),
+            install: InstallUi::default(),
             fwd: Default::default(),
             api_client: None,
         }
@@ -892,9 +967,14 @@ impl DeviceView {
     fn start_web_install(&mut self, waker: Waker) {
         let src = self.web_manifest.trim().to_string();
         let erase = self.web_erase;
+        let short = src.rsplit(['/', '\\']).find(|s| !s.is_empty()).unwrap_or(&src).to_string();
+        self.install.begin(format!("web install ({short})"), InstallSource::Web);
         let size = match self.dev.flash_size() {
             Ok(s) => s,
-            Err(e) => return self.lab(format!("web install: {e:#}")),
+            Err(e) => {
+                self.install.fail(format!("{e:#}"));
+                return self.lab(format!("web install: {e:#}"));
+            }
         };
         let (tx, rx) = std::sync::mpsc::channel();
         self.web_job = Some(rx);
@@ -914,9 +994,13 @@ impl DeviceView {
     /// Start a one-click catalogue install: download, verify the pinned SHA-256s, then write
     /// like a web install (erase first, power on after).
     fn start_catalog_install(&mut self, e: crate::catalog::Entry, cache: PathBuf, waker: Waker) {
+        self.install.begin(format!("{} {}", e.name, e.version).trim().to_string(), InstallSource::Catalog);
         let size = match self.dev.flash_size() {
             Ok(s) => s,
-            Err(err) => return self.lab(format!("catalogue: {err:#}")),
+            Err(err) => {
+                self.install.fail(format!("{err:#}"));
+                return self.lab(format!("catalogue: {err:#}"));
+            }
         };
         self.lab(format!("catalogue: installing {} {}", e.name, e.version));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1000,7 +1084,13 @@ impl DeviceView {
     }
 
     fn queue_flash(&mut self, erase: bool, parts: Vec<(u64, Vec<u8>, String)>, what: String, power_on_after: bool) {
-        if matches!(self.backend.state(), RunState::Running(_) | RunState::Stopping) {
+        let on = matches!(self.backend.state(), RunState::Running(_) | RunState::Stopping);
+        if !self.install.active() {
+            let label = if parts.is_empty() && erase { "Erase flash".to_string() } else { what.clone() };
+            self.install.begin(label, InstallSource::File);
+        }
+        self.install.writing(on);
+        if on {
             self.lab(format!("{what}: powering off to write flash.bin (the engine saves it first)…"));
         }
         self.pending_flash = Some(PendingFlash { erase, parts, what, power_on_after, stop_sent: false });
@@ -1027,6 +1117,7 @@ impl DeviceView {
         if p.erase {
             if let Err(e) = store.erase_flash(&self.dev) {
                 self.lab(format!("{}: erase failed: {e:#}", p.what));
+                self.install.fail(format!("erasing the flash: {e:#}"));
                 return false;
             }
         }
@@ -1034,6 +1125,7 @@ impl DeviceView {
         for (off, data, src) in &p.parts {
             if let Err(e) = store.import_firmware(&self.dev, *off, data) {
                 self.lab(format!("{}: writing {src} at 0x{off:x}: {e:#}", p.what));
+                self.install.fail(format!("writing {src} at 0x{off:x}: {e:#}"));
                 self.flash_blank = flash_is_blank(&self.dev.flash_path());
                 return false;
             }
@@ -1045,6 +1137,12 @@ impl DeviceView {
             (e, _) => format!("{}: wrote {bytes} bytes at {}{}", p.what, at.join(", "), if e { " (after erasing)" } else { "" }),
         });
         self.flash_blank = flash_is_blank(&self.dev.flash_path());
+        let msg = match (p.erase, p.parts.is_empty(), p.power_on_after) {
+            (true, true, _) => "Flash erased".to_string(),
+            (_, _, true) => format!("Installed {} ({bytes} bytes written); powering on", self.install.what),
+            (_, _, false) => format!("Installed {} ({bytes} bytes written)", self.install.what),
+        };
+        self.install.done(msg);
         p.power_on_after
     }
 
@@ -1684,12 +1782,18 @@ impl CydLabApp {
                 let msgs: Vec<WebMsg> = rx.try_iter().collect();
                 for m in msgs {
                     match m {
-                        WebMsg::Line(l) => d.lab(format!("{}: {l}", d.job_label)),
+                        WebMsg::Line(l) => {
+                            d.install.line(&l);
+                            d.lab(format!("{}: {l}", d.job_label));
+                        }
                         WebMsg::Done(r) => {
                             d.web_job = None;
                             match r {
                                 Ok(p) => d.finish_web_install(p),
-                                Err(e) => d.lab(format!("{} failed: {e}", d.job_label)),
+                                Err(e) => {
+                                    d.lab(format!("{} failed: {e}", d.job_label));
+                                    d.install.fail(e);
+                                }
                             }
                         }
                     }
@@ -2171,6 +2275,9 @@ impl CydLabApp {
                 }
             }
             d.start_catalog_install(e, cache, w);
+            // Progress and the result show in the device panel; the window has done its job.
+            d.gallery_open = false;
+            return;
         }
         if !open {
             self.devices[i].gallery_open = false;
@@ -2603,6 +2710,68 @@ impl CydLabApp {
             }
             ui.label(RichText::new("or drop a .bin on the window").weak());
         });
+        let mut reopen = false;
+        let mut retry_web = false;
+        if self.devices[i].install.visible() {
+            let st = &mut self.devices[i].install;
+            let mut dismiss = false;
+            ui.horizontal_wrapped(|ui| match &st.outcome {
+                None => {
+                    ui.spinner();
+                    ui.label(RichText::new(format!("Installing {}", st.what)).strong());
+                    ui.add(egui::ProgressBar::new(st.fraction()).desired_width(140.0).desired_height(10.0));
+                    let secs = st.since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                    ui.label(RichText::new(format!("{}  ·  {secs} s", st.stage)).small().weak());
+                    ui.ctx().request_repaint_after(Duration::from_millis(500));
+                }
+                Some(Ok(m)) => {
+                    ui.label(RichText::new(format!("✔ {m}")).color(Color32::from_rgb(120, 220, 140)));
+                    if ui.small_button("×").on_hover_text("Hide").clicked() {
+                        dismiss = true;
+                    }
+                }
+                Some(Err(e)) => {
+                    ui.label(RichText::new(format!("✖ {} failed: {e}", st.what)).color(Color32::from_rgb(240, 110, 100)));
+                    match st.source {
+                        InstallSource::Catalog => {
+                            if ui.small_button("Reopen Install firmware…").clicked() {
+                                reopen = true;
+                                dismiss = true;
+                            }
+                        }
+                        InstallSource::Web => {
+                            if ui.small_button("Try again").on_hover_text("Install from the same manifest again (edit it under \"More: install from a web flasher\")").clicked() {
+                                retry_web = true;
+                            }
+                            if ui.small_button("Install firmware…").clicked() {
+                                reopen = true;
+                                dismiss = true;
+                            }
+                        }
+                        InstallSource::File => {
+                            ui.label(RichText::new("pick the file again with Flash a .bin…, or").small().weak());
+                            if ui.small_button("Install firmware…").clicked() {
+                                reopen = true;
+                                dismiss = true;
+                            }
+                        }
+                    }
+                    if ui.small_button("×").on_hover_text("Hide").clicked() {
+                        dismiss = true;
+                    }
+                }
+            });
+            if dismiss {
+                *st = InstallUi::default();
+            }
+        }
+        if reopen {
+            self.devices[i].gallery_open = true;
+        }
+        if retry_web && !busy {
+            let w = self.waker.clone();
+            self.devices[i].start_web_install(w);
+        }
         egui::CollapsingHeader::new("More: install from a web flasher, write at an offset").id_salt(("more", i)).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             let d = &mut self.devices[i];
@@ -3764,6 +3933,30 @@ fn toggle_if(ui: &egui::Ui, id: egui::Id, clicked: bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn install_status_follows_the_pipeline() {
+        let mut st = InstallUi::default();
+        assert!(!st.visible() && !st.active());
+        st.begin("openHASP 0.7.0-rc13", InstallSource::Catalog);
+        assert!(st.active() && st.visible());
+        let f0 = st.fraction();
+        st.line("downloading https://example.invalid/x.bin");
+        assert!(st.fraction() > f0);
+        st.line("firmware: SHA-256 OK");
+        st.line("downloading again"); // never goes backwards
+        assert_eq!(st.step, 3);
+        st.writing(true);
+        assert!(st.stage.contains("powering off"));
+        st.done("Installed openHASP".into());
+        assert!(!st.active() && st.visible() && st.fraction() == 1.0);
+        st.begin("web install (manifest.json)", InstallSource::Web);
+        st.fail("HTTP 404".into());
+        assert!(matches!(st.outcome, Some(Err(_))) && st.visible() && !st.active());
+        let mut never_started = InstallUi::default();
+        never_started.fail("flash.bin missing".into());
+        assert!(never_started.visible());
+    }
+
     use super::*;
 
     #[test]
