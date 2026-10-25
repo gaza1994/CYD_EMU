@@ -3732,7 +3732,7 @@ impl CydLabApp {
         } else {
             format!(
                 "Network: Wi-Fi {} · {}",
-                if net.accept_any && features.net().wifi_any { "any name".to_string() } else { format!("\"{}\"", eff.ssid) },
+                if net.accept_any && features.net().wifi_any { format!("\"{}\" (or any name)", eff.ssid) } else { format!("\"{}\"", eff.ssid) },
                 if ports.is_empty() { "no ports published".to_string() } else { format!("{} {}", if net.lan { ip_text.as_str() } else { "127.0.0.1" }, ports.join(", ")) }
             )
         };
@@ -3784,6 +3784,35 @@ impl CydLabApp {
                             });
                             ui.end_row();
                         });
+                        // Which name the chip sees, spelled out: an empty field shows the
+                        // fallback only as grey hint text, and older devices say "cyd-lab"
+                        // while new ones say "esp32sim".
+                        let now = n.effective(&defaults);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new("Current network:").small());
+                            ui.label(RichText::new(format!("\"{}\"", now.ssid)).small().strong().monospace());
+                            ui.label(RichText::new(if now.password.is_empty() { "open (no password)" } else { "secured (WPA2)" }).small().weak());
+                        });
+                        let why = if n.ssid.is_empty() && defaults.ssid.is_empty() {
+                            Some(format!("No name is set for this device, so it gets the built-in \"{}\"; new devices get \"{}\".", crate::network::FALLBACK_SSID, crate::network::NEW_DEVICE_SSID))
+                        } else if n.ssid.is_empty() {
+                            Some("No name is set for this device, so it gets the details new devices get (Settings).".to_string())
+                        } else if n.ssid == crate::network::FALLBACK_SSID && defaults.ssid.is_empty() {
+                            Some(format!("\"{}\" was the name older devices got; new devices get \"{}\".", crate::network::FALLBACK_SSID, crate::network::NEW_DEVICE_SSID))
+                        } else {
+                            None
+                        };
+                        let why = why.map(|w| if n.ssid.is_empty() && !n.password.is_empty() { format!("{w} The password above is not used until a name is set.") } else { w });
+                        if let Some(why) = why {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new(why).small().weak());
+                                if now.ssid != crate::network::NEW_DEVICE_SSID && ui.small_button(format!("Use \"{}\"", crate::network::NEW_DEVICE_SSID)).on_hover_text("Firmware already set up for the old name will need its Wi-Fi details changed (or tick Accept any network name)").clicked() {
+                                    n.ssid = crate::network::NEW_DEVICE_SSID.to_string();
+                                    n.password.clear();
+                                    save = true;
+                                }
+                            });
+                        }
                         let any_tip = "The emulated access point answers whatever network name the firmware looks for, so firmware with another name built in joins without changes.\nWith a password above, open and secured (WPA2) joins both work; with none, only open ones (cyd-lab asks for the password if the firmware wants a secured network).";
                         save |= ui.checkbox(&mut n.accept_any, "Accept any network name").on_hover_text(any_tip).changed();
                         if n.accept_any && !features.net().wifi_any {
