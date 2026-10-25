@@ -577,6 +577,9 @@ struct DeviceView {
     drop_ask: Option<DropAsk>,
     /// No bootloader in flash.bin (0xE9 at 0x1000), refreshed after writes and power-off.
     flash_blank: bool,
+    /// From this run's boot log (see `network::firmware_clue`), for the firmware chip.
+    fw_kind: String,
+    fw_host: String,
     /// Wi-Fi join attempts seen in the console, for the "firmware is looking for" banner.
     wifi_watch: crate::network::WifiWatch,
     /// The access point of the current run (what the banner compares against).
@@ -919,6 +922,56 @@ struct MultiRow {
 }
 
 /// Does flash.bin hold a bootloader? (Reads 0x1001 bytes.)
+/// The parts of a device's Wi-Fi setup UI, drawn in different places of the panel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WifiPart {
+    /// "Waiting for Wi-Fi setup" (needs attention: always visible).
+    Banner,
+    /// Improv buttons and state (under Details).
+    Setup,
+    /// The device's own hotspot (only while there is one).
+    Hotspot,
+}
+
+/// "ESP32-2432S028R original (micro-USB)" -> "2432S028R micro-USB".
+fn short_board_name(full: &str) -> String {
+    let s = full.trim();
+    let s = s.strip_prefix("ESP32-").unwrap_or(s);
+    let (head, paren) = match (s.find(" ("), s.ends_with(')')) {
+        (Some(p), true) => (&s[..p], Some(&s[p + 2..s.len() - 1])),
+        _ => (s, None),
+    };
+    let head = head.replace(" original", "");
+    match paren {
+        Some(p) if !p.is_empty() => format!("{head} {p}"),
+        _ => head,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tone {
+    Plain,
+    Good,
+    Warn,
+    Bad,
+}
+
+/// A compact status chip: neutral unless something needs attention.
+fn chip(ui: &mut egui::Ui, text: impl Into<String>, tone: Tone, tip: impl Into<egui::WidgetText>) -> egui::Response {
+    let mut t = RichText::new(text.into()).small();
+    let fill = match tone {
+        Tone::Plain | Tone::Good => ui.visuals().widgets.inactive.weak_bg_fill,
+        Tone::Warn => Color32::from_rgb(150, 95, 10),
+        Tone::Bad => Color32::from_rgb(150, 40, 35),
+    };
+    t = match tone {
+        Tone::Good => t.color(Color32::from_rgb(130, 215, 150)),
+        Tone::Warn | Tone::Bad => t.color(Color32::WHITE),
+        Tone::Plain => t,
+    };
+    ui.add(egui::Button::new(t).fill(fill).corner_radius(9.0)).on_hover_text(tip)
+}
+
 fn flash_is_blank(path: &Path) -> bool {
     use std::io::Read;
     let mut b = vec![0u8; 0x1001];
@@ -985,6 +1038,8 @@ impl DeviceView {
             pending_flash: None,
             drop_ask: None,
             flash_blank,
+            fw_kind: String::new(),
+            fw_host: String::new(),
             wifi_watch: Default::default(),
             wifi_ap: Default::default(),
             show_password: false,
@@ -1178,6 +1233,10 @@ impl DeviceView {
             (e, _) => format!("{}: wrote {bytes} bytes at {}{}", p.what, at.join(", "), if e { " (after erasing)" } else { "" }),
         });
         self.flash_blank = flash_is_blank(&self.dev.flash_path());
+        if !self.dev.meta.firmware_label.is_empty() {
+            self.dev.meta.firmware_label.clear();
+            let _ = self.dev.save();
+        }
         let msg = match (p.erase, p.parts.is_empty(), p.power_on_after) {
             (true, true, _) => "Flash erased".to_string(),
             (_, _, true) => format!("Installed {} ({bytes} bytes written); powering on", self.install.what),
@@ -1249,6 +1308,18 @@ impl DeviceView {
             if let Some(ssid) = crate::hotspot::sniff_ssid(&line) {
                 crate::hotspot::remember(&mut self.hotspot_ssids, ssid);
             }
+            if let Some(c) = crate::network::firmware_clue(&line) {
+                match c {
+                    crate::network::FirmwareClue::Kind(k) => self.fw_kind = k,
+                    crate::network::FirmwareClue::Host(h) if self.fw_host.is_empty() => self.fw_host = h,
+                    crate::network::FirmwareClue::Host(_) => {}
+                }
+                let label = [self.fw_kind.as_str(), self.fw_host.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" · ");
+                if !self.fw_kind.is_empty() && label != self.dev.meta.firmware_label {
+                    self.dev.meta.firmware_label = label;
+                    let _ = self.dev.save();
+                }
+            }
             let before = self.wifi_watch.banner.clone();
             if self.wifi_watch.feed(&line, &self.wifi_ap) && self.ap.was_up {
                 // Joined its Wi-Fi after its hotspot page was used (see the hotspot panel).
@@ -1306,6 +1377,8 @@ pub struct CydLabApp {
     /// The zoom factor last applied/saved (Ctrl +/-/0 change egui's directly).
     text_scale: f32,
     status: String,
+    /// The status message on show and since when (it fades after a few seconds).
+    status_shown: (String, Instant),
     waker: Waker,
     /// What `running.json` last said (rewritten only when this changes).
     running_written: Option<Vec<crate::running::RunningDevice>>,
@@ -1365,6 +1438,7 @@ impl CydLabApp {
             rename: None,
             text_scale,
             status,
+            status_shown: (String::new(), Instant::now()),
             waker,
             running_written: None,
             rom_ready: false,
@@ -1781,6 +1855,8 @@ impl CydLabApp {
         d.screen = None;
         d.api_clients = Default::default();
         d.ha_action_refused = false;
+        d.fw_kind.clear();
+        d.fw_host.clear();
         d.touch_down = None;
         d.touch_since = None;
         d.touch_release_due = None;
@@ -2042,7 +2118,7 @@ impl CydLabApp {
             let (name, pid) = (dlg.name.clone(), dlg.profile.clone());
             match self.profiles.get(&pid).cloned().context("pick a variant").and_then(|p| self.store.create_with(&name, &p, &self.settings.wifi)) {
                 Ok(dev) => {
-                    self.status = format!("Created {} ({}), flash.bin blank at {}", dev.meta.name, dev.id, dev.flash_path().display());
+                    self.status = format!("Created {}", dev.meta.name);
                     self.devices.push(DeviceView::new(dev, self.waker.clone()));
                     self.selected = Some(self.devices.len() - 1);
                     self.new_device = None;
@@ -2672,68 +2748,49 @@ impl CydLabApp {
         let alive = running || state == RunState::Stopping;
         let features = self.engine_features();
 
-        // --- header
+        // --- row 1: status, name, board; Power / EN / BOOT; the ••• menu for the rest
         let mut action = None;
-        ui.horizontal(|ui| {
+        let mut erase = false;
+        let mut import = false;
+        let mut pick_bin = false;
+        let mut web_install = false;
+        let mut power_toggle = false;
+        let mut en = false;
+        let mut boot_button_down = false;
+        let busy = self.devices[i].pending_flash.is_some() || self.devices[i].web_job.is_some();
+        let live_link = self.settings.engine.live_link;
+        let (board, board_tip) = {
+            let d = &self.devices[i];
+            let full = profile.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| format!("unknown profile {}", d.dev.meta.profile));
+            (short_board_name(&full), format!("{full}\nid {} · MAC {}", d.dev.id, d.dev.meta.mac.as_deref().unwrap_or("-")))
+        };
+        let caps_tip = {
+            let caps = self.devices[i].backend.capabilities();
+            // What this engine gives the device (only what it has: nothing about what it lacks).
+            let mut v = Vec::new();
+            if caps.live_screen || (!alive && live_link) {
+                v.push("live screen: TFT frames over the engine's --web WebSocket");
+            }
+            if caps.touch {
+                v.push("touch: mouse clicks on the screen are sent as panel touches");
+            }
+            if (alive && caps.flash_writeback) || (!alive && features.flash_file) {
+                v.push("flash saved: firmware writes persist in flash.bin across power cycles (--flash-file)");
+            }
+            if (alive && caps.serial_tcp.is_some()) || (!alive && features.serial_tcp) {
+                v.push("serial bridge: UART0 served as RFC 2217 (DTR/RTS auto-reset) for esptool and other tools");
+            }
+            if v.is_empty() { "Engine features: none reported".to_string() } else { format!("Engine features:\n{}", v.join("\n")) }
+        };
+        ui.horizontal_wrapped(|ui| {
             let d = &mut self.devices[i];
             let (color, s) = status_of(state, d.backend.chip_status());
             let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
             ui.painter().circle_filled(r.center(), 7.0, color);
             ui.heading(&d.dev.meta.name);
-            ui.label(RichText::new(s).weak());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let del = egui::Button::new(RichText::new("Delete…").color(Color32::from_rgb(255, 140, 130)));
-                if ui.add(del).on_hover_text("Delete this device: its flash, settings and folder (asks first)").clicked() {
-                    action = Some(DevAction::Delete);
-                }
-                if ui.button("Duplicate").on_hover_text("A copy with the same flash and settings, a new MAC address and its own ports").clicked() {
-                    action = Some(DevAction::Duplicate);
-                }
-                if ui.button("Rename…").clicked() {
-                    action = Some(DevAction::Rename);
-                }
-            });
-        });
-        if let Some(a) = action {
-            self.device_action(i, a);
-            return;
-        }
-        let d = &self.devices[i];
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(profile.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| format!("unknown profile {}", d.dev.meta.profile))).strong());
-            ui.label("·");
-            ui.label(format!("id {}", d.dev.id));
-            ui.label("·");
-            ui.label(format!("MAC {}", d.dev.meta.mac.as_deref().unwrap_or("-")));
-        });
-        let caps = d.backend.capabilities();
-        let live_link = self.settings.engine.live_link;
-        // What this engine gives the device (only what it has: nothing about what it lacks).
-        ui.horizontal_wrapped(|ui| {
-            let chip = |ui: &mut egui::Ui, on: bool, text: &str, tip: &str| {
-                if on {
-                    let c = Color32::from_rgb(110, 200, 130);
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                    ui.painter().circle_filled(rect.center(), 3.5, c);
-                    ui.label(RichText::new(text).small().color(c)).on_hover_text(tip);
-                }
-            };
-            chip(ui, caps.live_screen || (!alive && live_link), "live screen", "TFT frames over the engine's --web WebSocket");
-            chip(ui, caps.touch, "touch", "Mouse clicks on the screen are sent as panel touches");
-            if alive {
-                chip(ui, caps.flash_writeback, "flash saved", "This run uses --flash-file: firmware writes are saved to flash.bin when you power off");
-                chip(ui, caps.serial_tcp.is_some(), "serial bridge", "UART0 served as RFC 2217 over TCP (--serial-tcp)");
-            } else {
-                chip(ui, features.flash_file, "flash saved", "Firmware writes persist across power cycles (--flash-file)");
-                chip(ui, features.serial_tcp, "serial bridge", "UART0 can be served as RFC 2217 (DTR/RTS auto-reset) for esptool and other tools");
-            }
-        });
-        // --- controls
-        let mut power_toggle = false;
-        let mut en = false;
-        let mut boot_button_down = false;
-        ui.horizontal(|ui| {
-            let d = &mut self.devices[i];
+            ui.label(RichText::new(&board).weak()).on_hover_text(&board_tip);
+            ui.label(RichText::new(s).small().weak()).on_hover_text(&caps_tip);
+            ui.separator();
             let power_text = if state == RunState::Stopping { "Saving flash…" } else if running { "Power off" } else { "Power on" };
             let power_btn = egui::Button::new(RichText::new(power_text).strong()).fill(if running { Color32::from_rgb(120, 40, 40) } else { Color32::from_rgb(40, 100, 50) });
             if ui.add_enabled(state != RunState::Stopping, power_btn).clicked() {
@@ -2742,11 +2799,38 @@ impl CydLabApp {
             if ui.add_enabled(running, egui::Button::new("EN (reset)")).on_hover_text("Pulse EN: reset the chip in-process. BOOT is sampled on release. Same mode as now: the engine's reset. Changed BOOT: DTR/RTS on the engine's serial port (this disconnects a tool connected to it). Without --serial-tcp a changed BOOT power-cycles the engine.").clicked() {
                 en = true;
             }
-            ui.separator();
-            let boot = ui.add(egui::Button::new("BOOT").sense(Sense::click_and_drag())).on_hover_text("GPIO0 low while held (firmware sees the button). Hold BOOT and click EN, or tick \"BOOT held\" and press EN / Power, for download mode.");
+            let boot = ui.add(egui::Button::new("BOOT").sense(Sense::click_and_drag())).on_hover_text("GPIO0 low while held (firmware sees the button). Hold BOOT and click EN, or tick \"BOOT held\" in the ••• menu and press EN / Power, for download mode.");
             boot_button_down = boot.is_pointer_button_down_on();
-            ui.checkbox(&mut d.boot_latched, "BOOT held (download mode, strap 0x0f)");
+            if d.boot_latched {
+                ui.label(RichText::new("BOOT held").small().color(Color32::from_rgb(240, 190, 40))).on_hover_text("Download mode (strap 0x0f) at the next EN or Power on. Untick it in the ••• menu.");
+            }
+            ui.menu_button(RichText::new("•••").strong(), |ui| {
+                if ui.button("Rename…").clicked() {
+                    action = Some(DevAction::Rename);
+                    ui.close();
+                }
+                if ui.button("Duplicate").on_hover_text("A copy with the same flash and settings, a new MAC address and its own ports").clicked() {
+                    action = Some(DevAction::Duplicate);
+                    ui.close();
+                }
+                if ui.button(RichText::new("Delete…").color(Color32::from_rgb(255, 140, 130))).on_hover_text("Delete this device: its flash, settings and folder (asks first)").clicked() {
+                    action = Some(DevAction::Delete);
+                    ui.close();
+                }
+                ui.separator();
+                if ui.add_enabled(!busy, egui::Button::new("Erase flash")).on_hover_text("Reset flash.bin to all 0xFF (a running device is powered off first)").clicked() {
+                    erase = true;
+                    ui.close();
+                }
+                ui.checkbox(&mut d.boot_latched, "BOOT held (download mode, strap 0x0f)");
+            })
+            .response
+            .on_hover_text("Rename, Duplicate, Delete, Erase flash, BOOT held");
         });
+        if let Some(a) = action {
+            self.device_action(i, a);
+            return;
+        }
         let boot_held = self.devices[i].boot_latched || boot_button_down;
         // BOOT is also a live button (GPIO0) for the firmware, like on the board.
         {
@@ -2768,29 +2852,20 @@ impl CydLabApp {
             self.press_en(i, boot_held);
         }
 
-        // --- firmware
-        let mut erase = false;
-        let mut import = false;
-        let mut pick_bin = false;
-        let mut web_install = false;
-        let busy = self.devices[i].pending_flash.is_some() || self.devices[i].web_job.is_some();
+        // --- row 2: firmware, Wi-Fi, Home Assistant, serial at a glance
+        let open_details = self.status_chips(ui, i, alive, &features);
+
+        // --- firmware: one primary action (drop works too); the rest under More
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Firmware:").strong());
             ui.add_enabled_ui(!busy, |ui| {
-                if ui.button(RichText::new("Install firmware…").strong()).on_hover_text("Pick a ready-made firmware for this board (openHASP, NerdMiner, Bruce, …): cyd-lab downloads it, checks its SHA-256 and writes it in one click.").clicked() {
+                if ui.button(RichText::new("Install firmware…").strong()).on_hover_text("Pick a ready-made firmware for this board (openHASP, NerdMiner, Bruce, …): cyd-lab downloads it, checks its SHA-256 and writes it in one click. Your own .bin: drop it on the window, or use More below.").clicked() {
                     self.devices[i].gallery_open = true;
-                }
-                if ui.button(RichText::new("Flash a .bin…").strong()).on_hover_text("Pick a firmware .bin. Merged/factory images go to 0x0, app images into the app partition; you are asked only when it is unclear. A running device is powered off, written and powered on again.").clicked() {
-                    pick_bin = true;
-                }
-                if ui.button("Erase flash").on_hover_text("Reset flash.bin to all 0xFF (a running device is powered off first)").clicked() {
-                    erase = true;
                 }
             });
             if busy {
                 ui.spinner();
             }
-            ui.label(RichText::new("or drop a .bin on the window").weak());
+            ui.label(RichText::new("or drop a .bin on the window").small().weak());
         });
         let mut reopen = false;
         let mut retry_web = false;
@@ -2854,7 +2929,12 @@ impl CydLabApp {
             let w = self.waker.clone();
             self.devices[i].start_web_install(w);
         }
-        egui::CollapsingHeader::new("More: install from a web flasher, write at an offset").id_salt(("more", i)).show(ui, |ui| {
+        egui::CollapsingHeader::new(RichText::new("More: flash a .bin, install from a web flasher, write at an offset").small()).id_salt(("more", i)).show(ui, |ui| {
+        ui.add_enabled_ui(!busy, |ui| {
+            if ui.button("Flash a .bin…").on_hover_text("Pick a firmware .bin. Merged/factory images go to 0x0, app images into the app partition; you are asked only when it is unclear. A running device is powered off, written and powered on again.").clicked() {
+                pick_bin = true;
+            }
+        });
         ui.horizontal_wrapped(|ui| {
             let d = &mut self.devices[i];
             ui.label(RichText::new("Install from web:").strong()).on_hover_text("ESP Web Tools manifest: the JSON behind an \"Install\" / \"Connect\" button on a web flasher page (openHASP, WLED, ESPHome projects, ...). cyd-lab downloads the ESP32 build's parts and writes them into flash.bin, as the browser would over Web Serial. On the flasher page, look for manifest.json in the page source or the browser's network tab.");
@@ -2914,9 +2994,27 @@ impl CydLabApp {
                 Err(e) => d.lab(format!("write failed: {e:#}")),
             }
         }
-        self.serial_bridge_ui(ui, i, alive, &features);
-        self.network_ui(ui, i, alive, &features);
-        self.wifi_setup_ui(ui, i, alive, &features);
+        // Needs attention: stays out of Details.
+        self.wifi_setup_ui(ui, i, alive, &features, WifiPart::Banner);
+        let open = self.devices[i].dev.meta.details_open || open_details;
+        let resp = egui::CollapsingHeader::new(RichText::new("Details: serial port, network and ports, Wi-Fi setup").small())
+            .id_salt(("details", i))
+            .open(Some(open))
+            .show(ui, |ui| {
+                self.serial_bridge_ui(ui, i, alive, &features);
+                self.network_ui(ui, i, alive, &features);
+                self.wifi_setup_ui(ui, i, alive, &features, WifiPart::Setup);
+            });
+        let open = if resp.header_response.clicked() { !open } else { open };
+        if open != self.devices[i].dev.meta.details_open {
+            let d = &mut self.devices[i];
+            d.dev.meta.details_open = open;
+            if let Err(e) = d.dev.save() {
+                d.lab(format!("could not save device settings: {e:#}"));
+            }
+        }
+        // Only when the firmware has a hotspot up (or is in setup mode).
+        self.wifi_setup_ui(ui, i, alive, &features, WifiPart::Hotspot);
         ui.separator();
 
         // --- screen | setup checklist + console. Helpers never go on the screen itself.
@@ -2930,6 +3028,109 @@ impl CydLabApp {
                 self.console_ui(ui, i);
             });
         });
+    }
+
+    /// One line of chips under the header: firmware, Wi-Fi, Home Assistant, serial. Neutral
+    /// unless something needs attention; hover for details. Returns true to open Details.
+    fn status_chips(&mut self, ui: &mut egui::Ui, i: usize, alive: bool, features: &EngineFeatures) -> bool {
+        let mut open_details = false;
+        let mut status = None;
+        let defaults = self.settings.wifi.clone();
+        let d = &mut self.devices[i];
+        let busy = d.pending_flash.is_some() || d.web_job.is_some();
+        ui.horizontal_wrapped(|ui| {
+            // Firmware
+            let fw_text = if !d.dev.meta.firmware_label.is_empty() {
+                d.dev.meta.firmware_label.clone()
+            } else if let Some(g) = d.dev.meta.guide.as_ref().filter(|g| !g.name.is_empty()) {
+                g.name.clone()
+            } else {
+                "Firmware in flash".to_string()
+            };
+            if busy {
+                chip(ui, "Installing firmware…", Tone::Plain, "Writing flash.bin");
+            } else if matches!(d.install.outcome, Some(Err(_))) {
+                chip(ui, "Install failed", Tone::Bad, "See the message under Install firmware….");
+            } else if d.flash_blank {
+                if chip(ui, "No firmware (blank flash)", Tone::Warn, "Nothing to boot yet. Click (or Install firmware…) to pick one, or drop a .bin on the window.").clicked() {
+                    d.gallery_open = true;
+                }
+            } else {
+                chip(ui, &fw_text, Tone::Plain, "The firmware in this device's flash (what its boot log says it is, when it says).");
+            }
+
+            // Wi-Fi
+            let n = &d.dev.meta.network;
+            let wifi = n.effective(&defaults);
+            let name = if n.accept_any { "any name".to_string() } else { wifi.ssid.clone() };
+            let connected = d.wifi_watch.connected || matches!(d.improv.outcome, Some(Ok(_)));
+            let wanted = d.wifi_wanted.clone().filter(|w| !w.served);
+            let (text, tone, tip) = if !n.wifi {
+                ("Wi-Fi off".to_string(), Tone::Plain, "This device gets no Wi-Fi network (Details: Network).".to_string())
+            } else if alive && connected {
+                (format!("{name} ✔"), Tone::Good, format!("The firmware joined the emulated Wi-Fi \"{name}\"."))
+            } else if let Some(w) = wanted.filter(|_| alive) {
+                (format!("Wi-Fi: wants \"{}\"", w.ssid), Tone::Warn, format!("The firmware looks for \"{}\" ({}), but this device offers \"{name}\". Use the banner by the console, or Details: Network.", w.ssid, w.security()))
+            } else if let Some(b) = d.wifi_watch.banner.clone().filter(|_| alive) {
+                (format!("{name} ✖"), Tone::Warn, b)
+            } else if alive && d.waiting_for_wifi_setup(alive) {
+                ("Wi-Fi: setup needed".to_string(), Tone::Warn, "The firmware waits for Wi-Fi details: use Send Wi-Fi details, or its hotspot.".to_string())
+            } else if alive {
+                (name.clone(), Tone::Plain, format!("Offered to the firmware as \"{name}\"; it hasn't said it joined (yet)."))
+            } else {
+                (name.clone(), Tone::Plain, format!("Offered to the firmware as \"{name}\" at power-on."))
+            };
+            if chip(ui, text, tone, format!("{tip}\nClick for Details.")).clicked() {
+                open_details = true;
+            }
+
+            // Home Assistant (ESPHome native API, guest port 6053)
+            let api = n.active_forwards().iter().find(|f| f.guest == 6053).map(|f| f.host);
+            let host = if n.lan { cached_lan_ip().map(|ip| ip.to_string()).unwrap_or_else(|| "this PC's IP".into()) } else { "127.0.0.1".to_string() };
+            let esphome = d.fw_kind.starts_with("ESPHome") || d.dev.meta.firmware_label.starts_with("ESPHome");
+            if let Some(hp) = api {
+                let addr = format!("{host}:{hp}");
+                let ha = d.api_clients.home_assistant().map(str::to_string);
+                let (state, tone) = match (&ha, d.api_clients.dashboard_logs(), alive) {
+                    _ if d.ha_action_refused => ("HA actions refused".to_string(), Tone::Warn),
+                    (Some(_), _, true) => ("HA connected".to_string(), Tone::Good),
+                    (None, true, true) => ("dashboard logs only".to_string(), Tone::Plain),
+                    (None, false, true) => ("HA not connected".to_string(), Tone::Plain),
+                    (_, _, false) => ("Home Assistant".to_string(), Tone::Plain),
+                };
+                let mut tip = format!("Home Assistant: add the ESPHome integration with host {host}, port {hp}.");
+                if let Some(h) = ha.filter(|_| alive) {
+                    tip.push_str(&format!("\nConnected: {h}"));
+                }
+                if d.ha_action_refused {
+                    tip.push_str("\nThe firmware refused a Home Assistant action: allow actions for this device in Home Assistant (ESPHome integration, Configure).");
+                }
+                tip.push_str("\nClick to copy host:port.");
+                if chip(ui, format!("{addr} · {state}"), tone, tip).clicked() {
+                    ui.ctx().copy_text(addr.clone());
+                    status = Some(format!("Copied {addr}"));
+                }
+            } else if esphome && n.wifi {
+                if chip(ui, "HA: port 6053 not published", Tone::Plain, "To add this device to Home Assistant, publish its API port (6053) under Details: Network.").clicked() {
+                    open_details = true;
+                }
+            }
+
+            // Serial bridge (RFC 2217)
+            let live_port = d.backend.capabilities().serial_tcp.filter(|_| alive);
+            if let Some(p) = live_port.or(d.dev.meta.serial_tcp_port.filter(|_| features.serial_tcp)) {
+                let url = rfc2217_url(p);
+                let tip = format!("{url} ({})\nesptool --chip esp32 --port {url} --baud 921600 write-flash 0x1000 firmware.bin\nClick to copy the URL. Details has the port settings and Use with….", if live_port.is_some() { "live" } else { "served at power-on" });
+                if chip(ui, format!("rfc2217 :{p}"), if live_port.is_some() { Tone::Good } else { Tone::Plain }, tip).clicked() {
+                    ui.ctx().copy_text(url.clone());
+                    status = Some(format!("Copied {url}"));
+                }
+            }
+        });
+        if let Some(m) = status {
+            self.status = m;
+        }
+        open_details
     }
 
     /// The setup checklist after a catalogue install: compact, dismissable, and each step
@@ -3164,7 +3365,7 @@ impl CydLabApp {
 
     /// Wi-Fi setup for firmware that asks for it: Improv over serial ("Send Wi-Fi details")
     /// and the firmware's own setup hotspot ("Device hotspot").
-    fn wifi_setup_ui(&mut self, ui: &mut egui::Ui, i: usize, alive: bool, features: &EngineFeatures) {
+    fn wifi_setup_ui(&mut self, ui: &mut egui::Ui, i: usize, alive: bool, features: &EngineFeatures, part: WifiPart) {
         use crate::improv::State;
         let wifi = self.devices[i].dev.meta.network.effective(&self.settings.wifi);
         let wifi_on = self.devices[i].dev.meta.network.wifi;
@@ -3185,7 +3386,7 @@ impl CydLabApp {
         };
         let send_enabled = serial.is_some() && wifi_on && d.improv.busy.is_none();
         let provision = crate::improv::Job::Provision { ssid: wifi.ssid.clone(), password: wifi.password.clone() };
-        if waiting {
+        if waiting && part == WifiPart::Banner {
             egui::Frame::new().fill(Color32::from_rgb(90, 60, 10)).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
@@ -3204,84 +3405,86 @@ impl CydLabApp {
                 });
             });
         }
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Wi-Fi setup:").small());
-            if !waiting && ui.add_enabled(send_enabled, egui::Button::new(RichText::new("Send Wi-Fi details").small())).on_hover_text(&send_tip).on_disabled_hover_text(if serial.is_none() { "Power the device on first (needs the engine's serial port)" } else { send_tip.as_str() }).clicked() {
-                job = Some(provision.clone());
+        if part == WifiPart::Setup {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Wi-Fi setup:").small());
+                if !waiting && ui.add_enabled(send_enabled, egui::Button::new(RichText::new("Send Wi-Fi details").small())).on_hover_text(&send_tip).on_disabled_hover_text(if serial.is_none() { "Power the device on first (needs the engine's serial port)" } else { send_tip.as_str() }).clicked() {
+                    job = Some(provision.clone());
+                }
+                if ui
+                    .add_enabled(serial.is_some() && d.improv.busy.is_none(), egui::Button::new(RichText::new("Check").small()))
+                    .on_hover_text("Asks the firmware over serial whether it supports Wi-Fi setup (Improv) and what state it is in. Sends bytes to the board (firmware without Improv may print an error). Briefly takes the serial port: a connected tool is disconnected.")
+                    .clicked()
+                {
+                    job = Some(crate::improv::Job::Probe);
+                }
+                let status = match (d.improv.busy, d.improv.state) {
+                    (Some("provision"), Some(s)) => format!("sending… firmware: {}", s.label()),
+                    (Some("provision"), None) => "sending…".into(),
+                    (Some(_), _) => "asking the firmware…".into(),
+                    (None, Some(s)) => format!("firmware: {}", s.label()),
+                    (None, None) if alive && d.improv.capable => "its log says it supports Improv (nothing sent yet)".into(),
+                    (None, None) if alive && connected => "on Wi-Fi".into(),
+                    (None, None) if alive => "nothing is sent until you ask (Check sends an Improv request)".into(),
+                    (None, None) => "power on first".into(),
+                };
+                if d.improv.busy.is_some() {
+                    ui.spinner();
+                }
+                ui.label(RichText::new(status).small().weak());
+            });
+            if !d.improv.info.is_empty() {
+                ui.label(RichText::new(format!("  {}", d.improv.info.join(" · "))).small().weak());
             }
-            if ui
-                .add_enabled(serial.is_some() && d.improv.busy.is_none(), egui::Button::new(RichText::new("Check").small()))
-                .on_hover_text("Asks the firmware over serial whether it supports Wi-Fi setup (Improv) and what state it is in. Sends bytes to the board (firmware without Improv may print an error). Briefly takes the serial port: a connected tool is disconnected.")
-                .clicked()
-            {
-                job = Some(crate::improv::Job::Probe);
-            }
-            let status = match (d.improv.busy, d.improv.state) {
-                (Some("provision"), Some(s)) => format!("sending… firmware: {}", s.label()),
-                (Some("provision"), None) => "sending…".into(),
-                (Some(_), _) => "asking the firmware…".into(),
-                (None, Some(s)) => format!("firmware: {}", s.label()),
-                (None, None) if alive && d.improv.capable => "its log says it supports Improv (nothing sent yet)".into(),
-                (None, None) if alive && connected => "on Wi-Fi".into(),
-                (None, None) if alive => "nothing is sent until you ask (Check sends an Improv request)".into(),
-                (None, None) => "power on first".into(),
-            };
-            if d.improv.busy.is_some() {
-                ui.spinner();
-            }
-            ui.label(RichText::new(status).small().weak());
-        });
-        if !d.improv.info.is_empty() {
-            ui.label(RichText::new(format!("  {}", d.improv.info.join(" · "))).small().weak());
-        }
-        match d.improv.outcome.clone() {
-            Some(Ok(m)) => {
-                let forwards: Vec<(u16, u16)> = d.dev.meta.network.active_forwards().iter().map(|f| (f.host, f.guest)).collect();
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(format!("  Done: {m}")).small().color(Color32::LIGHT_GREEN));
-                    if d.improv.url.is_none() {
-                        if let Some((hp, _)) = forwards.iter().find(|(_, g)| *g == 6053) {
-                            let host = cached_lan_ip().map(|ip| ip.to_string()).unwrap_or_else(|| "this PC's IP".into());
-                            ui.label(RichText::new(format!("Home Assistant: add the ESPHome integration with host {host}, port {hp}")).small());
-                        }
-                    }
-                    if let Some(url) = d.improv.url.clone() {
-                        match crate::improv::local_url(&url, &forwards) {
-                            Some(local) => {
-                                ui.hyperlink_to(RichText::new(format!("open {local}")).small(), local).on_hover_text(format!("The firmware reported {url} (its address on the emulated network), published on this PC."));
-                            }
-                            None => {
-                                ui.label(RichText::new(format!("(it reported {url}, its address inside the emulator: publish port {} under Network to open it here)", url_port(&url))).small().weak()).on_hover_text(INTERNAL_IP_TIP);
+            match d.improv.outcome.clone() {
+                // Success shows in the Wi-Fi chip; only a page address is worth a line here.
+                Some(Ok(_)) if d.improv.url.is_some() => {
+                    let forwards: Vec<(u16, u16)> = d.dev.meta.network.active_forwards().iter().map(|f| (f.host, f.guest)).collect();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("  Its web page:").small());
+                        if let Some(url) = d.improv.url.clone() {
+                            match crate::improv::local_url(&url, &forwards) {
+                                Some(local) => {
+                                    ui.hyperlink_to(RichText::new(format!("open {local}")).small(), local).on_hover_text(format!("The firmware reported {url} (its address on the emulated network), published on this PC."));
+                                }
+                                None => {
+                                    ui.label(RichText::new(format!("(it reported {url}, its address inside the emulator: publish port {} under Network to open it here)", url_port(&url))).small().weak()).on_hover_text(INTERNAL_IP_TIP);
+                                }
                             }
                         }
-                    }
-                });
+                    });
+                }
+                Some(Err(e)) => {
+                    ui.label(RichText::new(format!("  Failed: {e}")).small().color(Color32::from_rgb(240, 120, 100)));
+                }
+                Some(Ok(_)) | None => {}
             }
-            Some(Err(e)) => {
-                ui.label(RichText::new(format!("  Failed: {e}")).small().color(Color32::from_rgb(240, 120, 100)));
+            if let Some(err) = d.improv.error.filter(|_| d.improv.outcome.is_none()) {
+                ui.label(RichText::new(format!("  firmware error: {}", crate::improv::error_label(err))).small().weak());
             }
-            None => {}
-        }
-        if let Some(err) = d.improv.error.filter(|_| d.improv.outcome.is_none()) {
-            ui.label(RichText::new(format!("  firmware error: {}", crate::improv::error_label(err))).small().weak());
         }
 
         // Device hotspot: only with an engine that can join it (--ap-client/--ap-fwd). With the
         // live link it is joined at run time (control channel); otherwise at the next power-on.
-        if features.ap_client {
+        // Seen on the air (the engine's phone) first, then names the firmware printed.
+        let mut seen: Vec<(String, Option<bool>)> = d.ap.status.as_ref().and_then(|s| s.phone.as_ref()).map(|p| p.hotspots.iter().map(|h| (h.ssid.clone(), Some(h.secure))).collect()).unwrap_or_default();
+        for n in &d.hotspot_ssids {
+            if !seen.iter().any(|(s, _)| s == n) {
+                seen.push((n.clone(), None));
+            }
+        }
+        // Only when there is a hotspot to join (or the firmware waits for setup), or one is in use.
+        let hotspot_relevant = !seen.is_empty() || waiting || d.hotspot.is_some() || d.ap.joining.is_some() || d.ap.left.is_some();
+        if part == WifiPart::Hotspot && !hotspot_relevant {
+            d.ap.panel_open = false;
+        }
+        if features.ap_client && part == WifiPart::Hotspot && hotspot_relevant {
             let catalog = &self.catalog;
             let live = d.link_up && alive;
             let hs_id = ui.make_persistent_id(("hotspot", i));
             let hs_state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), hs_id, false);
             let mut hs_header_clicked = false;
             d.ap.panel_open = hs_state.is_open() && live;
-            // Seen on the air (the engine's phone) first, then names the firmware printed.
-            let mut seen: Vec<(String, Option<bool>)> = d.ap.status.as_ref().and_then(|s| s.phone.as_ref()).map(|p| p.hotspots.iter().map(|h| (h.ssid.clone(), Some(h.secure))).collect()).unwrap_or_default();
-            for n in &d.hotspot_ssids {
-                if !seen.iter().any(|(s, _)| s == n) {
-                    seen.push((n.clone(), None));
-                }
-            }
             if hs_state.is_open() && live && !d.ap.scanning {
                 // A phone that only listens, so the panel can list the hotspots on the air.
                 if d.ap.ask(d.backend.as_mut(), crate::hotspot::client_message(None, "", None)).is_ok() {
@@ -4096,9 +4299,22 @@ impl eframe::App for CydLabApp {
                 ui.separator();
                 let running = self.devices.iter().filter(|d| matches!(d.backend.state(), RunState::Running(_))).count();
                 ui.label(format!("{} devices, {running} running", self.devices.len()));
+                // Messages fade after a few seconds (longer for failures).
+                if self.status != self.status_shown.0 {
+                    self.status_shown = (self.status.clone(), Instant::now());
+                }
                 if !self.status.is_empty() {
-                    ui.separator();
-                    ui.label(RichText::new(&self.status).small());
+                    let low = self.status.to_ascii_lowercase();
+                    let keep = Duration::from_secs(if low.contains("fail") || low.contains("could not") || low.contains("error") { 20 } else { 6 });
+                    let left = keep.saturating_sub(self.status_shown.1.elapsed());
+                    if left.is_zero() {
+                        self.status.clear();
+                        self.status_shown.0.clear();
+                    } else {
+                        ui.separator();
+                        ui.label(RichText::new(&self.status).small());
+                        ui.ctx().request_repaint_after(left);
+                    }
                 }
             });
         });
@@ -4232,6 +4448,14 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn short_board_names() {
+        assert_eq!(short_board_name("ESP32-2432S028R original (micro-USB)"), "2432S028R micro-USB");
+        assert_eq!(short_board_name("ESP32-2432S028R (two USB)"), "2432S028R two USB");
+        assert_eq!(short_board_name("TTGO T-Display (test)"), "TTGO T-Display test");
+        assert_eq!(short_board_name("Plain board"), "Plain board");
+    }
 
     #[test]
     fn symbol_fonts_are_bundled() {

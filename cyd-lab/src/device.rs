@@ -58,6 +58,13 @@ pub struct DeviceMeta {
     /// Unix seconds.
     #[serde(default)]
     pub created: u64,
+    /// What the firmware said it is (e.g. "ESPHome 2026.10 · esphome-web-16f414"), from its boot
+    /// log; cleared when the flash is written or erased.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub firmware_label: String,
+    /// The device panel's Details section is open (remembered per device).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub details_open: bool,
     /// Wi-Fi access point and published ports (`[network]`). Plain text, password included.
     #[serde(default)]
     pub network: crate::network::DeviceNetwork,
@@ -199,6 +206,8 @@ impl DeviceStore {
             notes: String::new(),
             view_rotation: profile.display.as_ref().map(|d| d.default_rotation).unwrap_or(0),
             created: now,
+            firmware_label: String::new(),
+            details_open: false,
             network: crate::network::DeviceNetwork::for_new_device(wifi),
             screen_window: ScreenWindow::default(),
             guide: None,

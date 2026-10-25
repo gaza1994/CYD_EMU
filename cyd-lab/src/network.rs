@@ -592,8 +592,39 @@ pub fn ha_action_refused(line: &str) -> bool {
         || l.contains("allow the device to make home assistant service calls")
 }
 
+/// What a boot log line says about the firmware: ESPHome's version and the device's hostname.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FirmwareClue {
+    /// "ESPHome 2026.10" (major.minor).
+    Kind(String),
+    Host(String),
+}
+
+pub fn firmware_clue(line: &str) -> Option<FirmwareClue> {
+    if let Some(rest) = line.split("ESPHome version ").nth(1) {
+        let v = rest.split_whitespace().next()?;
+        let mm: Vec<&str> = v.split('.').take(2).collect();
+        if mm.len() == 2 && mm.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
+            return Some(FirmwareClue::Kind(format!("ESPHome {}", mm.join("."))));
+        }
+        return None;
+    }
+    let rest = line.split("Hostname: ").nth(1)?;
+    let h = rest.trim().trim_matches(|c| c == '\'' || c == '"');
+    (!h.is_empty() && h.len() <= 63 && h.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')).then(|| FirmwareClue::Host(h.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn firmware_clues() {
+        assert_eq!(firmware_clue("[12:00:01][C][app:100]: ESPHome version 2026.10.0 compiled on Oct 20 2026, 10:00:00"), Some(FirmwareClue::Kind("ESPHome 2026.10".into())));
+        assert_eq!(firmware_clue("[C][wifi:600]:   Hostname: 'esphome-web-16f414'"), Some(FirmwareClue::Host("esphome-web-16f414".into())));
+        assert_eq!(firmware_clue("[C][mdns:100]:   Hostname: cyd-panel"), Some(FirmwareClue::Host("cyd-panel".into())));
+        assert_eq!(firmware_clue("Hostname: '' "), None);
+        assert_eq!(firmware_clue("nothing here"), None);
+    }
+
     use super::*;
 
     #[test]

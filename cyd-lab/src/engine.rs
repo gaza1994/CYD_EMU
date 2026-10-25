@@ -1279,6 +1279,8 @@ mod tests {
                 notes: String::new(),
                 view_rotation: 0,
                 created: 0,
+                firmware_label: String::new(),
+                details_open: false,
                 network: Default::default(),
                 screen_window: Default::default(),
                 guide: None,
