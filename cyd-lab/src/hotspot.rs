@@ -76,6 +76,28 @@ pub fn sniff_ssid(line: &str) -> Option<String> {
             }
         }
     }
+    quoted_after_ap(line)
+}
+
+/// `AP 'name' up` (CYD Weather Dashboard) or `AP "name" started`: a quoted name right after
+/// the word AP.
+fn quoted_after_ap(line: &str) -> Option<String> {
+    let b = line.as_bytes();
+    for (at, _) in line.match_indices(|c| c == '\'' || c == '"') {
+        let q = b[at] as char;
+        if at < 3 || !line[..at].ends_with(' ') {
+            continue;
+        }
+        let word = line[..at - 1].to_ascii_lowercase();
+        let ap_word = word.ends_with("softap") || (word.ends_with("ap") && (at == 3 || !b[at - 4].is_ascii_alphanumeric()));
+        if !ap_word {
+            continue;
+        }
+        let name = line[at + 1..].split(q).next().unwrap_or("");
+        if !name.is_empty() && name.len() <= 32 && line[at + 1 + name.len()..].starts_with(q) {
+            return Some(name.to_string());
+        }
+    }
     None
 }
 
@@ -500,6 +522,13 @@ mod tests {
         assert_eq!(sniff_ssid("softAP SSID: NerdMinerAP").as_deref(), Some("NerdMinerAP"));
         assert_eq!(sniff_ssid("Starting AP: \"WLED-AP\"").as_deref(), Some("WLED-AP"));
         assert_eq!(sniff_ssid("[wifi] connected to HomeNet"), None);
+        // CYD Weather Dashboard, and the engine's own report of a hotspot it hears on the air.
+        assert_eq!(sniff_ssid("[       444][W][NET  ] AP 'CYD-4578' up, portal at http://192.168.4.1").as_deref(), Some("CYD-4578"));
+        assert_eq!(sniff_ssid("[emu] device hotspot: 'CYD-2211' bssid 24:6f:28:00:11:23 channel 1 (WPA2-PSK)").as_deref(), Some("CYD-2211"));
+        assert_eq!(sniff_ssid("SoftAP \"Setup-1\" started").as_deref(), Some("Setup-1"));
+        assert_eq!(sniff_ssid("map 'level1' loaded"), None);
+        assert_eq!(sniff_ssid("snap 'x'"), None);
+        assert_eq!(sniff_ssid("AP 'unterminated"), None);
         let mut l = vec![];
         remember(&mut l, "a".into());
         remember(&mut l, "b".into());

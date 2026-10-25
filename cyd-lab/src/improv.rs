@@ -443,6 +443,9 @@ pub fn sniff_setup(line: &str) -> Option<Clue> {
         "starting config portal",
         "config portal running",
         "configportal",
+        // CYD Weather Dashboard
+        "starting setup ap",
+        "no wifi credentials",
         // generic
         "waiting for wi-fi setup",
         "waiting for wifi setup",
@@ -472,6 +475,7 @@ mod tests {
         assert_eq!(sniff_setup("WIFI: Temporary Access Point HASP-d43f84 password: haspadmin"), Some(Clue::Waiting));
         assert_eq!(sniff_setup("00:00:03.123 WIF: WifiManager active for 3 minutes"), Some(Clue::Waiting));
         assert_eq!(sniff_setup("*wm:StartAP with SSID:  NerdMinerAP"), Some(Clue::Waiting));
+        assert_eq!(sniff_setup("[       290][W][NET  ] no WiFi credentials, starting setup AP"), Some(Clue::Waiting));
         assert_eq!(sniff_setup("[wifi] connected to HomeNet"), None);
         assert_eq!(sniff_setup("[C][wifi:440]: Local MAC: 24:0A:C4:01:02:03"), None);
         // What firmware without Improv prints when a tool sends it a packet.
