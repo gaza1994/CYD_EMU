@@ -34,8 +34,8 @@ screenshots in `cyd-emulator/variants/`.
 | `cyd-3248s035r` | ST7796 | 320×480 | XPT2046 on the panel's bus | 27 | Sunton PlatformIO board JSON esp32-3248S035R | upright, 0x48 | 9/9, 0 px |
 | `cyd-3248s035c` | ST7796 | 320×480 | GT911 | 27 | Sunton PlatformIO board JSON esp32-3248S035C | upright, 0x48 | 9/9, 1 px |
 
-The Sunton PlatformIO board JSON sources are `https://github.com/rzeldent/platformio-espressif32-sunton` (board JSON
-files); the ESP32-Cheap-Yellow-Display PINS.md source is `https://github.com/witnessmenow/ESP32-Cheap-Yellow-Display`.
+The Sunton PlatformIO board JSONs are at `https://github.com/rzeldent/platformio-espressif32-sunton`;
+ESP32-Cheap-Yellow-Display PINS.md is at `https://github.com/witnessmenow/ESP32-Cheap-Yellow-Display`.
 Each profile's `sources` key carries its exact URLs.
 
 All profiles share SPI SCLK 14, MOSI 13, MISO 12, CS 15 and DC 2 for the panel; the common-anode
