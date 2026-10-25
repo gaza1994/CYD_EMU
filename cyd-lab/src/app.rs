@@ -2056,6 +2056,7 @@ impl CydLabApp {
 
     fn poll_backends(&mut self, ctx: &egui::Context) {
         let mut any_running = false;
+        let mut open_err = None;
         for d in &mut self.devices {
             if let Some(rx) = &d.web_job {
                 let msgs: Vec<WebMsg> = rx.try_iter().collect();
@@ -2142,7 +2143,10 @@ impl CydLabApp {
                     });
                     let url = url.unwrap_or_else(|| plan.url());
                     d.lab(format!("device hotspot: opening {url}"));
-                    ctx.open_url(egui::OpenUrl::new_tab(url));
+                    if let Err(e) = crate::open::url(&url) {
+                        d.lab(format!("device hotspot: {e}"));
+                        open_err = Some(e);
+                    }
                 }
             }
             // Live hotspot: newer engines push ap_status on change; older ones are polled
@@ -2163,7 +2167,10 @@ impl CydLabApp {
             }
             if let Some(url) = d.ap.take_open_url() {
                 d.lab(format!("device hotspot: joined; opening {url} (the page at {} on the device's hotspot)", d.ap.bound.as_ref().map(|b| b.1.clone()).unwrap_or_default()));
-                ctx.open_url(egui::OpenUrl::new_tab(url));
+                if let Err(e) = crate::open::url(&url) {
+                    d.lab(format!("device hotspot: {e}"));
+                    open_err = Some(e);
+                }
             }
             if d.improv.busy.is_some() || d.hotspot_open_at.is_some() {
                 ctx.request_repaint_after(Duration::from_millis(250));
@@ -2178,6 +2185,9 @@ impl CydLabApp {
                 d.screen_size = (f.width, f.height);
             }
             any_running |= matches!(d.backend.state(), RunState::Running(_) | RunState::Stopping);
+        }
+        if let Some(e) = open_err {
+            self.status = e;
         }
         self.publish_running();
         if any_running {
@@ -2469,7 +2479,7 @@ impl CydLabApp {
                                         }
                                     }
                                     if !e.homepage.is_empty() {
-                                        ui.hyperlink_to(RichText::new("homepage").small(), &e.homepage);
+                                        open_link(ui, RichText::new("homepage").small(), &e.homepage);
                                     }
                                     if !e.licence.is_empty() {
                                         ui.label(RichText::new(&e.licence).small().weak());
@@ -2491,7 +2501,7 @@ impl CydLabApp {
                                 ui.horizontal_wrapped(|ui| {
                                     ui.label(RichText::new(format!("{}: {}", u.name, u.reason)).small());
                                     if !u.homepage.is_empty() {
-                                        ui.hyperlink_to(RichText::new("link").small(), &u.homepage);
+                                        open_link(ui, RichText::new("link").small(), &u.homepage);
                                     }
                                 });
                             }
@@ -3741,7 +3751,7 @@ impl CydLabApp {
                         if let Some(url) = d.improv.url.clone() {
                             match crate::improv::local_url(&url, &forwards) {
                                 Some(local) => {
-                                    ui.hyperlink_to(RichText::new(format!("open {local}")).small(), local).on_hover_text(format!("The firmware reported {url} (its address on the emulated network), published on this PC."));
+                                    open_link(ui, RichText::new(format!("open {local}")).small(), &local).on_hover_text(format!("{local}\nThe firmware reported {url} (its address on the emulated network), published on this PC."));
                                 }
                                 None => {
                                     ui.label(RichText::new(format!("(it reported {url}, its address inside the emulator: publish port {} under Network to open it here)", url_port(&url))).small().weak()).on_hover_text(INTERNAL_IP_TIP);
@@ -3885,7 +3895,7 @@ impl CydLabApp {
                         }
                         if let Some(url) = d.ap.proxy.as_ref().filter(|p| p.target().is_some()).map(|p| p.url()) {
                             if ui.small_button("Open page").on_hover_text(url.clone()).clicked() {
-                                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                                open_url_ui(ui.ctx(), &url);
                             }
                         }
                         if (d.hotspot.is_some() || d.ap.joining.is_some()) && ui.button("Leave hotspot").on_hover_text("Stop using the device's hotspot (back to the normal Wi-Fi at the next power-on)").clicked() {
@@ -4010,6 +4020,17 @@ impl CydLabApp {
                             let c = if n > 0 { Color32::from_rgb(120, 220, 140) } else { Color32::from_gray(150) };
                             ui.label(RichText::new(format!("{n} connected")).small().color(c)).on_hover_text(if peers.is_empty() { "Nobody is connected to this port".to_string() } else { peers.join("\n") });
                             ui.end_row();
+                        }
+                    });
+                }
+                // Web pages behind the published ports, on this PC (127.0.0.1:host port).
+                let pages: Vec<(String, String)> = d.dev.meta.network.active_forwards().iter().filter_map(|f| crate::open::forward_page_url(f.host, f.guest).map(|u| (u, f.label.clone()))).collect();
+                if alive && !pages.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Open in browser:").small());
+                        for (url, label) in &pages {
+                            let text = if label.is_empty() { url.clone() } else { format!("{label} ({url})") };
+                            open_link(ui, RichText::new(text).small(), url);
                         }
                     });
                 }
@@ -4412,8 +4433,8 @@ impl CydLabApp {
                 self.status = format!("{}: copied {} console lines", d.dev.meta.name, d.console.len());
             }
             if ui.small_button("Open log folder").on_hover_text(format!("The full console is also written to {} (about 2 MB, plus one {} backup).", d.console_log.path().display(), crate::consolelog::OLD_NAME)).clicked() {
-                if let Err(e) = crate::consolelog::open_folder(&d.dev.dir) {
-                    self.status = format!("could not open {}: {e}", d.dev.dir.display());
+                if let Err(e) = crate::open::path(&d.dev.dir) {
+                    self.status = e;
                 }
             }
             if let Some(cmd) = d.backend.last_command() {
@@ -4677,6 +4698,9 @@ impl eframe::App for CydLabApp {
         let ctx = ui.ctx().clone();
         self.fit_window_to_monitor(&ctx);
         self.poll_backends(&ctx);
+        if let Some(e) = take_open_error(&ctx) {
+            self.status = e;
+        }
         self.poll_rom();
         for i in 0..self.devices.len() {
             if self.devices[i].apply_pending(&self.store) {
@@ -4824,6 +4848,27 @@ impl Drop for CydLabApp {
     fn drop(&mut self) {
         self.stop_all();
     }
+}
+
+/// A link that opens `url` in the default browser (through `crate::open`: eframe's own
+/// `open_url` does nothing without its `links` feature). Failures reach the status line.
+fn open_link(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>, url: &str) -> egui::Response {
+    let r = ui.link(text).on_hover_text(url);
+    if r.clicked() {
+        open_url_ui(ui.ctx(), url);
+    }
+    r
+}
+
+/// Opens `url` now; a failure is left for the status line (see `take_open_error`).
+fn open_url_ui(ctx: &egui::Context, url: &str) {
+    if let Err(e) = crate::open::url(url) {
+        ctx.data_mut(|m| m.insert_temp(egui::Id::unique("open-error"), e));
+    }
+}
+
+fn take_open_error(ctx: &egui::Context) -> Option<String> {
+    ctx.data_mut(|m| m.remove_temp::<String>(egui::Id::unique("open-error")))
 }
 
 /// Header text for a `CollapsingState` header: clickable, like a `CollapsingHeader`'s title

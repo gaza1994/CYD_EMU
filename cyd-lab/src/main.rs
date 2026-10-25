@@ -27,6 +27,7 @@ mod hotspot;
 mod improv;
 mod mdnswatch;
 mod network;
+mod open;
 mod profile;
 mod rfc2217;
 mod running;

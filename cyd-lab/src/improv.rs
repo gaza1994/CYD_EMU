@@ -393,7 +393,7 @@ pub fn local_url(url: &str, forwards: &[(u16, u16)]) -> Option<String> {
         None => 80,
     };
     let (host, _) = forwards.iter().find(|(_, g)| *g == port)?;
-    Some(format!("http://127.0.0.1:{host}{path}"))
+    Some(crate::open::page_url("127.0.0.1", *host, path))
 }
 
 /// Spot an Improv packet in a console line (the board printed it to stdout because no

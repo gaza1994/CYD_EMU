@@ -86,27 +86,6 @@ pub fn now_stamp() -> String {
     utc_stamp(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
 }
 
-/// Open a folder in the system file manager (Explorer, Finder, or xdg-open).
-pub fn open_folder(dir: &Path) -> std::io::Result<()> {
-    let prog = if cfg!(windows) {
-        "explorer"
-    } else if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let mut cmd = std::process::Command::new(prog);
-    cmd.arg(dir);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // explorer is a GUI program; no console window either way.
-        cmd.creation_flags(0x0800_0000);
-    }
-    // explorer.exe exits 1 even when it opened the folder, so only a failure to start counts.
-    cmd.spawn().map(|_| ())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

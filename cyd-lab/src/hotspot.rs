@@ -50,7 +50,7 @@ impl Plan {
         vec!["--ap-client".into(), client, "--ap-fwd".into(), format!("tcp:127.0.0.1:{}-{}:{}", self.host_port, self.guest_ip, self.guest_port)]
     }
     pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{}/", self.host_port)
+        crate::open::page_url("127.0.0.1", self.host_port, "/")
     }
 }
 
@@ -297,7 +297,7 @@ impl HostProxy {
         *self.target.lock().unwrap()
     }
     pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{}/", self.port)
+        crate::open::page_url("127.0.0.1", self.port, "/")
     }
 }
 
