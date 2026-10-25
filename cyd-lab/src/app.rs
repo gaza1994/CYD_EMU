@@ -526,6 +526,15 @@ struct DeviceView {
     autoscroll: bool,
     /// Autoscroll held last frame (text selected or being selected in the console).
     console_held: bool,
+    /// The console view was at the end last frame (following new lines).
+    console_following: bool,
+    /// How far above the end the console view was last frame, in points.
+    console_gap: f32,
+    /// ... and when the current hold (selection, press) began.
+    console_follow_at_hold: bool,
+    /// Widest console row laid out so far: the content width only grows, so the horizontal
+    /// scroll range doesn't change as long lines scroll in and out of view.
+    console_width: f32,
     /// The engine's latest `wifi_wanted` this run: the network the firmware asked for.
     wifi_wanted: Option<crate::network::WifiWanted>,
     /// The password typed for that network (its banner's prompt).
@@ -1007,6 +1016,10 @@ impl DeviceView {
             console_dropped: 0,
             console_log,
             console_held: false,
+            console_following: true,
+            console_gap: 0.0,
+            console_follow_at_hold: true,
+            console_width: 0.0,
             wifi_wanted: None,
             wanted_password: String::new(),
             autoscroll: true,
@@ -1347,6 +1360,7 @@ impl DeviceView {
     fn dropped_before_clear(&mut self) {
         self.console_dropped += self.console.len() as u64;
         self.console.clear();
+        self.console_width = 0.0;
     }
 
     fn lab(&mut self, msg: impl Into<String>) {
@@ -4174,10 +4188,29 @@ impl CydLabApp {
         let last_rect = ui.ctx().data(|m| m.get_temp::<egui::Rect>(console_id));
         let pressing = ui.input(|inp| inp.pointer.primary_down() && inp.pointer.press_origin().zip(last_rect).is_some_and(|(p, r)| r.contains(p)));
         let held = selecting || pressing;
-        if d.console_held && !held && d.autoscroll {
+        if held && !d.console_held {
+            d.console_follow_at_hold = d.console_following;
+        }
+        // Back to the end after a selection only if it was following when the hold began:
+        // dragging the scroll bar up (also a press in here) must not snap back on release.
+        if d.console_held && !held && d.autoscroll && d.console_follow_at_hold {
             jump_to_end = true;
         }
         d.console_held = held;
+        // Scrolled back down to (nearly) the end by hand: resume following. egui only re-sticks
+        // when the offset lands exactly on the end, which a wheel rarely does while lines keep
+        // arriving; without this the view sat a fraction of a line short and bounced.
+        // A wheel turned down while already following: nothing further to scroll to, but egui
+        // would start a wheel animation toward the old end, which drags the view up as lines
+        // arrive and unsticks it (the bounce). Swallow it here.
+        let over = ui.input(|inp| inp.pointer.hover_pos()).zip(last_rect).is_some_and(|(p, r)| r.contains(p));
+        if d.autoscroll && !held && d.console_following && over && ui.input(|inp| inp.smooth_scroll_delta().y < 0.0) {
+            ui.input_mut(|inp| inp.smooth_scroll_delta.y = 0.0);
+        }
+        let scrolling = ui.input(|inp| inp.smooth_scroll_delta().y != 0.0);
+        if d.autoscroll && !held && !scrolling && d.console_gap > 0.5 && d.console_following {
+            jump_to_end = true;
+        }
         let frame = egui::Frame::new().fill(Color32::from_gray(16)).inner_margin(4.0).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             let mut area = egui::ScrollArea::both()
@@ -4187,6 +4220,11 @@ impl CydLabApp {
                 .min_scrolled_height(log_h)
                 // Dragging selects text; the wheel and scroll bars scroll.
                 .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR | egui::scroll_area::ScrollSource::MOUSE_WHEEL)
+                // Always shown: a horizontal bar that comes and goes with the visible lines'
+                // width changes the view's height, and the view bounces.
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                // egui's own follow: stays at the end while it is there, pauses when scrolled
+                // up, resumes when scrolled back down. Nothing here moves the offset per frame.
                 .stick_to_bottom(d.autoscroll && !held);
             if jump_to_end {
                 // Past the end (the area clamps it). Not f32::MAX: show_rows turns the offset
@@ -4195,21 +4233,33 @@ impl CydLabApp {
             }
             let first = d.console_dropped;
             let total = d.console.len();
-            area.show_rows(ui, row_h, total, |ui, range| {
+            let mut widest = d.console_width;
+            let out = area.show_rows(ui, row_h, total, |ui, range| {
                 // Clamped: the range egui derives from the offset can run past the rows.
                 let range = range.start.min(total)..range.end.min(total);
+                let w = ui.available_width().max(d.console_width);
                 for (k, (s, line)) in d.console.range(range.clone()).enumerate() {
                     let color = match s {
                         Stream::Stdout => Color32::from_gray(220),
                         Stream::Stderr => Color32::from_rgb(230, 170, 90),
                         Stream::Lab => Color32::from_rgb(120, 170, 240),
                     };
+                    // Exactly one row each, whatever the glyphs (emoji, signal bars): rows of
+                    // another height than show_rows assumes make the end move every frame.
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(w, row_h), Sense::hover());
                     // Id by line number, not row position, so a selection stays on its text.
-                    ui.push_id(first + (range.start + k) as u64, |ui| {
-                        ui.add(egui::Label::new(RichText::new(line).monospace().color(color)).selectable(true).extend());
-                    });
+                    let mut row = ui.new_child(egui::UiBuilder::new().id_salt(first + (range.start + k) as u64).max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                    row.set_clip_rect(rect.intersect(ui.clip_rect()));
+                    let r = row.add(egui::Label::new(RichText::new(line).monospace().color(color)).selectable(true).extend());
+                    widest = widest.max(r.rect.width());
                 }
             });
+            d.console_width = widest;
+            d.console_gap = (out.content_size.y - out.inner_rect.height() - out.state.clamped_offset().y).max(0.0);
+            if !held {
+                // Within a line or so of the end counts as back at the end.
+                d.console_following = d.console_gap <= row_h + ui.spacing().item_spacing.y + 0.5;
+            }
         });
         ui.ctx().data_mut(|m| m.insert_temp(console_id, frame.response.rect));
         ui.horizontal(|ui| {
