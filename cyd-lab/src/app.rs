@@ -2477,12 +2477,20 @@ impl CydLabApp {
         match decision {
             Some(true) => {
                 let mut d = self.devices.remove(i);
-                d.backend.stop();
-                match self.store.delete(&d.dev) {
-                    Ok(()) => self.status = format!("Deleted {}", d.dev.meta.name),
-                    Err(e) => self.status = format!("Delete failed: {e:#}"),
+                d.web_job = None;
+                d.pending_flash = None;
+                match power_off_and_delete(&self.store, d.backend.as_mut(), &mut d.ap.proxy, &d.dev) {
+                    Ok(()) => {
+                        self.status = format!("Deleted {}", d.dev.meta.name);
+                        self.selected = if self.devices.is_empty() { None } else { Some(i.min(self.devices.len() - 1)) };
+                    }
+                    Err(e) => {
+                        // Keep it in the list (powered off) so the user sees what is left.
+                        self.status = format!("Delete failed (the device is powered off; close anything using its folder and try again): {e:#}");
+                        self.devices.insert(i, d);
+                        self.selected = Some(i);
+                    }
                 }
-                self.selected = if self.devices.is_empty() { None } else { Some(i.min(self.devices.len() - 1)) };
                 self.confirm_delete = None;
             }
             Some(false) => self.confirm_delete = None,
@@ -3920,6 +3928,20 @@ impl eframe::App for CydLabApp {
     }
 }
 
+/// Delete a device that may be running: power it off for good first (graceful quit,
+/// killed after [`DELETE_STOP_WAIT`]) and wait until the engine and its COM relay have
+/// exited, so flash.bin is closed (Windows refuses to delete an open file) and its
+/// published ports are free; close the hotspot page proxy (its port too); then remove
+/// the folder, retrying briefly while a file is still locked.
+fn power_off_and_delete(store: &DeviceStore, backend: &mut dyn Backend, proxy: &mut Option<crate::hotspot::HostProxy>, dev: &crate::device::Device) -> anyhow::Result<()> {
+    backend.stop_within(DELETE_STOP_WAIT);
+    *proxy = None;
+    store.delete(dev)
+}
+
+/// How long a delete lets the engine save and quit before killing it.
+const DELETE_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 impl Drop for CydLabApp {
     fn drop(&mut self) {
         self.stop_all();
@@ -4042,6 +4064,82 @@ mod tests {
         let (partial, _) = AppSettings::load(&path);
         assert!(!partial.engine.realtime);
         assert!(partial.engine.live_link);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deleting_a_running_device_stops_it_first_and_frees_everything() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = DeviceStore::open(tmp.path().join("devices")).unwrap();
+        let profile = ProfileLibrary::load(None).get("esp32-2432s028r").unwrap().clone();
+        let dev = store.create("Doomed", &profile).unwrap();
+        // A stubborn engine: ignores SIGTERM and stdin EOF, keeps flash.bin open.
+        let exe = tmp.path().join("fake-esp32sim");
+        std::fs::write(&exe, format!("#!/bin/sh\ntrap '' TERM\nexec 3<'{}'\nwhile :; do sleep 0.05; done\n", dev.flash_path().display())).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let settings = EngineSettings { engine_exe: exe, stop_grace_secs: 60, ..Default::default() };
+        let features = EngineFeatures { found: true, flash_file: true, ..Default::default() };
+        let mut spec = LaunchSpec::build(&profile, &dev, &settings, &features, BootMode::Normal, None, None);
+        spec.relay = Some(crate::combridge::Relay { program: "sleep".into(), args: vec!["30".into()], label: "test relay".into() });
+        let mut b = ProcessBackend::new(std::sync::Arc::new(|| {}));
+        b.start(&spec).unwrap();
+        std::thread::sleep(Duration::from_millis(200)); // let the trap install
+        let pid = b.pid().unwrap();
+        assert!(b.relay_running());
+        let mut proxy = crate::hotspot::HostProxy::start().ok();
+        let proxy_port = proxy.as_ref().unwrap().port;
+
+        let t = Instant::now();
+        power_off_and_delete(&store, &mut b, &mut proxy, &dev).unwrap();
+        // Killed after the short delete wait, not the 60 s grace.
+        assert!(t.elapsed() < DELETE_STOP_WAIT + Duration::from_secs(2), "{:?}", t.elapsed());
+        assert_eq!(b.state(), RunState::Stopped);
+        assert!(b.pid().is_none() && !b.relay_running());
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists(), "engine still alive");
+        assert!(proxy.is_none());
+        assert!(std::net::TcpListener::bind(("127.0.0.1", proxy_port)).is_ok(), "hotspot proxy port still held");
+        assert!(!dev.dir.exists());
+        assert!(store.list().unwrap().0.is_empty());
+        // Deleting a stopped device is immediate.
+        let dev2 = store.create("Idle", &profile).unwrap();
+        power_off_and_delete(&store, &mut b, &mut None, &dev2).unwrap();
+        assert!(!dev2.dir.exists());
+    }
+
+    #[test]
+    fn delete_retries_while_the_folder_is_busy() {
+        // Stand-in for a file still locked on Windows: the folder only becomes deletable
+        // after a moment; the retry loop waits for it instead of failing at once.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("dev");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("flash.bin"), b"x").unwrap();
+        assert!(crate::device::remove_dir_retrying(&tmp.path().join("missing"), std::time::Duration::ZERO).is_ok());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let lock = || std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+            lock();
+            if std::fs::remove_file(dir.join("flash.bin")).is_ok() {
+                return; // running as root: permissions don't lock anything
+            }
+            let d2 = dir.clone();
+            let unlock = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                std::fs::set_permissions(&d2, std::fs::Permissions::from_mode(0o755)).unwrap();
+            });
+            crate::device::remove_dir_retrying(&dir, std::time::Duration::from_secs(3)).unwrap();
+            unlock.join().unwrap();
+            assert!(!dir.exists());
+            // Gives up after the window.
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("f"), b"x").unwrap();
+            lock();
+            assert!(crate::device::remove_dir_retrying(&dir, std::time::Duration::from_millis(300)).is_err());
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 }
 

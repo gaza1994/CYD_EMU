@@ -264,7 +264,7 @@ impl DeviceStore {
         if dev.dir.parent() != Some(self.root.as_path()) {
             bail!("refusing to delete {} (not inside {})", dev.dir.display(), self.root.display());
         }
-        fs::remove_dir_all(&dev.dir).with_context(|| format!("deleting {}", dev.dir.display()))
+        remove_dir_retrying(&dev.dir, DELETE_RETRY).with_context(|| format!("deleting {}", dev.dir.display()))
     }
 
     /// Reset the whole flash to 0xFF, keeping its size.
@@ -377,6 +377,24 @@ fn generate_mac(id: &str, now: u64) -> String {
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// How long a delete keeps retrying while a file in the folder is still locked.
+pub const DELETE_RETRY: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// `remove_dir_all`, retried for up to `window`: on Windows a file another process (the
+/// engine that just exited, an antivirus scan, Explorer's preview) still has open cannot
+/// be deleted for a moment. A folder that is already gone counts as deleted.
+pub fn remove_dir_retrying(dir: &Path, window: std::time::Duration) -> std::io::Result<()> {
+    let until = std::time::Instant::now() + window;
+    loop {
+        match fs::remove_dir_all(dir) {
+            Ok(()) => return Ok(()),
+            Err(_) if !dir.exists() => return Ok(()),
+            Err(e) if std::time::Instant::now() >= until => return Err(e),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
 }
 
 #[cfg(test)]

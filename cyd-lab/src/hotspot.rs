@@ -260,6 +260,7 @@ pub struct HostProxy {
     target: Arc<Mutex<Option<SocketAddr>>>,
     host: Arc<Mutex<String>>,
     stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl HostProxy {
@@ -271,7 +272,7 @@ impl HostProxy {
         let host = Arc::new(Mutex::new(GUEST_AP_IP.to_string()));
         let stop = Arc::new(AtomicBool::new(false));
         let (t, h, st) = (target.clone(), host.clone(), stop.clone());
-        std::thread::Builder::new().name("hotspot-proxy".into()).spawn(move || {
+        let thread = std::thread::Builder::new().name("hotspot-proxy".into()).spawn(move || {
             while !st.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((client, _)) => {
@@ -285,7 +286,7 @@ impl HostProxy {
                 }
             }
         })?;
-        Ok(HostProxy { port, target, host, stop })
+        Ok(HostProxy { port, target, host, stop, thread: Some(thread) })
     }
     /// Where the page is now (the engine's forward for this run) and the guest's address.
     pub fn set_target(&self, to: Option<SocketAddr>, guest_ip: &str) {
@@ -303,6 +304,10 @@ impl HostProxy {
 impl Drop for HostProxy {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // The accept loop wakes every 50 ms; joining means the port is free on return.
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 }
 

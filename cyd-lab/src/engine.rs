@@ -317,8 +317,15 @@ pub trait Backend: Send {
     fn capabilities(&self) -> Capabilities;
     /// Power on with the given launch spec (BOOT strap is part of the spec).
     fn start(&mut self, spec: &LaunchSpec) -> Result<()>;
-    /// Power off.
+    /// Power off. Blocks until the engine process has exited (killed after its grace).
     fn stop(&mut self);
+    /// Power off for good (device delete, quit): like [`Backend::stop`] but waits at most
+    /// `max` for a graceful exit before killing, and returns only once the process and its
+    /// helper are gone, so its open files (flash.bin) and published ports are released.
+    fn stop_within(&mut self, max: Duration) {
+        let _ = max;
+        self.stop()
+    }
     /// Power off without blocking: ask the engine to save and quit; [`Backend::poll`]
     /// finishes the job (or kills it after the grace period).
     fn request_stop(&mut self) {
@@ -777,6 +784,12 @@ impl ProcessBackend {
         }
     }
 
+    /// The engine's process id while it runs. (Tests.)
+    #[cfg(test)]
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| c.id())
+    }
+
     /// Is the helper process still running? (Tests.)
     #[cfg(test)]
     pub fn relay_running(&mut self) -> bool {
@@ -967,6 +980,18 @@ impl Backend for ProcessBackend {
         if let Some(deadline) = self.stop_deadline {
             self.wait_or_kill(deadline);
         }
+        self.state = RunState::Stopped;
+    }
+
+    fn stop_within(&mut self, max: Duration) {
+        self.pending_restart = None;
+        self.request_stop();
+        if self.child.is_some() {
+            let cap = Instant::now() + max;
+            let deadline = self.stop_deadline.map_or(cap, |d| d.min(cap));
+            self.wait_or_kill(deadline);
+        }
+        self.stop_relay();
         self.state = RunState::Stopped;
     }
 
