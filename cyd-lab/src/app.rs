@@ -592,6 +592,12 @@ struct DeviceView {
     /// The setup checklist after installing a catalogue firmware that needs setting up.
     /// The last ESPHome API client the firmware logged as connected.
     api_client: Option<String>,
+    /// Checklist: when every step was first seen ticked (the brief "All set" before folding).
+    guide_all_set: Option<Instant>,
+    /// Checklist re-opened from its one-line status: don't fold it again by itself.
+    guide_reopened: bool,
+    /// Checklist: the firmware was on Wi-Fi in this run (so losing it unticks the step).
+    guide_wifi_seen: bool,
 }
 
 use crate::device::Guide;
@@ -629,6 +635,18 @@ fn zoom_combo(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, zoo
 }
 
 impl DeviceView {
+    /// The hotspot this run's firmware put up (seen by the engine's phone, or named in its log).
+    fn seen_hotspot(&self) -> Option<String> {
+        self.ap.status.as_ref().and_then(|s| s.phone.as_ref()).and_then(|p| p.hotspots.first()).map(|h| h.ssid.clone()).or_else(|| self.hotspot_ssids.last().cloned())
+    }
+
+    /// The firmware is running and asking for Wi-Fi details (Improv ready, a setup line in its
+    /// log, or its own hotspot), and is not on Wi-Fi in this run.
+    fn waiting_for_wifi_setup(&self, alive: bool) -> bool {
+        let connected = self.wifi_watch.connected || matches!(self.improv.outcome, Some(Ok(_)));
+        alive && !connected && self.improv.busy != Some("provision") && (self.improv.state == Some(crate::improv::State::Ready) || self.improv.waiting_log || self.seen_hotspot().is_some())
+    }
+
     /// The panel's size: the live frame's, else the profile's.
     fn panel_dims(&self, profile: Option<&Profile>) -> (usize, usize) {
         if self.screen.is_some() {
@@ -960,6 +978,9 @@ impl DeviceView {
             install: InstallUi::default(),
             fwd: Default::default(),
             api_client: None,
+            guide_all_set: None,
+            guide_reopened: false,
+            guide_wifi_seen: false,
         }
     }
 
@@ -1720,6 +1741,7 @@ impl CydLabApp {
         d.hotspot_open_at = (r.is_ok() && hotspot_ok && d.hotspot.is_some()).then(|| Instant::now() + Duration::from_secs(10));
         d.wifi_ap = d.dev.meta.network.effective(&self.settings.wifi);
         d.wifi_watch = Default::default();
+        d.guide_wifi_seen = false;
         d.link_up = false;
         d.link_lost = false;
         // A real panel starts dark: never show the previous run's last frame.
@@ -2891,27 +2913,77 @@ impl CydLabApp {
         // Remembered in device.toml, so a finished step stays ticked after a restart.
         g.wifi_connected |= d.wifi_watch.connected;
         g.wifi_sent |= matches!(d.improv.outcome, Some(Ok(_)));
-        let wifi_connected = g.wifi_connected;
-        let wifi_done = g.wifi_sent || wifi_connected;
         let ha_client = d.api_client.clone();
         g.ha_seen |= ha_client.as_deref().is_some_and(|c| c.contains("Home Assistant"));
         // The engine's port events: a client the firmware accepted on the published API port.
         let (api_clients, api_peers) = api.map(|p| d.fwd.on_host_port(p)).map(|(n, p)| (n, p.to_vec())).unwrap_or_default();
         g.ha_seen |= alive && api_clients > 0;
         let ha_done = g.ha_manual || g.ha_seen;
+        // Wi-Fi lost in this run (the firmware logged a disconnect): the step is not done.
+        if d.wifi_watch.connected {
+            d.guide_wifi_seen = true;
+        } else if (alive && d.guide_wifi_seen) || d.waiting_for_wifi_setup(alive) {
+            // Also when a remembered tick meets firmware that is asking for Wi-Fi setup again
+            // (its flash was erased or it forgot the network).
+            d.guide_wifi_seen = false;
+            g.wifi_connected = false;
+            g.wifi_sent = false;
+            d.improv.outcome = None;
+        }
+        let wifi_connected = g.wifi_connected;
+        let wifi_done = (g.wifi_sent || wifi_connected) && wifi_on;
+        let all_done = guide_complete(&g, firmware_done, wifi_done, published, ha_done);
+        // Done: "All set" for a moment, then fold into one line (remembered in device.toml).
+        // Anything unticked later brings the full list back.
+        let now = Instant::now();
+        if !all_done {
+            g.collapsed = false;
+            d.guide_all_set = None;
+            d.guide_reopened = false;
+        } else if !g.collapsed && !d.guide_reopened {
+            let since = *d.guide_all_set.get_or_insert(now);
+            match ALL_SET_HOLD.checked_sub(now - since) {
+                Some(left) if !left.is_zero() => ui.ctx().request_repaint_after(left),
+                _ => g.collapsed = true,
+            }
+        }
         let mut close = false;
+        let mut reopen = false;
+        let mut fold = false;
         let green = Color32::from_rgb(110, 200, 130);
         let tick = |ui: &mut egui::Ui, done: bool, text: &str| {
             let (sym, c) = if done { ("✔", green) } else { ("○", Color32::from_gray(170)) };
             ui.label(RichText::new(sym).color(c).strong());
             ui.label(if done { RichText::new(text).color(Color32::from_gray(200)) } else { RichText::new(text).strong() });
         };
+        if g.collapsed {
+            egui::Frame::new().fill(Color32::from_rgb(24, 40, 56)).inner_margin(egui::Margin::symmetric(8, 4)).corner_radius(4.0).show(ui, |ui| {
+                ui.set_width(ui.available_width().min(560.0));
+                // Buttons first (right to left), so a long name is cut short instead of the buttons.
+                let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    close = ui.small_button("×").on_hover_text("Remove this status (the steps are not shown again for this firmware)").clicked();
+                    reopen |= ui.small_button("Show steps").clicked();
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        let text = RichText::new(format!("✔ {}", guide_summary(&g))).color(green);
+                        reopen |= ui.add(egui::Label::new(text).sense(egui::Sense::click()).truncate()).on_hover_text(format!("{}: every step is done. Click to show the steps.", g.name)).clicked();
+                    });
+                });
+            });
+        } else {
         egui::Frame::new().fill(Color32::from_rgb(24, 40, 56)).inner_margin(8.0).corner_radius(4.0).show(ui, |ui| {
             ui.set_width(ui.available_width().min(560.0));
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("Set up {}", g.name)).strong().color(Color32::WHITE));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if all_done {
+                    ui.label(RichText::new("✔ All set").strong().color(green));
+                }
+                let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+                ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     close = ui.small_button("×").on_hover_text("Hide this checklist").clicked();
+                    if all_done && d.guide_reopened {
+                        fold = ui.small_button("Fold").on_hover_text("Back to the one-line status").clicked();
+                    }
                 });
             });
             ui.horizontal(|ui| {
@@ -2990,6 +3062,15 @@ impl CydLabApp {
                 ui.label(RichText::new(format!("• {note}")).small().weak());
             }
         });
+        }
+        if reopen {
+            g.collapsed = false;
+            d.guide_reopened = true;
+        }
+        if fold {
+            g.collapsed = true;
+            d.guide_reopened = false;
+        }
         ui.add_space(4.0);
         let after = (!close).then_some(g);
         if after != Some(before) {
@@ -3035,10 +3116,10 @@ impl CydLabApp {
         let serial = d.backend.capabilities().serial_tcp.filter(|_| alive);
         // Passive: the firmware said so (Improv state it printed, or a setup line in its log), or
         // it put up an access point (named in the log, or seen by the engine's phone).
-        let seen_ap = d.ap.status.as_ref().and_then(|s| s.phone.as_ref()).and_then(|p| p.hotspots.first()).map(|h| h.ssid.clone()).or_else(|| d.hotspot_ssids.last().cloned());
+        let seen_ap = d.seen_hotspot();
         let connected = d.wifi_watch.connected || matches!(d.improv.outcome, Some(Ok(_)));
         let improv_ready = d.improv.state == Some(State::Ready);
-        let waiting = alive && !connected && d.improv.busy != Some("provision") && (improv_ready || d.improv.waiting_log || seen_ap.is_some());
+        let waiting = d.waiting_for_wifi_setup(alive);
         let send_tip = if !wifi_on {
             "Wi-Fi is off for this device (Network section)".to_string()
         } else {
@@ -3928,6 +4009,25 @@ impl eframe::App for CydLabApp {
     }
 }
 
+/// How long the finished checklist shows "All set" before folding into one line.
+const ALL_SET_HOLD: Duration = Duration::from_secs(3);
+
+/// Every step this checklist has is done ("Customise" and the rotation hint are optional).
+fn guide_complete(g: &Guide, firmware: bool, wifi: bool, published: bool, ha: bool) -> bool {
+    firmware && (!g.improv || wifi) && (!g.home_assistant || (published && ha))
+}
+
+/// The folded checklist's one line.
+fn guide_summary(g: &Guide) -> String {
+    if g.home_assistant {
+        "Set up for Home Assistant".to_string()
+    } else if g.improv {
+        format!("{} installed and on Wi-Fi", g.name)
+    } else {
+        format!("{} installed", g.name)
+    }
+}
+
 /// Delete a device that may be running: power it off for good first (graceful quit,
 /// killed after [`DELETE_STOP_WAIT`]) and wait until the engine and its COM relay have
 /// exited, so flash.bin is closed (Windows refuses to delete an open file) and its
@@ -4106,6 +4206,29 @@ mod tests {
         let dev2 = store.create("Idle", &profile).unwrap();
         power_off_and_delete(&store, &mut b, &mut None, &dev2).unwrap();
         assert!(!dev2.dir.exists());
+    }
+
+    #[test]
+    fn checklist_is_complete_only_when_every_step_it_has_is_done() {
+        let ha = Guide { name: "ESPHome".into(), improv: true, home_assistant: true, ..Default::default() };
+        assert!(guide_complete(&ha, true, true, true, true));
+        assert!(!guide_complete(&ha, false, true, true, true));
+        assert!(!guide_complete(&ha, true, false, true, true));
+        assert!(!guide_complete(&ha, true, true, false, true));
+        assert!(!guide_complete(&ha, true, true, true, false));
+        let wifi_only = Guide { name: "openHASP".into(), improv: true, ..Default::default() };
+        assert!(guide_complete(&wifi_only, true, true, false, false));
+        assert!(!guide_complete(&wifi_only, true, false, false, false));
+        let plain = Guide { name: "WLED".into(), ..Default::default() };
+        assert!(guide_complete(&plain, true, false, false, false));
+        assert_eq!(guide_summary(&ha), "Set up for Home Assistant");
+        assert!(guide_summary(&wifi_only).contains("on Wi-Fi"));
+        // Folded state survives a restart; older device.toml files without it unfold.
+        let folded = Guide { collapsed: true, ..ha.clone() };
+        let back: Guide = toml::from_str(&toml::to_string(&folded).unwrap()).unwrap();
+        assert!(back.collapsed);
+        let old: Guide = toml::from_str("name = \"x\"\nimprov = true\n").unwrap();
+        assert!(!old.collapsed);
     }
 
     #[test]

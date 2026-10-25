@@ -91,6 +91,9 @@ pub struct Guide {
     pub wifi_connected: bool,
     /// Home Assistant was seen connecting at some point.
     pub ha_seen: bool,
+    /// Everything was ticked and the checklist folded into a one-line status. Unfolds by
+    /// itself when a step is no longer done (Wi-Fi dropped, firmware erased, ports removed).
+    pub collapsed: bool,
 }
 
 /// Where the device's screen window was ("Pop out"), in points, and how it was shown.
