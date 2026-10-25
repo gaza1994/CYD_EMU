@@ -1052,8 +1052,6 @@ impl TagWin {
     }
 }
 
-/// Where a tag window opens: to the right of the screen (over the console) when there is
-/// room, else below it, never over it. Returns (top-left, width, max height).
 /// Moves a tag window. `Window::current_pos` alone only works the first time: in egui 0.37 a
 /// window with a title bar puts back its stored position after `current_pos` (the title-bar drag
 /// handling in `Window::show`), so the stored position is moved too.
@@ -1065,6 +1063,8 @@ fn move_tag_window<'o>(ctx: &egui::Context, win: egui::Window<'o>, id: egui::Id,
     win.current_pos(pos)
 }
 
+/// Where a tag window opens: to the right of the screen (over the console) when there is
+/// room, else below it, never over it. Returns (top-left, width, max height).
 fn tag_window_place(content: Rect, screen: Option<Rect>, want: f32) -> (Pos2, f32, f32) {
     const GAP: f32 = 10.0;
     const MIN_W: f32 = 300.0;
