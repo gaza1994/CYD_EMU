@@ -163,6 +163,10 @@ pub struct EngineFeatures {
     pub quit_on_stdin_eof: bool,
     /// `--wifi SPEC` (a virtual access point) with `--net nat`.
     pub wifi: bool,
+    /// `--wifi any` / `ssid=*` (match-any) and the `wifi_wanted` event (detected from `--help`).
+    pub wifi_any: bool,
+    /// `\,` / `\\` escapes in the `--wifi` SPEC (detected from `--help`).
+    pub wifi_escapes: bool,
     /// `--hostfwd tcp:HOST:PORT-:GUESTPORT`.
     pub hostfwd: bool,
     /// `--mdns-relay`: answer/forward mDNS between the LAN and the NAT'd chip.
@@ -192,6 +196,8 @@ impl EngineFeatures {
             web_dir: has("--web-dir"),
             quit_on_stdin_eof: has("--quit-on-stdin-eof"),
             wifi: has("--wifi"),
+            wifi_any: help.contains("ssid=*"),
+            wifi_escapes: help.contains("\\, for a comma"),
             hostfwd: has("--hostfwd"),
             mdns_relay: has("--mdns-relay"),
             ap_client: help.contains("--ap-client") && help.contains("--ap-fwd"),
@@ -201,8 +207,7 @@ impl EngineFeatures {
     }
 
     pub fn net(&self) -> crate::network::NetFeatures {
-        // wifi_any (`--wifi ssid=*`) stays off until the engine change lands and is detected.
-        crate::network::NetFeatures { wifi: self.wifi, wifi_any: false, hostfwd: self.hostfwd, mdns_relay: self.mdns_relay }
+        crate::network::NetFeatures { wifi: self.wifi, wifi_any: self.wifi && self.wifi_any, wifi_escapes: self.wifi_escapes, hostfwd: self.hostfwd, mdns_relay: self.mdns_relay }
     }
 
     /// Probe an engine executable (cached by path, size and mtime, so a rebuilt engine is
@@ -1404,6 +1409,12 @@ mod tests {
         let f = EngineFeatures::from_probe("  --wifi SPEC\n  --hostfwd tcp:..\n", b"");
         assert!(f.wifi && f.hostfwd && !f.mdns_relay);
         assert!(EngineFeatures::from_probe("  --mdns-relay MODE\n", b"").mdns_relay);
+        // esp32sim e16060c0's --help.
+        let help = "  --wifi ssid=…,psk=…   a virtual access point\n                        (no psk: open; any SSID or passphrase, \\, for a comma; `any` or ssid=*: the SSID the firmware asks for)\n";
+        let f = EngineFeatures::from_probe(help, b"");
+        assert!(f.wifi && f.wifi_any && f.wifi_escapes && f.net().wifi_any && f.net().wifi_escapes);
+        let old = EngineFeatures::from_probe("  --wifi ssid=…,psk=…   a virtual access point\n", b"");
+        assert!(old.wifi && !old.wifi_any && !old.wifi_escapes);
     }
 
     #[test]

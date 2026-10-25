@@ -526,6 +526,10 @@ struct DeviceView {
     autoscroll: bool,
     /// Autoscroll held last frame (text selected or being selected in the console).
     console_held: bool,
+    /// The engine's latest `wifi_wanted` this run: the network the firmware asked for.
+    wifi_wanted: Option<crate::network::WifiWanted>,
+    /// The password typed for that network (its banner's prompt).
+    wanted_password: String,
     /// BOOT checkbox (latched). The momentary BOOT button ORs into this.
     boot_latched: bool,
     /// GPIO0 level last sent over the live link (BOOT pressed).
@@ -948,6 +952,8 @@ impl DeviceView {
             console_dropped: 0,
             console_log,
             console_held: false,
+            wifi_wanted: None,
+            wanted_password: String::new(),
             autoscroll: true,
             boot_latched: false,
             boot_pin_low: false,
@@ -1765,6 +1771,7 @@ impl CydLabApp {
         d.hotspot_open_at = (r.is_ok() && hotspot_ok && d.hotspot.is_some()).then(|| Instant::now() + Duration::from_secs(10));
         d.wifi_ap = d.dev.meta.network.effective(&self.settings.wifi);
         d.wifi_watch = Default::default();
+        d.wifi_wanted = None;
         d.guide_wifi_seen = false;
         d.link_up = false;
         d.link_lost = false;
@@ -1861,6 +1868,11 @@ impl CydLabApp {
                             d.ap.on_status(st);
                         } else if let Some(ev) = crate::hotspot::FwdEvent::parse(&text) {
                             d.fwd.apply(&ev);
+                        } else if let Some(w) = crate::network::WifiWanted::parse(&text) {
+                            if !w.served && d.wifi_wanted.as_ref().is_none_or(|o| o.ssid != w.ssid) {
+                                d.wanted_password.clear();
+                            }
+                            d.wifi_wanted = Some(w);
                         }
                     }
                     EngineEvent::LinkUp => {
@@ -3501,13 +3513,13 @@ impl CydLabApp {
                             });
                             ui.end_row();
                         });
-                        let any_tip = "The emulated access point answers whatever network name the firmware looks for, so firmware with another name built in joins without changes. The password above still applies (empty = open).";
+                        let any_tip = "The emulated access point answers whatever network name the firmware looks for, so firmware with another name built in joins without changes.\nWith a password above, open and secured (WPA2) joins both work; with none, only open ones (cyd-lab asks for the password if the firmware wants a secured network).";
                         save |= ui.checkbox(&mut n.accept_any, "Accept any network name").on_hover_text(any_tip).changed();
                         if n.accept_any && !features.net().wifi_any {
                             ui.label(RichText::new(format!("Saved for when esp32sim supports it. This engine offers only \"{}\" for now.", n.effective(&defaults).ssid)).small().weak());
                         }
                     });
-                    if let Err(e) = crate::network::validate_wifi(&n.effective(&defaults)) {
+                    if let Err(e) = crate::network::validate_wifi(&n.effective(&defaults), features.net().wifi_escapes) {
                         ui.label(RichText::new(format!("Can't use this: {e}.")).small().color(Color32::from_rgb(230, 120, 90)));
                     }
                     ui.horizontal(|ui| {
@@ -3858,11 +3870,36 @@ impl CydLabApp {
         let mut use_ssid = None;
         // Wi-Fi settings changed since power-on: the banner describes the old access point.
         let now = d.dev.meta.network.effective(&wifi_defaults);
-        let pending = d.wifi_watch.banner.is_some() && (now != d.wifi_ap || !d.dev.meta.network.wifi);
+        let wanted = d.wifi_wanted.clone().filter(|w| !w.served);
+        let pending = (d.wifi_watch.banner.is_some() || wanted.is_some()) && (now != d.wifi_ap || !d.dev.meta.network.wifi);
+        let mut use_wanted = None;
         if pending {
             egui::Frame::new().fill(Color32::from_rgb(40, 70, 100)).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.label(RichText::new(format!("Wi-Fi changed to \"{}\". Power off and on to apply it.", now.ssid)).color(Color32::WHITE));
+            });
+        } else if let Some(w) = wanted {
+            // The engine's wifi_wanted: the firmware asked for a network this access point
+            // doesn't let it join (another name, or secured and no password here).
+            egui::Frame::new().fill(Color32::from_rgb(90, 60, 10)).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("Firmware is looking for \"{}\" ({})", w.ssid, w.security())).color(Color32::WHITE));
+                    if !w.needs_password() && ui.button("Use this name").on_hover_text("Sets this device's emulated Wi-Fi network to this name, then power off and on.").clicked() {
+                        use_wanted = Some((w.ssid.clone(), None));
+                    }
+                });
+                if w.needs_password() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("It wants a secured network: its password").color(Color32::WHITE));
+                        ui.add(egui::TextEdit::singleline(&mut d.wanted_password).password(true).desired_width(160.0).hint_text("8 to 63 characters"));
+                        let check = crate::network::validate_wifi(&crate::network::WifiDetails { ssid: w.ssid.clone(), password: d.wanted_password.clone() }, true);
+                        let ok = !d.wanted_password.is_empty() && check.is_ok();
+                        if ui.add_enabled(ok, egui::Button::new("Use this name")).on_hover_text("The password the firmware was built with (its secrets.yaml, Wi-Fi settings or sketch). Stored on this PC only, in device.toml.").on_disabled_hover_text(check.err().unwrap_or_else(|| "Type the password the firmware expects".into())).clicked() {
+                            use_wanted = Some((w.ssid.clone(), Some(d.wanted_password.clone())));
+                        }
+                    });
+                }
             });
         } else if let Some(b) = d.wifi_watch.banner.clone() {
             egui::Frame::new().fill(Color32::from_rgb(90, 60, 10)).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
@@ -3876,6 +3913,22 @@ impl CydLabApp {
                     }
                 });
             });
+        }
+        if let Some((ssid, password)) = use_wanted {
+            let n = &mut d.dev.meta.network;
+            n.ssid = ssid;
+            n.wifi = true;
+            match password {
+                Some(p) => n.password = p,
+                // Asked for an open network: no password, or the join is refused.
+                None if d.wifi_wanted.as_ref().is_some_and(|w| w.secure == Some(false)) => n.password.clear(),
+                None => {}
+            }
+            d.wanted_password.clear();
+            if let Err(e) = d.dev.save() {
+                d.lab(format!("could not save device settings: {e:#}"));
+            }
+            d.lab("Wi-Fi network updated. Power off and on to apply it.");
         }
         if let Some(w) = use_ssid {
             d.dev.meta.network.ssid = w;

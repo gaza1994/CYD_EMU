@@ -148,37 +148,89 @@ impl DeviceNetwork {
     }
 }
 
-/// Why an SSID or password can't be given to the engine. esp32sim's `--wifi` SPEC is
-/// `key=value` pairs split on `,` with no escaping, so a comma can't be carried.
-pub fn validate_wifi(w: &WifiDetails) -> Result<(), String> {
+/// Why an SSID or password can't be given to the engine. `escapes`: the engine takes `\,`
+/// and `\\` in its `--wifi` SPEC; older builds split on `,` with no escaping, so a comma
+/// can't be carried.
+pub fn validate_wifi(w: &WifiDetails, escapes: bool) -> Result<(), String> {
     if w.ssid.is_empty() {
         return Err("the network name is empty".into());
     }
     if w.ssid.len() > 32 {
         return Err(format!("the network name is {} bytes; Wi-Fi allows at most 32", w.ssid.len()));
     }
-    if w.ssid.contains(',') || w.password.contains(',') {
+    if !escapes && (w.ssid.contains(',') || w.password.contains(',')) {
         return Err("the engine can't take a comma in the network name or password yet (its --wifi option splits on commas)".into());
     }
-    if !w.password.is_empty() && !(8..=63).contains(&w.password.chars().count()) {
+    let raw_key = w.password.len() == 64 && w.password.bytes().all(|b| b.is_ascii_hexdigit());
+    if !w.password.is_empty() && !raw_key && !(8..=63).contains(&w.password.chars().count()) {
         return Err("a WPA2 password is 8 to 63 characters (or leave it empty for an open network)".into());
     }
     Ok(())
 }
 
 /// `--wifi` SPEC: `ssid=NAME` (open) or `ssid=NAME,psk=PASSWORD`. `=` inside a value is
-/// fine (the engine splits each pair at the first `=`).
-pub fn wifi_spec(w: &WifiDetails) -> Result<String, String> {
-    validate_wifi(w)?;
-    Ok(if w.password.is_empty() { format!("ssid={}", w.ssid) } else { format!("ssid={},psk={}", w.ssid, w.password) })
+/// fine (the engine splits each pair at the first `=`); with `escapes`, `\` and `,` are
+/// written `\\` and `\,`.
+pub fn wifi_spec(w: &WifiDetails, escapes: bool) -> Result<String, String> {
+    validate_wifi(w, escapes)?;
+    let e = |v: &str| if escapes { spec_escape(v) } else { v.to_string() };
+    Ok(if w.password.is_empty() { format!("ssid={}", e(&w.ssid)) } else { format!("ssid={},psk={}", e(&w.ssid), e(&w.password)) })
+}
+
+/// A `--wifi` SPEC value: `\` -> `\\`, `,` -> `\,`.
+pub fn spec_escape(v: &str) -> String {
+    v.replace('\\', "\\\\").replace(',', "\\,")
+}
+
+/// The engine's `wifi_wanted` event: `{"t":"wifi_wanted","ssid":"X","secure":true|false|null,"served":bool}`,
+/// the network the firmware asked for (a directed probe, or the security it picked).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WifiWanted {
+    pub ssid: String,
+    /// `Some(true)` WPA2, `Some(false)` open, `None` not known yet (only probed).
+    pub secure: Option<bool>,
+    /// The access point lets that join through.
+    pub served: bool,
+}
+
+impl WifiWanted {
+    pub fn parse(text: &str) -> Option<WifiWanted> {
+        let v: serde_json::Value = serde_json::from_str(text).ok()?;
+        if v.get("t")?.as_str()? != "wifi_wanted" {
+            return None;
+        }
+        let ssid = v.get("ssid")?.as_str()?;
+        // Not a name to offer: empty, or control bytes / invalid UTF-8 (seen from openHASP's
+        // setup mode: a probe for "\u{2}").
+        if ssid.is_empty() || ssid.chars().any(|c| c.is_control() || c == '\u{FFFD}') {
+            return None;
+        }
+        Some(WifiWanted { ssid: ssid.to_string(), secure: v.get("secure").and_then(|s| s.as_bool()), served: v.get("served").and_then(|s| s.as_bool()).unwrap_or(false) })
+    }
+
+    /// "secured", "open" or "security not known yet".
+    pub fn security(&self) -> &'static str {
+        match self.secure {
+            Some(true) => "secured",
+            Some(false) => "open",
+            None => "security not known yet",
+        }
+    }
+
+    /// Joining needs a password this device doesn't have: WPA2 and not let through.
+    pub fn needs_password(&self) -> bool {
+        self.secure == Some(true) && !self.served
+    }
 }
 
 /// The engine features this needs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NetFeatures {
     pub wifi: bool,
-    /// `--wifi ssid=*` (answer any network name).
+    /// `--wifi any` / `ssid=*,psk=…` (answer any network name).
     pub wifi_any: bool,
+    /// `\,` and `\\` escapes in the `--wifi` SPEC.
+    pub wifi_escapes: bool,
     pub hostfwd: bool,
     pub mdns_relay: bool,
 }
@@ -195,9 +247,9 @@ pub fn engine_args(net: &DeviceNetwork, defaults: &WifiDetails, f: NetFeatures, 
         return (a, notes);
     }
     let w = net.effective(defaults);
-    let spec = match wifi_spec(&w) {
+    let spec = match wifi_spec(&w, f.wifi_escapes) {
         Ok(_) if net.accept_any && f.wifi_any => {
-            if w.password.is_empty() { "ssid=*".to_string() } else { format!("ssid=*,psk={}", w.password) }
+            if w.password.is_empty() { "any".to_string() } else { format!("ssid=*,psk={}", spec_escape(&w.password)) }
         }
         Ok(s) => {
             if net.accept_any {
@@ -509,16 +561,41 @@ mod tests {
         WifiDetails { ssid: s.into(), password: p.into() }
     }
 
+    fn wifi_spec_old(w: &WifiDetails) -> Result<String, String> {
+        wifi_spec(w, false)
+    }
+
+    #[test]
+    fn wifi_spec_escapes_and_wanted_events() {
+        let e = |s: &str, p: &str| wifi_spec(&w(s, p), true);
+        assert_eq!(e("Home,Net", "sec,ret\\12").unwrap(), "ssid=Home\\,Net,psk=sec\\,ret\\\\12");
+        assert_eq!(e("Café 5G", "").unwrap(), "ssid=Café 5G");
+        assert!(e("x", &"ab".repeat(32)).is_ok(), "a 64-hex-digit raw key");
+        assert!(e("x", &"zz".repeat(32)).is_err());
+        let any = NetFeatures { wifi: true, wifi_any: true, wifi_escapes: true, hostfwd: false, mdns_relay: false };
+        let n = DeviceNetwork { ssid: "esp32sim".into(), password: "pa,ss\\word".into(), accept_any: true, lan: false, ..Default::default() };
+        assert_eq!(engine_args(&n, &WifiDetails::default(), any, &|_, _| true).0.join(" "), "--wifi ssid=*,psk=pa\\,ss\\\\word --net nat");
+        let ev = WifiWanted::parse(r#"{"t":"wifi_wanted","ssid":"cyd-lab","secure":true,"served":false}"#).unwrap();
+        assert_eq!(ev, WifiWanted { ssid: "cyd-lab".into(), secure: Some(true), served: false });
+        assert!(ev.needs_password());
+        let probe = WifiWanted::parse(r#"{"t":"wifi_wanted","ssid":"Home Net","secure":null,"served":true}"#).unwrap();
+        assert_eq!((probe.secure, probe.served, probe.security(), probe.needs_password()), (None, true, "security not known yet", false));
+        assert_eq!(WifiWanted::parse(r#"{"t":"ap_status"}"#), None);
+        assert_eq!(WifiWanted::parse("not json"), None);
+        assert_eq!(WifiWanted::parse(r#"{"t":"wifi_wanted","ssid":"\u0002","secure":null,"served":false}"#), None);
+        assert_eq!(WifiWanted::parse(r#"{"t":"wifi_wanted","ssid":"","secure":null,"served":false}"#), None);
+    }
+
     #[test]
     fn wifi_spec_and_validation() {
-        assert_eq!(wifi_spec(&w("HomeNet", "secret123")).unwrap(), "ssid=HomeNet,psk=secret123");
-        assert_eq!(wifi_spec(&w("Cafe Guest", "")).unwrap(), "ssid=Cafe Guest");
-        assert_eq!(wifi_spec(&w("a=b", "x=y=z!\"#")).unwrap(), "ssid=a=b,psk=x=y=z!\"#");
-        assert!(wifi_spec(&w("Home,Net", "secret123")).unwrap_err().contains("comma"));
-        assert!(wifi_spec(&w("Home", "sec,ret123")).unwrap_err().contains("comma"));
-        assert!(wifi_spec(&w("Home", "short")).is_err());
-        assert!(wifi_spec(&w("", "")).is_err());
-        assert!(wifi_spec(&w(&"x".repeat(33), "")).is_err());
+        assert_eq!(wifi_spec_old(&w("HomeNet", "secret123")).unwrap(), "ssid=HomeNet,psk=secret123");
+        assert_eq!(wifi_spec_old(&w("Cafe Guest", "")).unwrap(), "ssid=Cafe Guest");
+        assert_eq!(wifi_spec_old(&w("a=b", "x=y=z!\"#")).unwrap(), "ssid=a=b,psk=x=y=z!\"#");
+        assert!(wifi_spec_old(&w("Home,Net", "secret123")).unwrap_err().contains("comma"));
+        assert!(wifi_spec_old(&w("Home", "sec,ret123")).unwrap_err().contains("comma"));
+        assert!(wifi_spec_old(&w("Home", "short")).is_err());
+        assert!(wifi_spec_old(&w("", "")).is_err());
+        assert!(wifi_spec_old(&w(&"x".repeat(33), "")).is_err());
     }
 
     #[test]
@@ -553,7 +630,7 @@ mod tests {
 
     #[test]
     fn engine_command_line() {
-        let all = NetFeatures { wifi: true, wifi_any: false, hostfwd: true, mdns_relay: true };
+        let all = NetFeatures { wifi: true, wifi_any: false, wifi_escapes: false, hostfwd: true, mdns_relay: true };
         let mut n = DeviceNetwork { ssid: "HomeNet".into(), password: "secret123".into(), ..Default::default() };
         let (a, notes) = engine_args(&n, &WifiDetails::default(), all, &|_, _| true);
         assert_eq!(a.join(" "), "--wifi ssid=HomeNet,psk=secret123 --net nat --mdns-relay auto");
@@ -578,14 +655,14 @@ mod tests {
 
     #[test]
     fn accept_any_network_name() {
-        let f = NetFeatures { wifi: true, wifi_any: false, hostfwd: false, mdns_relay: false };
+        let f = NetFeatures { wifi: true, wifi_any: false, wifi_escapes: false, hostfwd: false, mdns_relay: false };
         let mut n = DeviceNetwork { ssid: "esp32sim".into(), accept_any: true, lan: false, ..Default::default() };
         // An engine without match-any: the named network, with a note.
         let (a, notes) = engine_args(&n, &WifiDetails::default(), f, &|_, _| true);
         assert_eq!(a.join(" "), "--wifi ssid=esp32sim --net nat");
         assert!(notes[0].contains("Accept any network name"));
         let any = NetFeatures { wifi_any: true, ..f };
-        assert_eq!(engine_args(&n, &WifiDetails::default(), any, &|_, _| true).0.join(" "), "--wifi ssid=* --net nat");
+        assert_eq!(engine_args(&n, &WifiDetails::default(), any, &|_, _| true).0.join(" "), "--wifi any --net nat");
         n.password = "esp32sim-pass".into();
         assert_eq!(engine_args(&n, &WifiDetails::default(), any, &|_, _| true).0.join(" "), "--wifi ssid=*,psk=esp32sim-pass --net nat");
         // Saved in device.toml; older files without the field read as off.

@@ -238,10 +238,11 @@ fn session(
             }
             Ok(Message::Close(_)) => return Session::Dropped("engine closed the link".into()),
             // Control-channel messages go to the app: the device hotspot's `ap_status`
-            // (answers, and pushes on newer engines) and forwarded-port `fwd` events.
+            // (answers, and pushes on newer engines), forwarded-port `fwd` events and
+            // `wifi_wanted` (the network the firmware asks for).
             Ok(Message::Text(t)) => {
                 busy = true;
-                if t.contains("\"ap_status\"") || t.contains("\"fwd\"") {
+                if t.contains("\"ap_status\"") || t.contains("\"fwd\"") || t.contains("\"wifi_wanted\"") {
                     let _ = events.send(EngineEvent::Control(t.to_string()));
                     waker();
                 }
