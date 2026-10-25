@@ -185,6 +185,25 @@ pub fn spec_escape(v: &str) -> String {
     v.replace('\\', "\\\\").replace(',', "\\,")
 }
 
+/// The web channel's live access-point change: `{"t":"wifi","ssid":..,"psk":..,"any":..}`
+/// (an empty psk: open). The engine deauthenticates a joined station, which rejoins.
+pub fn live_wifi_message(w: &WifiDetails, any: bool) -> String {
+    serde_json::json!({ "t": "wifi", "ssid": w.ssid, "psk": w.password, "any": any }).to_string()
+}
+
+/// The engine's answer to [`live_wifi_message`]: `Ok(())`, or `Err(why)` (e.g. no `--wifi`
+/// at power-on). `None`: not a `wifi_status`.
+pub fn parse_wifi_status(text: &str) -> Option<Result<(), String>> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if v.get("t")?.as_str()? != "wifi_status" {
+        return None;
+    }
+    Some(match v.get("error").and_then(|e| e.as_str()) {
+        Some(e) => Err(e.to_string()),
+        None => Ok(()),
+    })
+}
+
 /// The engine's `wifi_wanted` event: `{"t":"wifi_wanted","ssid":"X","secure":true|false|null,"served":bool}`,
 /// the network the firmware asked for (a directed probe, or the security it picked).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -696,6 +715,19 @@ mod tests {
 
     fn wifi_spec_old(w: &WifiDetails) -> Result<String, String> {
         wifi_spec(w, false)
+    }
+
+    #[test]
+    fn live_wifi_messages() {
+        let v: serde_json::Value = serde_json::from_str(&live_wifi_message(&w("Home, \"Net\"", ""), false)).unwrap();
+        assert_eq!(v, serde_json::json!({"t":"wifi","ssid":"Home, \"Net\"","psk":"","any":false}));
+        let v: serde_json::Value = serde_json::from_str(&live_wifi_message(&w("cyd-lab", "secret123"), true)).unwrap();
+        assert_eq!(v["psk"], "secret123");
+        assert_eq!(v["any"], true);
+        assert_eq!(parse_wifi_status(r#"{"t":"wifi_status","ssid":"x","secure":false,"any":false,"disconnected":true}"#), Some(Ok(())));
+        assert_eq!(parse_wifi_status(r#"{"t":"wifi_status","error":"no emulated access point: run with --wifi"}"#), Some(Err("no emulated access point: run with --wifi".into())));
+        assert_eq!(parse_wifi_status(r#"{"t":"wifi_wanted","ssid":"x"}"#), None);
+        assert_eq!(parse_wifi_status("nope"), None);
     }
 
     #[test]

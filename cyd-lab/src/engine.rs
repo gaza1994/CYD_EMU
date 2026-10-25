@@ -167,6 +167,8 @@ pub struct EngineFeatures {
     pub wifi_any: bool,
     /// `\,` / `\\` escapes in the `--wifi` SPEC (detected from `--help`).
     pub wifi_escapes: bool,
+    /// The web channel's `{"t":"wifi"}`: change the access point while running (detected from `--help`).
+    pub wifi_live: bool,
     /// `--hostfwd tcp:HOST:PORT-:GUESTPORT`.
     pub hostfwd: bool,
     /// `--mdns-relay`: answer/forward mDNS between the LAN and the NAT'd chip.
@@ -198,6 +200,7 @@ impl EngineFeatures {
             wifi: has("--wifi"),
             wifi_any: help.contains("ssid=*"),
             wifi_escapes: help.contains("\\, for a comma"),
+            wifi_live: help.contains("{\"t\":\"wifi\"}"),
             hostfwd: has("--hostfwd"),
             mdns_relay: has("--mdns-relay"),
             ap_client: help.contains("--ap-client") && help.contains("--ap-fwd"),
@@ -1418,6 +1421,10 @@ mod tests {
         assert!(f.wifi && f.wifi_any && f.wifi_escapes && f.net().wifi_any && f.net().wifi_escapes);
         let old = EngineFeatures::from_probe("  --wifi ssid=…,psk=…   a virtual access point\n", b"");
         assert!(old.wifi && !old.wifi_any && !old.wifi_escapes);
+        assert!(!f.wifi_live && !old.wifi_live);
+        // esp32sim 13a9106e: the access point can be changed live ({"t":"wifi"}).
+        let help = format!("{help}                        (change it while running with the web channel's {{\"t\":\"wifi\"}}: the firmware is disconnected and rejoins)\n");
+        assert!(EngineFeatures::from_probe(&help, b"").wifi_live);
     }
 
     #[test]

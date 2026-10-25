@@ -27,6 +27,8 @@ const CONSOLE_LINES: usize = 5000;
 /// (`%APPDATA%\cyd-lab` on Windows, `~/.local/share/cyd-lab` on Linux).
 /// Shortest touch the panel will see; quicker clicks are stretched to this.
 const MIN_TOUCH_HOLD: std::time::Duration = std::time::Duration::from_millis(120);
+/// How long "Wi-Fi updated, the firmware will reconnect" stays up.
+const WIFI_NOTE_FOR: std::time::Duration = std::time::Duration::from_secs(8);
 
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -602,8 +604,20 @@ struct DeviceView {
     fw_host: String,
     /// Wi-Fi join attempts seen in the console, for the "firmware is looking for" banner.
     wifi_watch: crate::network::WifiWatch,
-    /// The access point of the current run (what the banner compares against).
+    /// The access point of the current run (what the banner compares against); updated by
+    /// a live change.
     wifi_ap: crate::network::WifiDetails,
+    /// The current run's access point answers any network name.
+    wifi_ap_any: bool,
+    /// The current run has an emulated access point (`--wifi`).
+    wifi_run: bool,
+    /// Wi-Fi settings edited while running, not sent to the engine yet (sent once the
+    /// fields lose focus, so typing doesn't disconnect the firmware at every key).
+    wifi_live_pending: bool,
+    /// A Wi-Fi text field had focus until then.
+    wifi_editing_until: Option<Instant>,
+    /// The last live Wi-Fi change: when, and what to show ("Wi-Fi updated, …" or an error).
+    wifi_live_note: Option<(Instant, String, bool)>,
     /// Show the Wi-Fi password in the Network section.
     show_password: bool,
     /// Improv Wi-Fi over serial: detection, the last session and its result.
@@ -717,7 +731,8 @@ impl DeviceView {
         }
     }
 
-    /// The firmware asked for `ssid`: make it this device's network (applies at the next power-on).
+    /// The firmware asked for `ssid`: make it this device's network (sent to the running
+    /// engine at once when it can change Wi-Fi live, else at the next power-on).
     fn use_wanted_network(&mut self, ssid: String, password: Option<String>) {
         let open = self.wifi_wanted.as_ref().is_some_and(|w| w.secure == Some(false));
         let n = &mut self.dev.meta.network;
@@ -733,7 +748,63 @@ impl DeviceView {
         if let Err(e) = self.dev.save() {
             self.lab(format!("could not save device settings: {e:#}"));
         }
-        self.lab("Wi-Fi network updated. Power off and on to apply it.");
+        self.wifi_live_pending = true;
+        self.wifi_editing_until = None;
+    }
+
+    /// A new engine run: its access point is the saved settings (`--wifi` given: `wifi_run`).
+    fn started_wifi(&mut self, wifi_run: bool, defaults: &crate::network::WifiDetails, f: &EngineFeatures) {
+        self.wifi_ap = self.dev.meta.network.effective(defaults);
+        self.wifi_ap_any = wifi_run && self.dev.meta.network.accept_any && f.net().wifi_any;
+        self.wifi_run = wifi_run;
+        self.wifi_live_pending = false;
+        self.wifi_live_note = None;
+    }
+
+    /// Send pending Wi-Fi settings to the running engine (`{"t":"wifi"}`): it disconnects the
+    /// firmware, which rejoins the new network, with no power cycle (so an OTA trial isn't
+    /// cut short). Older engines, or a run with Wi-Fi off: they apply at the next power-on.
+    fn apply_wifi_live(&mut self, defaults: &crate::network::WifiDetails, f: &EngineFeatures) {
+        if !self.wifi_live_pending || self.wifi_editing_until.is_some_and(|t| Instant::now() < t) {
+            return;
+        }
+        if !matches!(self.backend.state(), RunState::Running(_)) {
+            self.wifi_live_pending = false;
+            return;
+        }
+        let n = &self.dev.meta.network;
+        let w = n.effective(defaults);
+        let any = n.accept_any && f.net().wifi_any;
+        if !n.wifi || crate::network::validate_wifi(&w, true).is_err() {
+            // Not a network to offer (the section says why); wait for the next edit.
+            self.wifi_live_pending = false;
+            return;
+        }
+        if w == self.wifi_ap && any == self.wifi_ap_any {
+            self.wifi_live_pending = false;
+            return;
+        }
+        if !f.wifi_live || !self.wifi_run {
+            self.wifi_live_pending = false;
+            let why = if f.wifi_live { "Wi-Fi was off at power-on" } else { "this esp32sim can't change Wi-Fi while running" };
+            self.lab(format!("Wi-Fi settings saved; {why}, so power off and on to apply them."));
+            self.wifi_live_note = Some((Instant::now(), format!("Saved: {why}, so they apply at the next power-on."), false));
+            return;
+        }
+        if !self.link_up {
+            // Sent once the live link is (back) up.
+            return;
+        }
+        if self.backend.control(crate::network::live_wifi_message(&w, any)).is_ok() {
+            self.wifi_live_pending = false;
+            let what = if any { "any network name".to_string() } else { format!("\"{}\" ({})", w.ssid, if w.password.is_empty() { "open" } else { "WPA2" }) };
+            self.wifi_ap = w;
+            self.wifi_ap_any = any;
+            self.wifi_wanted = None;
+            self.wifi_watch = Default::default();
+            self.lab(format!("Wi-Fi updated to {what}, the firmware will reconnect (no power cycle)."));
+            self.wifi_live_note = Some((Instant::now(), "Wi-Fi updated, the firmware will reconnect".into(), true));
+        }
     }
 
     /// The hotspot this run's firmware put up (seen by the engine's phone, or named in its log).
@@ -1264,6 +1335,11 @@ impl DeviceView {
             fw_host: String::new(),
             wifi_watch: Default::default(),
             wifi_ap: Default::default(),
+            wifi_ap_any: false,
+            wifi_run: false,
+            wifi_live_pending: false,
+            wifi_editing_until: None,
+            wifi_live_note: None,
             show_password: false,
             improv: ImprovUi::default(),
             hotspot_ssids: Vec::new(),
@@ -2120,7 +2196,9 @@ impl CydLabApp {
 
     fn power_on(&mut self, i: usize, boot_held: bool) {
         let boot = BootMode::from_boot_held(boot_held);
+        let mut wifi_run = false;
         let r = self.launch_spec(i, boot).and_then(|spec| {
+            wifi_run = spec.args.iter().any(|a| a == "--wifi");
             let port = spec.web_port;
             let r = self.devices[i].backend.start(&spec);
             if r.is_err() {
@@ -2130,7 +2208,8 @@ impl CydLabApp {
             }
             r
         });
-        let hotspot_ok = self.engine_features().ap_client;
+        let features = self.engine_features();
+        let hotspot_ok = features.ap_client;
         let d = &mut self.devices[i];
         d.console_log.line(&format!("----- power on{} {} -----", if boot_held { " (download mode)" } else { "" }, crate::consolelog::now_stamp()));
         d.improv = ImprovUi::default();
@@ -2140,7 +2219,7 @@ impl CydLabApp {
         // No automatic Improv probe: a real board on a PC gets no bytes unless a tool or the
         // user sends them. "Waiting for setup" is read from its log and its hotspot instead.
         d.hotspot_open_at = (r.is_ok() && hotspot_ok && d.hotspot.is_some()).then(|| Instant::now() + Duration::from_secs(10));
-        d.wifi_ap = d.dev.meta.network.effective(&self.settings.wifi);
+        d.started_wifi(wifi_run, &self.settings.wifi, &features);
         d.wifi_watch = Default::default();
         d.wifi_wanted = None;
         d.guide_wifi_seen = false;
@@ -2181,7 +2260,9 @@ impl CydLabApp {
         }
         // No live link / no serial port: power-cycle so the new BOOT strap is sampled.
         // With --flash-file this waits for the engine to save flash.bin first.
+        let mut wifi_run = false;
         let r = self.launch_spec(i, boot).and_then(|spec| {
+            wifi_run = spec.args.iter().any(|a| a == "--wifi");
             let port = spec.web_port;
             let r = self.devices[i].backend.restart(spec);
             if r.is_err() {
@@ -2191,7 +2272,11 @@ impl CydLabApp {
             }
             r
         });
+        let features = self.engine_features();
         let d = &mut self.devices[i];
+        if r.is_ok() {
+            d.started_wifi(wifi_run, &self.settings.wifi, &features);
+        }
         d.link_up = false;
         d.link_lost = false;
         d.screen = None; // power-cycled: the panel lost power too
@@ -2205,6 +2290,8 @@ impl CydLabApp {
     fn poll_backends(&mut self, ctx: &egui::Context) {
         let mut any_running = false;
         let mut open_err = None;
+        let features = self.engine_features();
+        let wifi_defaults = self.settings.wifi.clone();
         for d in &mut self.devices {
             if let Some(rx) = &d.web_job {
                 let msgs: Vec<WebMsg> = rx.try_iter().collect();
@@ -2248,6 +2335,9 @@ impl CydLabApp {
                                 d.wanted_password.clear();
                             }
                             d.wifi_wanted = Some(w);
+                        } else if let Some(Err(e)) = crate::network::parse_wifi_status(&text) {
+                            d.lab(format!("Wi-Fi change refused by the engine: {e}"));
+                            d.wifi_live_note = Some((Instant::now(), format!("Not applied: {e}. Power off and on to apply it."), false));
                         }
                     }
                     EngineEvent::LinkUp => {
@@ -2280,6 +2370,10 @@ impl CydLabApp {
                 }
             }
             d.poll_improv();
+            d.apply_wifi_live(&wifi_defaults, &features);
+            if d.wifi_live_pending || d.wifi_live_note.as_ref().is_some_and(|n| n.0.elapsed() < WIFI_NOTE_FOR) {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
             if d.hotspot_open_at.is_some_and(|t| Instant::now() >= t) {
                 d.hotspot_open_at = None;
                 // The command-line plan's forward, behind the Host-rewriting proxy.
@@ -3577,7 +3671,7 @@ impl CydLabApp {
                 if let Some(ssid) = &wanted_ssid {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!("The firmware looks for \"{ssid}\"."));
-                        if ui.button("Use this name").on_hover_text("Sets this device's emulated Wi-Fi network to this name, then power off and on.").clicked() {
+                        if ui.button("Use this name").on_hover_text("Sets this device's emulated Wi-Fi network to this name; the firmware rejoins it at once, with no power cycle.").clicked() {
                             self.devices[i].use_wanted_network(ssid.clone(), None);
                         }
                     });
@@ -4334,24 +4428,38 @@ impl CydLabApp {
                     });
                 }
                 let n = &mut d.dev.meta.network;
-                ui.add_enabled_ui(!alive, |ui| {
-                    if alive {
+                // Wi-Fi details change live (the engine's {"t":"wifi"}); turning the access
+                // point on or off, and the ports, need a power cycle.
+                let live_wifi = features.wifi_live && d.wifi_run;
+                let mut wifi_changed = false;
+                let mut editing = false;
+                ui.add_enabled_ui(!alive || (part == NetPart::Wifi && live_wifi), |ui| {
+                    if alive && (part == NetPart::Ports || !live_wifi) {
                         ui.label(RichText::new("Power off to change these; they apply at the next power-on.").small().weak());
                         if d.ota_trial.is_some() {
                             ui.label(RichText::new("Just updated over the air: wait about a minute (console: \"Boot seems successful\") before powering off, or ESPHome rolls the update back.").small().color(Color32::from_rgb(240, 190, 40)));
                         }
                     }
                     if part == NetPart::Wifi {
-                    save |= ui.checkbox(&mut n.wifi, "Wi-Fi: offer the chip an access point").on_hover_text("The emulator runs a virtual access point; the firmware joins it as it would join your router. Nothing changes on your real Wi-Fi.").changed();
+                    ui.add_enabled_ui(!alive, |ui| {
+                        save |= ui.checkbox(&mut n.wifi, "Wi-Fi: offer the chip an access point").on_hover_text("The emulator runs a virtual access point; the firmware joins it as it would join your router. Nothing changes on your real Wi-Fi.").on_disabled_hover_text("Power off to turn the access point on or off. Its name and password can be changed while running.").changed();
+                    });
                     ui.add_enabled_ui(n.wifi, |ui| {
                         ui.label(RichText::new("Emulated Wi-Fi network").small().strong());
+                        if alive && live_wifi {
+                            ui.label(RichText::new("Changes apply while running: the firmware is disconnected and rejoins (no power cycle).").small().weak());
+                        }
                         egui::Grid::new(("netgrid", i)).num_columns(2).show(ui, |ui| {
                             ui.label("Network name (SSID)");
-                            save |= ui.add(egui::TextEdit::singleline(&mut n.ssid).desired_width(200.0).hint_text(if defaults.ssid.is_empty() { crate::network::FALLBACK_SSID } else { defaults.ssid.as_str() })).changed();
+                            let r = ui.add(egui::TextEdit::singleline(&mut n.ssid).desired_width(200.0).hint_text(if defaults.ssid.is_empty() { crate::network::FALLBACK_SSID } else { defaults.ssid.as_str() }));
+                            wifi_changed |= r.changed();
+                            editing |= r.has_focus();
                             ui.end_row();
                             ui.label("Password");
                             ui.horizontal(|ui| {
-                                save |= ui.add(egui::TextEdit::singleline(&mut n.password).password(!d.show_password).desired_width(200.0).hint_text("empty = open network")).on_hover_text("Optional. Empty: an open network. Stored on this PC only, in this device's device.toml.").changed();
+                                let r = ui.add(egui::TextEdit::singleline(&mut n.password).password(!d.show_password).desired_width(200.0).hint_text("empty = open network")).on_hover_text("Optional. Empty: an open network. Stored on this PC only, in this device's device.toml.");
+                                wifi_changed |= r.changed();
+                                editing |= r.has_focus();
                                 ui.checkbox(&mut d.show_password, "show");
                             });
                             ui.end_row();
@@ -4380,12 +4488,12 @@ impl CydLabApp {
                                 if now.ssid != crate::network::NEW_DEVICE_SSID && ui.small_button(format!("Use \"{}\"", crate::network::NEW_DEVICE_SSID)).on_hover_text("Firmware set up for the old name will need its Wi-Fi details changed (or tick Accept any network name)").clicked() {
                                     n.ssid = crate::network::NEW_DEVICE_SSID.to_string();
                                     n.password.clear();
-                                    save = true;
+                                    wifi_changed = true;
                                 }
                             });
                         }
                         let any_tip = "The emulated access point answers whatever network name the firmware looks for, so firmware with another name built in joins without changes.\nWith a password above, open and secured (WPA2) joins both work; with none, only open ones (cyd-lab asks for the password if the firmware wants a secured network).";
-                        save |= ui.checkbox(&mut n.accept_any, "Accept any network name").on_hover_text(any_tip).changed();
+                        wifi_changed |= ui.checkbox(&mut n.accept_any, "Accept any network name").on_hover_text(any_tip).changed();
                         if n.accept_any && !features.net().wifi_any {
                             ui.label(RichText::new(format!("Saved for when esp32sim supports it. This engine offers only \"{}\" for now.", n.effective(&defaults).ssid)).small().weak());
                         }
@@ -4452,6 +4560,22 @@ impl CydLabApp {
                     }
                     }
                 });
+                if part == NetPart::Wifi {
+                    if wifi_changed {
+                        save = true;
+                        if alive {
+                            d.wifi_live_pending = true;
+                        }
+                    }
+                    if editing {
+                        d.wifi_editing_until = Some(Instant::now() + Duration::from_millis(300));
+                    }
+                    if let Some((_, text, ok)) = d.wifi_live_note.as_ref().filter(|n| alive && n.0.elapsed() < WIFI_NOTE_FOR) {
+                        ui.label(RichText::new(text).small().color(if *ok { Color32::from_rgb(120, 220, 140) } else { Color32::from_rgb(240, 190, 40) }));
+                    } else if alive && d.wifi_live_pending && live_wifi {
+                        ui.label(RichText::new("Applies when you finish typing (Enter or click elsewhere).").small().weak());
+                    }
+                }
                 if part == NetPart::Ports {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(format!("This PC: {}", ip.map(|i| i.to_string()).unwrap_or_else(|| "no network address found".into()))).small());
@@ -4749,9 +4873,16 @@ impl CydLabApp {
         // Wi-Fi settings changed since power-on: the banner describes the old access point.
         let now = d.dev.meta.network.effective(&wifi_defaults);
         let wanted = d.wifi_wanted.clone().filter(|w| !w.served);
-        let pending = (d.wifi_watch.banner.is_some() || wanted.is_some()) && (now != d.wifi_ap || !d.dev.meta.network.wifi);
+        // (Not while a live change is about to be sent: it updates the access point itself.)
+        let pending = !d.wifi_live_pending && (d.wifi_watch.banner.is_some() || wanted.is_some()) && (now != d.wifi_ap || !d.dev.meta.network.wifi);
         let mut use_wanted = None;
-        if pending {
+        let live_note = d.wifi_live_note.clone().filter(|n| n.2 && n.0.elapsed() < WIFI_NOTE_FOR && matches!(d.backend.state(), RunState::Running(_)));
+        if let Some((_, text, _)) = live_note.filter(|_| wanted.is_none()) {
+            egui::Frame::new().fill(Color32::from_rgb(30, 90, 50)).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.label(RichText::new(text).color(Color32::WHITE));
+            });
+        } else if pending {
             egui::Frame::new().fill(Color32::from_rgb(40, 70, 100)).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.label(RichText::new(format!("Wi-Fi changed to \"{}\". Power off and on to apply it.", now.ssid)).color(Color32::WHITE));
@@ -4766,7 +4897,7 @@ impl CydLabApp {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(format!("Firmware is looking for \"{}\" ({})", w.ssid, w.security())).color(Color32::WHITE));
-                    if !w.needs_password() && ui.button("Use this name").on_hover_text("Sets this device's emulated Wi-Fi network to this name, then power off and on.").clicked() {
+                    if !w.needs_password() && ui.button("Use this name").on_hover_text("Sets this device's emulated Wi-Fi network to this name; the firmware rejoins it at once, with no power cycle.").clicked() {
                         use_wanted = Some((w.ssid.clone(), None));
                     }
                 });
@@ -4788,7 +4919,7 @@ impl CydLabApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(b).color(Color32::WHITE));
                     if let Some(w) = d.wifi_watch.wanted.clone().filter(|w| *w != d.dev.meta.network.ssid) {
-                        if ui.button(format!("Use \"{w}\" for this device")).on_hover_text("Sets this device's Wi-Fi network name. Check the password in Network, then power-cycle.").clicked() {
+                        if ui.button(format!("Use \"{w}\" for this device")).on_hover_text("Sets this device's Wi-Fi network name (the firmware rejoins at once). Check the password in Network.").clicked() {
                             use_ssid = Some(w);
                         }
                     }
@@ -4804,7 +4935,9 @@ impl CydLabApp {
             if let Err(e) = d.dev.save() {
                 d.lab(format!("could not save device settings: {e:#}"));
             }
-            d.lab("Wi-Fi network name updated. Check the password under Network, then Power off and on.");
+            d.wifi_live_pending = true;
+            d.wifi_editing_until = None;
+            d.lab("Wi-Fi network name updated. Check the password under Network.");
         }
         let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
         // Reserve room for the serial input row below the log so it never falls off the window.
@@ -5336,6 +5469,121 @@ mod tests {
         let dev2 = store.create("Idle", &profile).unwrap();
         power_off_and_delete(&store, &mut b, &mut None, &dev2).unwrap();
         assert!(!dev2.dir.exists());
+    }
+
+    /// A running engine with a live link that records its control messages.
+    struct LiveWifiBackend(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl Backend for LiveWifiBackend {
+        fn capabilities(&self) -> crate::engine::Capabilities {
+            Default::default()
+        }
+        fn start(&mut self, _: &LaunchSpec) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn stop(&mut self) {}
+        fn soft_reset(&mut self) -> std::result::Result<(), crate::engine::TouchError> {
+            Ok(())
+        }
+        fn state(&self) -> RunState {
+            RunState::Running(BootMode::Normal)
+        }
+        fn poll(&mut self) -> Vec<EngineEvent> {
+            Vec::new()
+        }
+        fn take_frame(&mut self) -> Option<crate::weblink::Frame> {
+            None
+        }
+        fn touch(&mut self, _: u16, _: u16, _: bool) -> std::result::Result<(), crate::engine::TouchError> {
+            Ok(())
+        }
+        fn serial_line(&mut self, _: &str) -> std::result::Result<(), crate::engine::TouchError> {
+            Ok(())
+        }
+        fn last_command(&self) -> Option<String> {
+            None
+        }
+        fn control(&mut self, json: String) -> std::result::Result<(), crate::engine::TouchError> {
+            self.0.lock().unwrap().push(json);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn wifi_changes_while_running_go_to_the_engine_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = DeviceStore::open(tmp.path().join("devices")).unwrap();
+        let profile = ProfileLibrary::load(None).get("esp32-2432s028r").unwrap().clone();
+        let dev = store.create("Live", &profile).unwrap();
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut d = DeviceView::new(dev, std::sync::Arc::new(|| {}));
+        d.backend = Box::new(LiveWifiBackend(sent.clone()));
+        let defaults = crate::network::WifiDetails::default();
+        let help = "  --wifi ssid=…,psk=…   a virtual access point\n    (no psk: open; any SSID or passphrase, \\, for a comma; `any` or ssid=*: the SSID the firmware asks for)\n    (change it while running with the web channel's {\"t\":\"wifi\"}: the firmware is disconnected and rejoins)\n";
+        let f = EngineFeatures::from_probe(help, b"");
+        assert!(f.wifi_live && f.wifi_any);
+        d.dev.meta.network.wifi = true;
+        d.dev.meta.network.ssid = "cyd-lab".into();
+        d.started_wifi(true, &defaults, &f);
+        d.link_up = true;
+        let msgs = || sent.lock().unwrap().iter().map(|m| serde_json::from_str::<serde_json::Value>(m).unwrap()).collect::<Vec<_>>();
+
+        // The firmware asks for another (open) network; "Use this name" sends it at once.
+        d.wifi_wanted = Some(crate::network::WifiWanted { ssid: "other-net".into(), secure: Some(false), served: false });
+        d.use_wanted_network("other-net".into(), None);
+        d.apply_wifi_live(&defaults, &f);
+        assert_eq!(msgs(), vec![serde_json::json!({"t":"wifi","ssid":"other-net","psk":"","any":false})]);
+        assert_eq!(d.wifi_ap.ssid, "other-net");
+        assert!(d.wifi_wanted.is_none() && !d.wifi_live_pending);
+        assert!(d.wifi_live_note.as_ref().is_some_and(|n| n.2 && n.1 == "Wi-Fi updated, the firmware will reconnect"));
+        // Saved for the next power-on too.
+        assert_eq!(store.list().unwrap().0.iter().find(|x| x.id == d.dev.id).unwrap().meta.network.ssid, "other-net");
+
+        // Typing a password: nothing is sent while the field has focus, nor for a short one.
+        d.dev.meta.network.password = "secret1".into();
+        d.wifi_live_pending = true;
+        d.wifi_editing_until = Some(Instant::now() + Duration::from_secs(60));
+        d.apply_wifi_live(&defaults, &f);
+        assert_eq!(msgs().len(), 1);
+        d.wifi_editing_until = None;
+        d.apply_wifi_live(&defaults, &f);
+        assert_eq!(msgs().len(), 1, "a 7-character WPA2 password is not offered");
+        d.dev.meta.network.password = "secret12".into();
+        d.wifi_live_pending = true;
+        d.apply_wifi_live(&defaults, &f);
+        assert_eq!(msgs()[1]["psk"], "secret12");
+        // The same again: no message (it would disconnect the firmware for nothing).
+        d.wifi_live_pending = true;
+        d.apply_wifi_live(&defaults, &f);
+        assert_eq!(msgs().len(), 2);
+        // Accept any network name.
+        d.dev.meta.network.accept_any = true;
+        d.wifi_live_pending = true;
+        d.apply_wifi_live(&defaults, &f);
+        assert_eq!(msgs()[2]["any"], true);
+        // Link down: kept until it is back.
+        d.dev.meta.network.accept_any = false;
+        d.wifi_live_pending = true;
+        d.link_up = false;
+        d.apply_wifi_live(&defaults, &f);
+        assert!(d.wifi_live_pending && msgs().len() == 3);
+        d.link_up = true;
+        d.apply_wifi_live(&defaults, &f);
+        assert_eq!(msgs().len(), 4);
+
+        // An engine without the message, or a run with Wi-Fi off: saved, next power-on.
+        let old = EngineFeatures::from_probe("  --wifi ssid=…,psk=…   a virtual access point\n", b"");
+        d.dev.meta.network.ssid = "third".into();
+        d.wifi_live_pending = true;
+        d.apply_wifi_live(&defaults, &old);
+        assert_eq!(msgs().len(), 4);
+        assert!(!d.wifi_live_pending && d.wifi_live_note.as_ref().is_some_and(|n| !n.2 && n.1.contains("next power-on")));
+        d.started_wifi(false, &defaults, &f);
+        d.dev.meta.network.ssid = "fourth".into();
+        d.wifi_live_pending = true;
+        d.apply_wifi_live(&defaults, &f);
+        assert_eq!(msgs().len(), 4);
+        assert!(d.wifi_live_note.as_ref().is_some_and(|n| n.1.contains("Wi-Fi was off at power-on")));
     }
 
     #[test]
