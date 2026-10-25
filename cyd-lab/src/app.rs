@@ -990,6 +990,30 @@ fn flash_is_blank(path: &Path) -> bool {
     }
 }
 
+/// What a console line says about the flash, whatever wrote it (cyd-lab, esptool over the
+/// serial bridge, the firmware itself). The ROM's "entry 0x…" means it loaded a bootloader from
+/// flash; "invalid header: 0xffffffff" is the ROM reading erased flash; the engine's
+/// "[emu] flash: wrote …" means flash.bin changed on disk.
+#[derive(Debug, PartialEq)]
+enum FlashClue {
+    Boots,
+    Erased,
+    FileWritten,
+}
+
+fn flash_clue(line: &str) -> Option<FlashClue> {
+    let l = line.trim();
+    if l.starts_with("entry 0x") {
+        Some(FlashClue::Boots)
+    } else if l.starts_with("invalid header: 0xffffffff") {
+        Some(FlashClue::Erased)
+    } else if l.starts_with("[emu] flash: wrote") {
+        Some(FlashClue::FileWritten)
+    } else {
+        None
+    }
+}
+
 /// The first 0x9000 bytes of flash.bin (bootloader + partition table) for the heuristics.
 fn flash_head(path: &Path) -> Vec<u8> {
     use std::io::Read;
@@ -1320,6 +1344,15 @@ impl DeviceView {
             }
             if let Some(ssid) = crate::hotspot::sniff_ssid(&line) {
                 crate::hotspot::remember(&mut self.hotspot_ssids, ssid);
+            }
+            // The yellow blank-flash hint follows the flash, not just cyd-lab's own writes: an
+            // esptool upload through the serial bridge stays in the engine until power-off
+            // (when it lands in flash.bin, re-read on exit), so trust the ROM meanwhile.
+            match flash_clue(&line) {
+                Some(FlashClue::Boots) => self.flash_blank = false,
+                Some(FlashClue::Erased) => self.flash_blank = true,
+                Some(FlashClue::FileWritten) => self.flash_blank = flash_is_blank(&self.dev.flash_path()),
+                None => {}
             }
             if let Some(c) = crate::network::firmware_clue(&line) {
                 match c {
@@ -4506,6 +4539,15 @@ mod tests {
         assert_eq!(short_board_name("ESP32-2432S028R (two USB)"), "2432S028R two USB");
         assert_eq!(short_board_name("TTGO T-Display (test)"), "TTGO T-Display test");
         assert_eq!(short_board_name("Plain board"), "Plain board");
+    }
+
+    #[test]
+    fn flash_clues() {
+        assert_eq!(flash_clue("entry 0x400805c4"), Some(FlashClue::Boots));
+        assert_eq!(flash_clue("invalid header: 0xffffffff"), Some(FlashClue::Erased));
+        assert_eq!(flash_clue("[emu] flash: wrote 4194304 bytes to /x/flash.bin (--flash-file)"), Some(FlashClue::FileWritten));
+        assert_eq!(flash_clue("load:0x3fff0030,len:6148"), None);
+        assert_eq!(flash_clue("[I][app]: entry 0x12 in a table"), None);
     }
 
     #[test]
