@@ -9,6 +9,7 @@
 //! the firmware's API/OTA/web ports reachable at this PC's address.
 
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 /// SSID used when neither the device nor the app-wide default has one.
 pub const FALLBACK_SSID: &str = "cyd-lab";
@@ -191,16 +192,17 @@ pub fn live_wifi_message(w: &WifiDetails, any: bool) -> String {
     serde_json::json!({ "t": "wifi", "ssid": w.ssid, "psk": w.password, "any": any }).to_string()
 }
 
-/// The engine's answer to [`live_wifi_message`]: `Ok(())`, or `Err(why)` (e.g. no `--wifi`
-/// at power-on). `None`: not a `wifi_status`.
-pub fn parse_wifi_status(text: &str) -> Option<Result<(), String>> {
+/// The engine's answer to [`live_wifi_message`]: `Ok(disconnected)` (`Some(true)`: a joined
+/// station was deauthenticated and rejoins; `None`: an engine that doesn't say), or `Err(why)`
+/// (e.g. no `--wifi` at power-on). `None`: not a `wifi_status`.
+pub fn parse_wifi_status(text: &str) -> Option<Result<Option<bool>, String>> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     if v.get("t")?.as_str()? != "wifi_status" {
         return None;
     }
     Some(match v.get("error").and_then(|e| e.as_str()) {
         Some(e) => Err(e.to_string()),
-        None => Ok(()),
+        None => Ok(v.get("disconnected").and_then(|d| d.as_bool())),
     })
 }
 
@@ -417,6 +419,9 @@ pub enum WifiEvent {
     /// Joining failed. `ssid` when the line names it; `auth` = the password was wrong
     /// (auth/handshake failure) rather than the network not being found.
     Failed { ssid: Option<String>, reason: String, auth: bool },
+    /// Disconnected without a fault of its own settings: the access point left (esp32sim's
+    /// live Wi-Fi change deauthenticates with reason 3), or the signal went. It rejoins.
+    Left,
     Connected,
 }
 
@@ -429,6 +434,8 @@ fn quoted_after(line: &str, key: &str) -> Option<String> {
 
 /// ESP-IDF `wifi_err_reason_t` codes and names that mean "wrong password".
 const AUTH_REASONS: &[&str] = &["AUTH_FAIL", "AUTH_EXPIRE", "4WAY_HANDSHAKE_TIMEOUT", "HANDSHAKE_TIMEOUT", "MIC_FAILURE", "reason: 202", "reason: 15", "reason: 204", "Reason: 202", "Reason: 15", "Reason: 204"];
+/// ... and "the access point went away" (nothing wrong with the settings: it rejoins).
+const LEFT_REASONS: &[&str] = &["Auth Leave", "Association Leave", "Beacon Timeout", "Disassociated Due To Inactivity", "AUTH_LEAVE", "ASSOC_LEAVE", "BEACON_TIMEOUT", "DISASSOC_DUE_TO_INACTIVITY"];
 /// ... and "no such network".
 const NOT_FOUND_REASONS: &[&str] = &["NO_AP_FOUND", "reason: 201", "Reason: 201", "Could not find network", "No matching network", "Could not find WiFi", "SSID not found"];
 
@@ -437,6 +444,9 @@ const NOT_FOUND_REASONS: &[&str] = &["NO_AP_FOUND", "reason: 201", "Reason: 201"
 pub fn wifi_event(line: &str) -> Option<WifiEvent> {
     let lower = line.to_ascii_lowercase();
     // ESPHome: "[W][wifi_esp32:866]: Disconnected ssid='X' bssid=.. reason='Probe Request Unsuccessful'"
+    if LEFT_REASONS.iter().any(|r| line.contains(*r)) {
+        return Some(WifiEvent::Left);
+    }
     if line.contains("Disconnected ssid=") {
         let ssid = quoted_after(line, "ssid=");
         let reason = quoted_after(line, "reason=").unwrap_or_default();
@@ -481,9 +491,42 @@ pub struct WifiWatch {
     pub wanted: Option<String>,
     pub banner: Option<String>,
     pub connected: bool,
+    /// Off Wi-Fi since then and expected back on its own: a live Wi-Fi change disconnected it,
+    /// or it was on Wi-Fi and lost the access point. Cleared when it rejoins (or fails to).
+    pub rejoin_since: Option<Instant>,
+}
+
+/// How long a rejoin reads as a neutral "reconnecting…" before it needs attention.
+pub const REJOIN_GRACE: Duration = Duration::from_secs(30);
+
+/// The Wi-Fi tag's rejoin state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejoin {
+    /// Not rejoining.
+    No,
+    /// Within [`REJOIN_GRACE`]: neutral.
+    Reconnecting,
+    /// Longer: it needs attention.
+    Disconnected,
 }
 
 impl WifiWatch {
+    /// The firmware was just disconnected and rejoins on its own (esp32sim's `wifi_status`
+    /// said so, or a live change went to a joined station).
+    pub fn begin_rejoin(&mut self, now: Instant) {
+        self.connected = false;
+        self.banner = None;
+        self.rejoin_since.get_or_insert(now);
+    }
+
+    pub fn rejoin(&self, now: Instant) -> Rejoin {
+        match self.rejoin_since {
+            None => Rejoin::No,
+            Some(t) if now.saturating_duration_since(t) < REJOIN_GRACE => Rejoin::Reconnecting,
+            Some(_) => Rejoin::Disconnected,
+        }
+    }
+
     /// Returns true when this line says the firmware is on Wi-Fi.
     pub fn feed(&mut self, line: &str, ap: &WifiDetails) -> bool {
         // "Connected to esp32sim" (openHASP, many sketches) names this device's network.
@@ -497,8 +540,14 @@ impl WifiWatch {
                 }
                 self.wanted = Some(s);
             }
+            WifiEvent::Left => {
+                if self.connected {
+                    self.begin_rejoin(Instant::now());
+                }
+            }
             WifiEvent::Failed { ssid, auth, .. } => {
                 self.connected = false;
+                self.rejoin_since = None;
                 let ssid = ssid.or_else(|| self.wanted.clone());
                 self.banner = Some(match &ssid {
                     Some(s) if *s != ap.ssid => mismatch(s, &ap.ssid),
@@ -513,6 +562,7 @@ impl WifiWatch {
             WifiEvent::Connected => {
                 self.connected = true;
                 self.banner = None;
+                self.rejoin_since = None;
             }
         }
         on
@@ -724,7 +774,9 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&live_wifi_message(&w("cyd-lab", "secret123"), true)).unwrap();
         assert_eq!(v["psk"], "secret123");
         assert_eq!(v["any"], true);
-        assert_eq!(parse_wifi_status(r#"{"t":"wifi_status","ssid":"x","secure":false,"any":false,"disconnected":true}"#), Some(Ok(())));
+        assert_eq!(parse_wifi_status(r#"{"t":"wifi_status","ssid":"x","secure":false,"any":false,"disconnected":true}"#), Some(Ok(Some(true))));
+        assert_eq!(parse_wifi_status(r#"{"t":"wifi_status","ssid":"x","secure":false,"any":false,"disconnected":false}"#), Some(Ok(Some(false))));
+        assert_eq!(parse_wifi_status(r#"{"t":"wifi_status","ssid":"x"}"#), Some(Ok(None)));
         assert_eq!(parse_wifi_status(r#"{"t":"wifi_status","error":"no emulated access point: run with --wifi"}"#), Some(Err("no emulated access point: run with --wifi".into())));
         assert_eq!(parse_wifi_status(r#"{"t":"wifi_wanted","ssid":"x"}"#), None);
         assert_eq!(parse_wifi_status("nope"), None);
@@ -854,6 +906,38 @@ mod tests {
         assert!(watch.banner.is_none());
         watch.feed("[W][wifi_esp32:866]: Disconnected ssid='HomeNet' bssid=02:53:49:4D:00:01 reason='4-Way Handshake Timeout'", &ap);
         assert!(watch.banner.as_deref().unwrap().contains("password"));
+    }
+
+    #[test]
+    fn wifi_watch_rejoin_after_live_change_or_lost_ap() {
+        let ap = w("cyd-lab", "");
+        let t0 = Instant::now();
+        let mut watch = WifiWatch::default();
+        watch.feed("[I][wifi:1732]: Connected", &ap);
+        assert_eq!(watch.rejoin(t0), Rejoin::No);
+        // esp32sim's live change: wifi_status said the station was disconnected
+        watch.begin_rejoin(t0);
+        assert!(!watch.connected && watch.banner.is_none());
+        assert_eq!(watch.rejoin(t0 + Duration::from_secs(5)), Rejoin::Reconnecting);
+        assert_eq!(watch.rejoin(t0 + REJOIN_GRACE), Rejoin::Disconnected);
+        // the deauth as ESPHome logs it is not a fault of the settings: no banner, still rejoining
+        assert_eq!(wifi_event("[W][wifi_esp32:866]: Disconnected ssid='cyd-lab' bssid=02:53:49:4D:00:01 reason='Auth Leave'"), Some(WifiEvent::Left));
+        watch.feed("[W][wifi_esp32:866]: Disconnected ssid='cyd-lab' bssid=02:53:49:4D:00:01 reason='Auth Leave'", &ap);
+        assert!(watch.banner.is_none() && watch.rejoin_since == Some(t0));
+        // back on Wi-Fi
+        watch.feed("[I][wifi:1732]: Connected", &ap);
+        assert!(watch.connected && watch.rejoin_since.is_none());
+        assert_eq!(watch.rejoin(t0 + REJOIN_GRACE), Rejoin::No);
+        // the firmware itself loses the access point while on Wi-Fi: rejoining, neutral
+        assert!(!watch.feed("[  9012][W][STA.cpp:137] _onStaArduinoEvent(): Reason: 3 - AUTH_LEAVE", &ap));
+        assert!(!watch.connected && watch.rejoin_since.is_some() && watch.banner.is_none());
+        // the new settings don't suit the firmware: that needs attention, not "reconnecting"
+        watch.feed("[W][wifi_esp32:866]: Disconnected ssid='cyd-lab' bssid=02:53:49:4D:00:01 reason='4-Way Handshake Timeout'", &ap);
+        assert!(watch.rejoin_since.is_none() && watch.banner.as_deref().unwrap().contains("password"));
+        // a "left" line while not on Wi-Fi starts nothing
+        let mut watch = WifiWatch::default();
+        watch.feed("[W][wifi_esp32:866]: Disconnected ssid='cyd-lab' reason='Association Leave'", &ap);
+        assert_eq!(watch, WifiWatch::default());
     }
 
     #[test]

@@ -801,7 +801,13 @@ impl DeviceView {
             self.wifi_ap = w;
             self.wifi_ap_any = any;
             self.wifi_wanted = None;
+            // On Wi-Fi before: the engine deauthenticates it and it rejoins ("reconnecting…"
+            // until it says it is back; the engine's wifi_status confirms or cancels it).
+            let was_on = self.on_wifi();
             self.wifi_watch = Default::default();
+            if was_on {
+                self.wifi_watch.begin_rejoin(Instant::now());
+            }
             self.lab(format!("Wi-Fi updated to {what}, the firmware will reconnect (no power cycle)."));
             self.wifi_live_note = Some((Instant::now(), "Wi-Fi updated, the firmware will reconnect".into(), true));
         }
@@ -812,11 +818,17 @@ impl DeviceView {
         self.ap.status.as_ref().and_then(|s| s.phone.as_ref()).and_then(|p| p.hotspots.first()).map(|h| h.ssid.clone()).or_else(|| self.hotspot_ssids.last().cloned())
     }
 
+    /// The firmware said it is on Wi-Fi (its log), or Improv set it up, and it hasn't been
+    /// disconnected since.
+    fn on_wifi(&self) -> bool {
+        self.wifi_watch.connected || (matches!(self.improv.outcome, Some(Ok(_))) && self.wifi_watch.rejoin_since.is_none())
+    }
+
     /// The firmware is running and asking for Wi-Fi details (Improv ready, a setup line in its
     /// log, or its own hotspot), and is not on Wi-Fi in this run.
     fn waiting_for_wifi_setup(&self, alive: bool) -> bool {
-        let connected = self.wifi_watch.connected || matches!(self.improv.outcome, Some(Ok(_)));
-        alive && !connected && self.improv.busy != Some("provision") && (self.improv.state == Some(crate::improv::State::Ready) || self.improv.waiting_log || self.seen_hotspot().is_some())
+        let asking = self.improv.state == Some(crate::improv::State::Ready) || self.improv.waiting_log || self.seen_hotspot().is_some();
+        waiting_for_setup(alive, self.on_wifi(), self.improv.busy == Some("provision"), asking, self.wifi_watch.rejoin(Instant::now()))
     }
 
     /// The panel's size: the live frame's, else the profile's.
@@ -1183,6 +1195,23 @@ enum Tone {
     Good,
     Warn,
     Bad,
+}
+
+/// Whether to ask for Wi-Fi setup: not while the firmware is rejoining after a live Wi-Fi
+/// change (its hotspot from before setup is still "seen"), only once the grace runs out.
+fn waiting_for_setup(alive: bool, on_wifi: bool, provisioning: bool, asking: bool, rejoin: crate::network::Rejoin) -> bool {
+    alive && !on_wifi && !provisioning && asking && rejoin != crate::network::Rejoin::Reconnecting
+}
+
+/// The Wi-Fi tag while the firmware rejoins (see `WifiWatch::rejoin`): a neutral
+/// "reconnecting…" at first, coloured once it has been gone too long. `None`: not rejoining.
+fn rejoin_tag(name: &str, r: crate::network::Rejoin) -> Option<(String, Tone, String)> {
+    use crate::network::{Rejoin, REJOIN_GRACE};
+    match r {
+        Rejoin::No => None,
+        Rejoin::Reconnecting => Some((format!("{name} · reconnecting…"), Tone::Plain, format!("The firmware was disconnected from the emulated Wi-Fi \"{name}\" (its settings changed, or the access point went) and is rejoining."))),
+        Rejoin::Disconnected => Some((format!("{name} · disconnected"), Tone::Warn, format!("The firmware hasn't rejoined the emulated Wi-Fi \"{name}\" in {} s: see its log (it may want a different network name or password).", REJOIN_GRACE.as_secs()))),
+    }
 }
 
 /// A compact status chip: neutral unless something needs attention.
@@ -2335,6 +2364,13 @@ impl CydLabApp {
                                 d.wanted_password.clear();
                             }
                             d.wifi_wanted = Some(w);
+                        } else if let Some(Ok(disconnected)) = crate::network::parse_wifi_status(&text) {
+                            match disconnected {
+                                Some(true) if !d.wifi_watch.connected => d.wifi_watch.begin_rejoin(Instant::now()),
+                                // no station was joined: nothing to wait for
+                                Some(false) => d.wifi_watch.rejoin_since = None,
+                                _ => {}
+                            }
                         } else if let Some(Err(e)) = crate::network::parse_wifi_status(&text) {
                             d.lab(format!("Wi-Fi change refused by the engine: {e}"));
                             d.wifi_live_note = Some((Instant::now(), format!("Not applied: {e}. Power off and on to apply it."), false));
@@ -3541,7 +3577,7 @@ impl CydLabApp {
         let n = &d.dev.meta.network;
         let wifi = n.effective(&defaults);
         let name = if n.accept_any { "any name".to_string() } else { wifi.ssid.clone() };
-        let connected = d.wifi_watch.connected || matches!(d.improv.outcome, Some(Ok(_)));
+        let connected = d.on_wifi();
         let wanted = d.wifi_wanted.clone().filter(|w| !w.served && alive);
         let (wifi_text, wifi_tone, wifi_tip) = if !n.wifi {
             ("Wi-Fi off".to_string(), Tone::Plain, "This device gets no Wi-Fi network.".to_string())
@@ -3551,6 +3587,9 @@ impl CydLabApp {
             (format!("Wi-Fi: wants \"{}\"", w.ssid), Tone::Warn, format!("The firmware looks for \"{}\" ({}), but this device offers \"{name}\".", w.ssid, w.security()))
         } else if let Some(b) = d.wifi_watch.banner.clone().filter(|_| alive) {
             (format!("{name} ✖"), Tone::Warn, b)
+        } else if let Some((text, tone, tip)) = alive.then(|| rejoin_tag(&name, d.wifi_watch.rejoin(Instant::now()))).flatten() {
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
+            (text, tone, tip)
         } else if alive && d.waiting_for_wifi_setup(alive) {
             ("Wi-Fi: setup needed".to_string(), Tone::Warn, "The firmware waits for Wi-Fi details: use Send Wi-Fi details, or its hotspot.".to_string())
         } else if alive {
@@ -3828,7 +3867,8 @@ impl CydLabApp {
         // Wi-Fi lost in this run (the firmware logged a disconnect): the step is not done.
         if d.wifi_watch.connected {
             d.guide_wifi_seen = true;
-        } else if (alive && d.guide_wifi_seen) || d.waiting_for_wifi_setup(alive) {
+        } else if (alive && d.guide_wifi_seen && d.wifi_watch.rejoin_since.is_none()) || d.waiting_for_wifi_setup(alive) {
+            // (A rejoin after a live Wi-Fi change keeps the step: it is back in seconds.)
             // Also when a remembered tick meets firmware that is asking for Wi-Fi setup again
             // (its flash was erased or it forgot the network).
             d.guide_wifi_seen = false;
@@ -4068,7 +4108,7 @@ impl CydLabApp {
         // Passive: the firmware said so (Improv state it printed, or a setup line in its log), or
         // it put up an access point (named in the log, or seen by the engine's phone).
         let seen_ap = d.seen_hotspot();
-        let connected = d.wifi_watch.connected || matches!(d.improv.outcome, Some(Ok(_)));
+        let connected = d.on_wifi();
         let improv_ready = d.improv.state == Some(State::Ready);
         let waiting = d.waiting_for_wifi_setup(alive);
         let send_tip = if !wifi_on {
@@ -5305,6 +5345,22 @@ mod tests {
         assert_eq!(ota_clue("[I][app:100]: ESPHome version 2026.10.0"), None);
     }
 
+
+    #[test]
+    fn wifi_tag_while_rejoining() {
+        use crate::network::Rejoin;
+        assert_eq!(rejoin_tag("cyd-lab", Rejoin::No), None);
+        let (text, tone, tip) = rejoin_tag("cyd-lab", Rejoin::Reconnecting).unwrap();
+        assert_eq!((text.as_str(), tone), ("cyd-lab · reconnecting…", Tone::Plain));
+        assert!(tip.contains("rejoining") && !text.contains('✔'));
+        let (text, tone, _) = rejoin_tag("cyd-lab", Rejoin::Disconnected).unwrap();
+        assert_eq!((text.as_str(), tone), ("cyd-lab · disconnected", Tone::Warn));
+        // no "waiting for Wi-Fi setup" banner during a short rejoin, only after the grace
+        assert!(!waiting_for_setup(true, false, false, true, Rejoin::Reconnecting));
+        assert!(waiting_for_setup(true, false, false, true, Rejoin::Disconnected));
+        assert!(waiting_for_setup(true, false, false, true, Rejoin::No));
+        assert!(!waiting_for_setup(true, true, false, true, Rejoin::No));
+    }
 
     #[test]
     fn install_status_follows_the_pipeline() {
