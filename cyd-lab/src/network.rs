@@ -10,12 +10,15 @@
 
 use serde::{Deserialize, Serialize};
 
-/// SSID used when neither the device nor the app-wide default has one (devices made
-/// before new devices got [`NEW_DEVICE_SSID`]).
+/// SSID used when neither the device nor the app-wide default has one.
 pub const FALLBACK_SSID: &str = "cyd-lab";
 
-/// The emulated network a new device offers when no app-wide default is set.
-pub const NEW_DEVICE_SSID: &str = "esp32sim";
+/// The emulated network a new device offers when no app-wide default is set: the same
+/// open "cyd-lab" (what the sample YAML and sketches use).
+pub const NEW_DEVICE_SSID: &str = FALLBACK_SSID;
+
+/// The name cyd-lab v5 gave new devices; such devices are offered a switch back.
+pub const V5_SSID: &str = "esp32sim";
 
 /// Wi-Fi network name and password (app-wide default for new devices).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,7 +88,7 @@ impl Default for DeviceNetwork {
 
 impl DeviceNetwork {
     /// Settings for a new device: Wi-Fi on with the app-wide details (else an open
-    /// "esp32sim"), no ports published.
+    /// "cyd-lab"), no ports published.
     pub fn for_new_device(defaults: &WifiDetails) -> DeviceNetwork {
         let (ssid, password) = if defaults.ssid.is_empty() { (NEW_DEVICE_SSID.to_string(), String::new()) } else { (defaults.ssid.clone(), defaults.password.clone()) };
         DeviceNetwork { ssid, password, ..DeviceNetwork::default() }
@@ -733,7 +736,7 @@ mod tests {
         let d = WifiDetails::default();
         let mut a = DeviceNetwork::for_new_device(&d);
         assert!(a.wifi && a.lan && a.forwards.is_empty());
-        assert_eq!((a.ssid.as_str(), a.password.as_str(), a.accept_any), ("esp32sim", "", false));
+        assert_eq!((a.ssid.as_str(), a.password.as_str(), a.accept_any), ("cyd-lab", "", false));
         a.add_preset(&PRESETS[0], &[]);
         let pairs: Vec<(u16, u16)> = a.forwards.iter().map(|f| (f.host, f.guest)).collect();
         assert_eq!(pairs, vec![(6053, 6053), (3232, 3232)]);
