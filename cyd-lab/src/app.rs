@@ -548,6 +548,8 @@ struct DeviceView {
     ota_restarted_in_trial: bool,
     /// The console said "OTA rollback detected" (until dismissed).
     ota_rolled_back: bool,
+    /// a name-mismatch hint the user closed (that wanted name)
+    name_hint_hidden: String,
     /// BOOT checkbox (latched). The momentary BOOT button ORs into this.
     boot_latched: bool,
     /// GPIO0 level last sent over the live link (BOOT pressed).
@@ -1091,6 +1093,7 @@ impl DeviceView {
             ota_trial: None,
             ota_restarted_in_trial: false,
             ota_rolled_back: false,
+            name_hint_hidden: String::new(),
             autoscroll: true,
             boot_latched: false,
             boot_pin_low: false,
@@ -3176,6 +3179,23 @@ impl CydLabApp {
             });
             if dismiss {
                 self.devices[i].ota_rolled_back = false;
+            }
+        }
+        // Something keeps asking for this name with another MAC suffix and nothing answers:
+        // usually `name:` pasted from another device's YAML ("Update queued" for ever).
+        let d = &self.devices[i];
+        let wanted = (alive && d.dev.meta.network.wifi && !d.fw_host.is_empty()).then(|| crate::mdnswatch::lookalike(&d.fw_host)).flatten();
+        if let Some(wanted) = wanted.filter(|w| *w != self.devices[i].name_hint_hidden) {
+            let mut dismiss = false;
+            egui::Frame::new().fill(Color32::from_rgb(70, 60, 20)).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(crate::mdnswatch::hint(&wanted, &self.devices[i].fw_host)).color(Color32::WHITE));
+                    dismiss = ui.small_button("×").on_hover_text("Hide this").clicked();
+                });
+            });
+            if dismiss {
+                self.devices[i].name_hint_hidden = wanted;
             }
         }
         self.wifi_setup_ui(ui, i, alive, &features, WifiPart::Banner);

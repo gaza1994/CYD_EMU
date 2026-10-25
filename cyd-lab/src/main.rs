@@ -25,6 +25,7 @@ mod engine;
 mod firmware;
 mod hotspot;
 mod improv;
+mod mdnswatch;
 mod network;
 mod profile;
 mod rfc2217;
