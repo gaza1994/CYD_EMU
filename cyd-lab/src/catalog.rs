@@ -271,10 +271,20 @@ pub enum Spec {
 }
 
 impl Catalog {
-    /// The catalogue's first-setup details for a hotspot name (its password and page), if a
-    /// firmware's `first_setup.hotspot` pattern fits it.
-    pub fn hotspot_setup(&self, ssid: &str) -> Option<&FirstSetup> {
-        self.entries.iter().filter_map(|e| e.first_setup.as_ref()).find(|f| !f.hotspot.is_empty() && crate::hotspot::ssid_matches(&f.hotspot, ssid))
+    /// The catalogue entry whose setup hotspot this is (a firmware's `first_setup.hotspot`
+    /// pattern fits the name), with its first-setup details (password, page). The
+    /// installed firmware (`installed`, its catalogue name) wins when several patterns match.
+    pub fn hotspot_setup_entry(&self, ssid: &str, installed: Option<&str>) -> Option<(&str, &FirstSetup)> {
+        let mut hits = self
+            .entries
+            .iter()
+            .filter_map(|e| e.first_setup.as_ref().map(|f| (e.name.as_str(), f)))
+            .filter(|(_, f)| !f.hotspot.is_empty() && crate::hotspot::ssid_matches(&f.hotspot, ssid));
+        let first = hits.next()?;
+        Some(match installed {
+            Some(n) if first.0 != n => std::iter::once(first).chain(hits).find(|(e, _)| *e == n).unwrap_or(first),
+            _ => first,
+        })
     }
 
     pub fn parse(text: &str) -> Result<Catalog> {
@@ -929,10 +939,15 @@ mod tests {
     #[test]
     fn hotspot_passwords_from_the_catalogue() {
         let c = Catalog::bundled();
-        assert_eq!(c.hotspot_setup("HASP-b1353e").map(|f| f.password.as_str()), Some("haspadmin"));
-        assert_eq!(c.hotspot_setup("NerdMinerAP").map(|f| f.password.as_str()), Some("MineYourCoins"));
-        assert_eq!(c.hotspot_setup("WLED-AP").and_then(|f| f.page_ip()).as_deref(), Some("4.3.2.1"));
-        assert!(c.hotspot_setup("SomeoneElse").is_none());
+        assert_eq!(c.hotspot_setup_entry("HASP-b1353e", None).map(|(_, f)| f.password.as_str()), Some("haspadmin"));
+        // The CYD Weather Dashboard's hotspot is CYD- and four hex digits, password cyd-setup.
+        let (name, f) = c.hotspot_setup_entry("CYD-4578", None).unwrap();
+        assert_eq!((name, f.password.as_str()), ("CYD Weather Dashboard", "cyd-setup"));
+        assert_eq!(c.hotspot_setup_entry("HASP-b1353e", Some("openHASP")).map(|(n, f)| (n, f.password.as_str())), Some(("openHASP", "haspadmin")));
+        assert!(c.hotspot_setup_entry("HomeNet", None).is_none());
+        assert_eq!(c.hotspot_setup_entry("NerdMinerAP", None).map(|(_, f)| f.password.as_str()), Some("MineYourCoins"));
+        assert_eq!(c.hotspot_setup_entry("WLED-AP", None).and_then(|(_, f)| f.page_ip()).as_deref(), Some("4.3.2.1"));
+        assert!(c.hotspot_setup_entry("SomeoneElse", None).is_none());
     }
 
     #[test]

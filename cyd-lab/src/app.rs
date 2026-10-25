@@ -616,6 +616,8 @@ struct DeviceView {
     hotspot_open_at: Option<Instant>,
     /// The "Device hotspot" form: network name, password, page address.
     hotspot_form: (String, String, String),
+    /// The seen network the hotspot form filled in by itself (not again once cleared).
+    hotspot_auto: Option<String>,
     /// The tag window that is open (Firmware, Wi-Fi, Ports, Serial, Hotspot): a small floating
     /// window beside the screen, closed only by its × or Escape.
     tag_win: Option<TagWin>,
@@ -1257,6 +1259,7 @@ impl DeviceView {
             api_clients: Default::default(),
             ha_action_refused: false,
             guide_all_set: None,
+            hotspot_auto: None,
             tag_win: None,
             tag_win_new: false,
             screen_rect: None,
@@ -4033,24 +4036,37 @@ impl CydLabApp {
             }
             let mut lab_msg = None;
             ui.label(RichText::new(d.hotspot_title(false)).strong());
+            let installed = d.dev.meta.guide.as_ref().map(|g| g.name.clone());
             ui.scope(|ui| {
                     ui.label(RichText::new("Many firmwares start their own Wi-Fi network for first setup (openHASP HASP-xxxxxx, NerdMinerAP, Tasmota, WLED-AP, ESPHome's fallback hotspot) with a setup page at 192.168.4.1. cyd-lab joins it like a phone would and opens that page in your browser (on this PC only).").small().weak());
                     let (ssid, pw, ip) = &mut d.hotspot_form;
+                    // Choosing a network: its name, and the firmware's default password and page
+                    // when the catalogue knows them.
+                    let choose = |name: &str, secure: Option<bool>, ssid: &mut String, pw: &mut String, ip: &mut String| {
+                        *ssid = name.to_string();
+                        match catalog.hotspot_setup_entry(name, installed.as_deref()) {
+                            Some((_, f)) => {
+                                *pw = f.password.clone();
+                                *ip = f.page_ip().unwrap_or_else(|| crate::hotspot::GUEST_AP_IP.to_string());
+                            }
+                            None if secure == Some(false) => pw.clear(),
+                            None => {}
+                        }
+                    };
+                    // One the firmware just put up: filled in already (once; a cleared field stays clear).
+                    if let Some((name, secure)) = seen.first() {
+                        if ssid.trim().is_empty() && d.hotspot_auto.as_deref() != Some(name.as_str()) {
+                            d.hotspot_auto = Some(name.clone());
+                            choose(name, *secure, ssid, pw, ip);
+                        }
+                    }
                     if !seen.is_empty() {
                         egui::Grid::new(("hs-seen", i)).num_columns(3).show(ui, |ui| {
                             for (name, secure) in &seen {
                                 ui.label(RichText::new(name).monospace());
                                 ui.label(RichText::new(match secure { Some(true) => "password", Some(false) => "open", None => "from the log" }).small().weak());
-                                if ui.small_button("Use").clicked() {
-                                    *ssid = name.clone();
-                                    match catalog.hotspot_setup(name) {
-                                        Some(f) => {
-                                            *pw = f.password.clone();
-                                            *ip = f.page_ip().unwrap_or_else(|| crate::hotspot::GUEST_AP_IP.to_string());
-                                        }
-                                        None if *secure == Some(false) => pw.clear(),
-                                        None => {}
-                                    }
+                                if ui.small_button("Use").on_hover_text("Put this network in the form below").clicked() {
+                                    choose(name, *secure, ssid, pw, ip);
                                 }
                                 ui.end_row();
                             }
@@ -4058,7 +4074,7 @@ impl CydLabApp {
                     } else if live {
                         ui.label(RichText::new("Listening for hotspots… (the firmware starts one when it has no Wi-Fi saved)").small().weak());
                     }
-                    let known = catalog.hotspot_setup(ssid.trim());
+                    let known = catalog.hotspot_setup_entry(ssid.trim(), installed.as_deref());
                     egui::Grid::new(("hs-grid", i)).num_columns(2).show(ui, |ui| {
                         ui.label(RichText::new("Network").small());
                         ui.add(egui::TextEdit::singleline(ssid).desired_width(170.0).hint_text("e.g. HASP-1A2B3C"));
@@ -4066,7 +4082,7 @@ impl CydLabApp {
                         ui.label(RichText::new("Password").small());
                         ui.horizontal(|ui| {
                             ui.add(egui::TextEdit::singleline(pw).password(true).desired_width(170.0).hint_text("blank if open"));
-                            if let Some(f) = known.filter(|f| !f.password.is_empty() && *pw != f.password) {
+                            if let Some((_, f)) = known.filter(|(_, f)| !f.password.is_empty() && *pw != f.password) {
                                 if ui.small_button("Use catalogue password").on_hover_text(format!("The firmware's default hotspot password ({})", f.hotspot)).clicked() {
                                     *pw = f.password.clone();
                                 }
@@ -4078,8 +4094,14 @@ impl CydLabApp {
                         ui.end_row();
                     });
                     let secure = seen.iter().find(|(n, _)| n == ssid.trim()).and_then(|(_, s)| *s);
-                    if secure == Some(true) && pw.is_empty() {
-                        ui.label(RichText::new("This network needs a password (see the firmware's docs or its screen).").small().color(Color32::from_rgb(240, 200, 120)));
+                    match known {
+                        Some((name, f)) if !f.password.is_empty() && *pw == f.password => {
+                            ui.label(RichText::new(format!("Password from the catalogue ({name}'s default; it may have been changed on the device).")).small().weak());
+                        }
+                        _ if !ssid.trim().is_empty() && secure != Some(false) && pw.is_empty() => {
+                            ui.label(RichText::new("The password is usually shown on the device screen (or in the firmware's docs). Leave it blank if the network is open.").small().color(Color32::from_rgb(240, 200, 120)));
+                        }
+                        _ => {}
                     }
                     if !pw.is_empty() && pw.len() < 8 {
                         ui.label(RichText::new("Wi-Fi passwords are 8 to 63 characters.").small().color(Color32::from_rgb(240, 200, 120)));
