@@ -2,9 +2,9 @@
 # Pins: ILI9341 on HSPI (CLK14 MOSI13 MISO12 CS15 DC2, BL21), XPT2046 on its own bus
 # (CLK25 MOSI32 MISO39 CS33 IRQ36), RGB LED 4/16/17 (active low), LDR on GPIO34.
 # Build with `esphome compile esphome-cyd-2432s028r.yaml`; the factory image is
-# .esphome/build/cyd/.pioenvs/cyd/firmware.factory.bin (flash @0x0).
+# .esphome/build/cyd-panel/.pioenvs/cyd-panel/firmware.factory.bin (flash @0x0).
 substitutions:
-  name: cyd
+  name: cyd-panel
   friendly_name: Cheap Yellow Display
 
 esphome:
