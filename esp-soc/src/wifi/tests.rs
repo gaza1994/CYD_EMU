@@ -601,3 +601,98 @@ fn guest_hotspot_is_announced_once_without_a_phone() {
     l.station_tx(&guest_beacon(b, "HASP-001122", false, 1), 0);
     assert_eq!(l.heard.len(), 1);
 }
+
+/// The reason code of a deauthentication from the access point to `STA`, or None for another frame.
+fn deauth_reason(f: &[u8], from: [u8; 6]) -> Option<u16> {
+    (f.len() >= 26 && f[0] == 0xc0 && f[4..10] == STA && f[10..16] == from && f[16..22] == from).then(|| u16::from_le_bytes([f[24], f[25]]))
+}
+
+#[test]
+fn a_live_change_deauthenticates_the_joined_station_and_serves_the_new_network() {
+    let cfg = ApConfig::parse("ssid=cyd-lab").unwrap();
+    let mut ap = VirtualAp::new(cfg.clone(), false);
+    assert_eq!(join(&mut ap, cfg.bssid, b"cyd-lab", None), 0);
+    ap.queue.clear();
+    // open to WPA2 under a new name, with a comma and unicode
+    let next = ap.cfg.retarget(Some("other, net ☕"), Some("pässword 123"), false).unwrap();
+    assert_eq!((next.bssid, next.channel), (cfg.bssid, cfg.channel), "the BSSID and channel stay");
+    assert!(ap.reconfigure(next));
+    assert_eq!(ap.state, StaState::Idle);
+    assert_eq!(ap.queue.len(), 1);
+    assert_eq!(deauth_reason(&ap.queue[0].frame, cfg.bssid), Some(3), "deauthenticated: the AP is leaving");
+    assert_eq!(ap.step(0).len(), 1, "due at once");
+    assert!(ap.on_station_tx(&to(cfg.bssid, 0x0108, &[0xaa, 0xaa, 3, 0, 0, 0, 8, 0, 0x45]), 0).is_none(), "no data after the change");
+    let beacons = ap.step(10_000_000);
+    assert_eq!(beacons.len(), 1);
+    assert_eq!(ssid_of(&beacons[0].frame), "other, net ☕".as_bytes());
+    ap.on_station_tx(&probe_request(&ssid_element("other, net ☕".as_bytes())), 0);
+    assert!(response_summary(&ap.queue[0].frame).3, "RSN now");
+    assert_eq!(join(&mut ap, cfg.bssid, "other, net ☕".as_bytes(), Some("pässword 123")), 0, "the handshake uses the new PMK");
+    // and back to open: the joined WPA2 station is told too
+    ap.queue.clear();
+    assert!(ap.reconfigure(ap.cfg.retarget(Some("cyd-lab"), None, false).unwrap()));
+    assert_eq!(deauth_reason(&ap.queue[0].frame, cfg.bssid), Some(3));
+    ap.queue.clear();
+    ap.on_station_tx(&probe_request(&ssid_element(b"cyd-lab")), 0);
+    assert!(!response_summary(&ap.queue[0].frame).3, "no RSN");
+    assert_eq!(join(&mut ap, cfg.bssid, b"cyd-lab", None), 0);
+}
+
+#[test]
+fn a_live_change_to_the_wanted_name_clears_wanted_and_the_next_probe_is_answered() {
+    let mut ap = VirtualAp::new(ApConfig::parse("ssid=cyd-lab").unwrap(), false);
+    ap.on_station_tx(&probe_request(&ssid_element(b"other-net")), 0);
+    assert!(ap.queue.is_empty(), "a mismatch is not answered");
+    assert_eq!(ap.wanted.as_ref().unwrap().json(ap.cfg.ssid == "other-net"), r#"{"t":"wifi_wanted","ssid":"other-net","secure":null,"served":false}"#);
+    assert!(!ap.reconfigure(ap.cfg.retarget(Some("other-net"), Some(""), false).unwrap()), "nobody joined: nothing to disconnect");
+    assert!(ap.wanted.is_none() && ap.queue.is_empty());
+    ap.on_station_tx(&probe_request(&ssid_element(b"other-net")), 0);
+    assert_eq!(ap.queue.len(), 1, "answered now");
+    assert_eq!(ap.wanted, Some(Wanted { ssid: "other-net".into(), secure: None }));
+    let b = ap.cfg.bssid;
+    assert_eq!(join(&mut ap, b, b"other-net", None), 0);
+    // the same settings again change nothing and keep the station
+    ap.queue.clear();
+    assert!(!ap.reconfigure(ap.cfg.retarget(Some("other-net"), None, false).unwrap()));
+    assert_eq!((ap.state, ap.queue.len()), (StaState::Associated, 0));
+}
+
+#[test]
+fn a_live_change_to_match_any_serves_the_name_asked_for_at_once() {
+    let mut ap = VirtualAp::new(ApConfig::parse("ssid=cyd-lab,psk=cyd-lab-pass").unwrap(), false);
+    ap.on_station_tx(&probe_request(&ssid_element(b"other-net")), 0);
+    assert!(!ap.reconfigure(ap.cfg.retarget(Some("ignored"), None, true).unwrap()));
+    assert!(ap.cfg.any);
+    assert_eq!(ap.cfg.ssid, "other-net", "the wanted name, not the ignored one");
+    let beacons = ap.step(10_000_000);
+    assert_eq!(beacons.len(), 2, "both profiles (WPA2 is refused without a psk)");
+    assert!(beacons.iter().all(|b| ssid_of(&b.frame) == b"other-net"));
+    let b = ap.cfg.bssid;
+    assert_eq!(join(&mut ap, b, b"other-net", None), 0);
+    // match-any with a psk while joined: the station goes, the name stays, WPA2 is served too
+    ap.queue.clear();
+    assert!(ap.reconfigure(ap.cfg.retarget(None, Some("esp32sim-pass"), true).unwrap()));
+    assert_eq!(ap.cfg.ssid, "other-net");
+    assert!(deauth_reason(&ap.step(20_000_000)[0].frame, ap.cfg.bssid).is_some(), "the deauthentication first");
+    assert_eq!(ap.step(30_000_000).iter().filter(|b| is_beacon(&b.frame)).count(), 2);
+    let b = secure_bssid(&ap.cfg.bssid);
+    assert_eq!(join(&mut ap, b, b"other-net", Some("esp32sim-pass")), 0);
+}
+
+#[test]
+fn live_changes_are_validated_like_the_flag() {
+    let cfg = config();
+    for (ssid, psk, any) in [(None, None, false), (Some(""), None, false), (Some("*"), None, false), (Some("x"), Some("short"), false),
+                             (Some("0123456789abcdef0123456789abcdef!"), None, false), (None, Some("1234567"), true)] {
+        assert!(cfg.retarget(ssid, psk, any).is_err(), "accepted {ssid:?} {psk:?} {any}");
+    }
+    let c = cfg.retarget(Some(r"a\b,c=d"), Some(r"p,a\ss=word"), false).unwrap();
+    assert_eq!((c.ssid.as_str(), c.psk.as_deref()), (r"a\b,c=d", Some(r"p,a\ss=word")), "escaped through the spec");
+    assert_eq!(c.describe(), r"'a\b,c=d' (WPA2-PSK)");
+    assert_eq!(cfg.retarget(None, None, true).unwrap().describe(), "any network (open)");
+    // a nearby network that would clash with the new name is left out
+    let mut ap = VirtualAp::new(cfg, false);
+    ap.beacons = vec![BeaconAp { ssid: "neighbour".into(), bssid: [2, 0, 0, 0, 0, 9], channel: 1, rssi: -70, secure: true }];
+    ap.reconfigure(ap.cfg.retarget(Some("neighbour"), None, false).unwrap());
+    assert!(ap.beacons.is_empty());
+}

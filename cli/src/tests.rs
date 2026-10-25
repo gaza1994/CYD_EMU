@@ -260,6 +260,51 @@ fn the_wanted_network_is_pushed_on_change() {
     assert!(wanted(&web).is_empty(), "unchanged: not re-sent");
 }
 
+/// `{"t":"wifi"}` changes the emulated access point at run time: answered with `wifi_status`, a
+/// bad value with its error, and a `wifi_wanted` that reads the same as before is pushed again.
+#[test]
+fn the_control_channel_changes_the_access_point_live() {
+    let mut m = esp32::machine([0; 6], 4 << 20);
+    let web = esp_soc::web::WebServer::queued();
+    m.web = Some(web.clone());
+    const PUSH: u64 = 10_000_000;
+    let texts = |web: &esp_soc::web::WebServer| -> Vec<String> { web.take_outbox().into_iter().filter(|(k, _)| *k == 1).map(|(_, d)| String::from_utf8(d).unwrap()).filter(|s| s.contains("wifi_")).collect() };
+    web.push_incoming(r#"{"t":"wifi","ssid":"other-net"}"#.into());
+    m.run(PUSH);
+    assert_eq!(texts(&web), [r#"{"t":"wifi_status","error":"no emulated access point: run with --wifi"}"#]);
+    let link = esp_soc::SocBus::station_link(&mut m.bus).unwrap();
+    link.attach(Some(esp_soc::wifi::VirtualAp::new(esp_soc::wifi::ApConfig::parse("ssid=cyd-lab").unwrap(), false)), None);
+    let mut probe = vec![0x40, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 2, 3, 4, 5, 6, 7, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0];
+    probe.extend_from_slice(&[0, 9]); probe.extend_from_slice(b"other-net");
+    link.ap_mut().unwrap().on_station_tx(&probe, 0);
+    m.run(PUSH);
+    assert_eq!(texts(&web), [r#"{"t":"wifi_wanted","ssid":"other-net","secure":null,"served":false}"#]);
+    web.push_incoming(r#"{"t":"wifi","ssid":"x","psk":"short"}"#.into());
+    web.push_incoming(r#"{"t":"wifi","ssid":"other-net","psk":"","any":false}"#.into());
+    m.run(PUSH);
+    let out = texts(&web);
+    assert!(out[0].contains("invalid WiFi psk: expected 8 to 63 bytes"), "{out:?}");
+    assert_eq!(out[1], r#"{"t":"wifi_status","ssid":"other-net","secure":false,"any":false,"disconnected":false}"#);
+    assert_eq!(out.len(), 2, "wanted was cleared: nothing to push");
+    let link = esp_soc::SocBus::station_link(&mut m.bus).unwrap();
+    assert!(link.ap().unwrap().wanted.is_none());
+    link.ap_mut().unwrap().on_station_tx(&probe, 0);
+    m.run(PUSH);
+    assert_eq!(texts(&web), [r#"{"t":"wifi_wanted","ssid":"other-net","secure":null,"served":true}"#], "the next probe is reported, served now");
+    web.push_incoming(r#"{"t":"wifi","psk":"esp32sim-pass","any":true}"#.into());
+    m.run(PUSH);
+    assert_eq!(texts(&web), [r#"{"t":"wifi_status","ssid":"other-net","secure":true,"any":true,"disconnected":false}"#]);
+    // a wanted that reads as before is pushed again after a change
+    web.push_incoming(r#"{"t":"wifi","ssid":"other-net"}"#.into());
+    m.run(PUSH);
+    let link = esp_soc::SocBus::station_link(&mut m.bus).unwrap();
+    link.ap_mut().unwrap().on_station_tx(&probe, 0);
+    m.run(PUSH);
+    let out = texts(&web);
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert_eq!(out[1], r#"{"t":"wifi_wanted","ssid":"other-net","secure":null,"served":true}"#);
+}
+
 #[test]
 fn analog_scripts_validate_inputs_and_keep_panel_touch_separate() {
     use esp_soc::ScriptAction;
