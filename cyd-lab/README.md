@@ -407,7 +407,7 @@ hotspot with a phone. In cyd-lab:
   over the device's serial port whether it speaks Improv (at about 6 s, and once more).
   If it's waiting for Wi-Fi, a banner says **This firmware is waiting for Wi-Fi setup:
   Send Wi-Fi details**. The button sends the device's emulated network name and password
-  (Network section) and shows the state (waiting, connecting, connected), the firmware's
+  (Wi-Fi tag) and shows the state (waiting, connecting, connected), the firmware's
   name/version and its page address. A page address on the emulated network is shown as
   a `127.0.0.1` link when you've published that port, otherwise as "publish port N".
   **Check** asks again at any time. The probe is skipped while a Windows COM bridge is on
@@ -557,7 +557,7 @@ Every device has its own emulated Wi-Fi access point (`--wifi ssid=..,psk=.. --n
 on by default). The firmware joins it as it would join your router: it gets 10.0.2.15,
 can reach the internet through this PC, and nothing changes on your real Wi-Fi.
 
-- **Network name / password** (device's Network section): set them to the ones built into
+- **Network name / password** (the device's Wi-Fi tag): set them to the ones built into
   the firmware, i.e. your home Wi-Fi details, and the same firmware works unchanged. Empty
   password = open network. "Use these Wi-Fi details for new devices" stores them as the
   app-wide default. **They are stored in plain text** in `device.toml` / `settings.toml`
@@ -570,7 +570,7 @@ can reach the internet through this PC, and nothing changes on your real Wi-Fi.
   free PC ports (6054, 3233, ...). A port that is busy at power-on is skipped with a
   console note.
 - **Reach from my network** (on by default) listens on 0.0.0.0, so Home Assistant or a
-  phone on your LAN can connect to *this PC's IP*:port (shown in the Network section and
+  phone on your LAN can connect to *this PC's IP*:port (shown in the HA tag's popover and
   in "Use with..."). Off = 127.0.0.1 only.
 - **API vs OTA ports**: a client that takes a port (Home Assistant's ESPHome integration,
   a browser) can use any PC port, so the API can be 6054 -> 6053 with no firmware change.

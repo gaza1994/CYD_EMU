@@ -5202,6 +5202,23 @@ mod tests {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
+
+    /// A firmware whose own log names no hotspot (no pattern matches) still gets the Hotspot tag
+    /// once the engine reports the soft-AP it hears: `[emu] device hotspot: 'NAME' …` (esp32sim f74cb5e4).
+    #[test]
+    fn engine_hotspot_line_shows_the_hotspot_tag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::device::DeviceStore::open(tmp.path().join("devices")).unwrap();
+        let profile = ProfileLibrary::load(None).get("esp32-2432s028r").unwrap().clone();
+        let dev = store.create("Weather", &profile).unwrap();
+        let mut d = DeviceView::new(dev, Arc::new(|| {}));
+        d.log(Stream::Stdout, "[  1203][I][main] Mystery firmware v1: starting portal".into());
+        assert!(!d.hotspot_relevant(true), "nothing recognisable yet");
+        d.log(Stream::Stderr, "[emu] device hotspot: 'Mystery-7F3A' bssid 24:0a:c4:00:7f:3a channel 6 (open)".into());
+        assert_eq!(d.hotspots_seen(), [("Mystery-7F3A".to_string(), None)]);
+        assert!(d.hotspot_relevant(true));
+        assert_eq!(d.hotspot_title(true), "Hotspot: 1 seen");
+    }
 }
 
 /// The port in an http URL (80 if none).
