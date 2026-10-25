@@ -149,6 +149,9 @@ pub struct Entry {
     /// Listed first in its group.
     #[serde(default)]
     pub pinned: bool,
+    /// Not the firmware project's own release (built by cyd-lab or a third party); see [`Entry::is_custom`].
+    #[serde(default)]
+    pub custom_build: bool,
     /// How the firmware gets onto Wi-Fi the first time.
     #[serde(default)]
     pub first_setup: Option<FirstSetup>,
@@ -440,6 +443,11 @@ impl Entry {
 
     pub fn kind(&self) -> &str {
         self.source.get("type").and_then(|v| v.as_str()).unwrap_or("")
+    }
+
+    /// A custom build rather than the upstream project's official image: flagged in the gallery.
+    pub fn is_custom(&self) -> bool {
+        self.custom_build || self.kind() == "bundled"
     }
 
     pub fn is_template(&self) -> bool {
@@ -829,14 +837,20 @@ mod tests {
         let c = Catalog::bundled();
         let g = c.grouped("cyd-2432s028r", false);
         assert_eq!(g[0].0, "Home Assistant");
-        assert_eq!(g[0].1[0].id, "esphome-ha-cyd");
+        // The official ESPHome image leads, as on a real board; the custom demo sits in Other, flagged.
+        let official = g[0].1[0];
+        assert_eq!(official.id, "esphome-web");
+        assert!(official.name.contains("official") && !official.is_custom());
+        assert!(official.home_assistant && official.first_setup.as_ref().unwrap().improv && official.description.contains("screen stays dark"));
+        assert!(official.fits("cyd-2432s028r-2usb") && !official.borrowed_for("cyd-2432s028r-2usb"));
         let names: Vec<&str> = g.iter().map(|(h, _)| *h).collect();
         assert_eq!(names, ["Home Assistant", "Tools & fun", "Programming", "Other / advanced"]);
-        let ha = g[0].1[0];
+        let ha = c.entries.iter().find(|e| e.id == "esphome-ha-cyd").unwrap();
+        assert!(ha.group_id() == "other" && ha.is_custom() && ha.name.contains("not official"));
         assert!(ha.pinned() && ha.first_setup.as_ref().unwrap().improv && ha.home_assistant && ha.view_rotation == Some(270));
         assert!(Entry::template_text(&ha.config).unwrap().contains("improv_serial"));
-        let ehw = c.entries.iter().find(|e| e.id == "esphome-web").unwrap();
-        assert!(ehw.name.contains("no screen") && ehw.group_id() == "other");
+        // Everything else is the upstream project's own image.
+        assert_eq!(c.entries.iter().filter(|e| e.is_custom()).map(|e| e.id.as_str()).collect::<Vec<_>>(), ["esphome-ha-cyd"]);
         // Every flashable entry says how it gets onto Wi-Fi.
         for e in c.entries.iter().filter(|e| !e.is_template() && e.profiles.iter().any(|p| p == "cyd-2432s028r")) {
             assert!(e.first_setup.as_ref().is_some_and(|f| !f.summary().is_empty()), "{} has no first_setup", e.id);

@@ -2127,6 +2127,10 @@ impl CydLabApp {
                                     let badge = format!(" {} ", e.emulator_status.label());
                                     ui.label(RichText::new(badge).small().color(Color32::WHITE).background_color(col))
                                         .on_hover_text(format!("{}\n\n{}", e.emulator_status.help(), e.emulator_notes));
+                                    if e.is_custom() {
+                                        ui.label(RichText::new(" custom build ").small().color(Color32::BLACK).background_color(Color32::from_rgb(240, 150, 60)))
+                                            .on_hover_text("Not the firmware project's official release: built by cyd-lab (or a third party). A real board from the shop would not have it; prefer the official entries.");
+                                    }
                                     for need in e.needs() {
                                         ui.label(RichText::new(format!(" needs {need} ")).small().color(Color32::BLACK).background_color(Color32::from_rgb(230, 200, 120)))
                                             .on_hover_text("The emulator doesn't model this; those features won't work here.");
@@ -2254,6 +2258,12 @@ impl CydLabApp {
                 notes: e.steps.clone(),
                 ..Default::default()
             });
+            // A fresh checklist must not inherit the old firmware's Wi-Fi / Home Assistant
+            // state: it would be ticked again before the new firmware even runs.
+            d.wifi_watch = Default::default();
+            d.improv = ImprovUi::default();
+            d.api_client = None;
+            d.fwd = Default::default();
             let _ = self.store.update_meta(&d.dev);
             if e.home_assistant {
                 // Home Assistant has to reach the device: publish the ESPHome API and OTA

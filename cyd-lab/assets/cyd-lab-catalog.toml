@@ -7,6 +7,8 @@
 # Extra entry fields cyd-lab reads:
 #   group       = "home-assistant" | "tools" | "programming" | "other"  (gallery heading)
 #   pinned      = true            listed first in its group
+#   custom_build = true           not the project's own release (built by cyd-lab or a third party):
+#                                 the gallery flags it; "bundled" sources always count as custom
 #   first_setup = { improv = bool, hotspot = "SSID pattern", password = "...", page = "http://...",
 #                   note = "..." }  how the firmware gets onto Wi-Fi the first time
 #   steps       = ["...", ...]    extra notes under the setup checklist shown after installing it
@@ -20,8 +22,8 @@
 
 [[entries]]
 id = "esphome-ha-cyd"
-name = "ESPHome for Home Assistant (with screen)"
-description = "Ready to adopt in Home Assistant: the screen shows the device name, IP and status, touch works, and the backlight, RGB LED and light sensor appear in Home Assistant. Wi-Fi setup over USB (Improv) or its own hotspot. Built by cyd-lab from its ESPHome config (no Bluetooth)."
+name = "Custom demo (not official firmware): ESPHome with screen"
+description = "Not official firmware: a demo cyd-lab built from its own ESPHome YAML, to show what an adopted board can look like. For the real out-of-the-box experience use \"ESPHome (official, for Home Assistant)\". The screen shows the device name, IP and status, touch works, and the backlight, RGB LED and light sensor appear in Home Assistant. Wi-Fi setup over USB (Improv) or its own hotspot. Built by cyd-lab from its ESPHome config (no Bluetooth)."
 homepage = "https://esphome.io/"
 licence = "ESPHome: MIT (Python) + GPL-3.0 (C++)"
 profiles = ["cyd-2432s028r", "cyd-2432s028r-2usb"]
@@ -31,8 +33,8 @@ emulator_notes = "Checked in the emulator: ready screen, touch (Identify button)
 notes = """For the original micro-USB ESP32-2432S028R (ILI9341 240x320, drawn landscape).
 Name: cyd-panel plus the last 6 digits of the MAC, e.g. cyd-panel-1a2b3c. No API encryption key, so Home Assistant adopts it without secrets; take control of it in the ESPHome add-on to add one.
 TODO: a one-click "Take control" (dashboard_import) needs a public copy of the config; not published yet."""
-group = "home-assistant"
-pinned = true
+group = "other"
+custom_build = true
 config = "esphome/cyd-panel-2432s028r.yaml"
 view_rotation = 270
 first_setup = { improv = true, hotspot = "cyd-panel-xxxxxx", password = "", page = "http://192.168.4.1", note = "" }
@@ -145,11 +147,16 @@ first_setup = { note = "no Wi-Fi" }
 
 [[overrides]]
 id = "esphome-web"
-name = "ESPHome Web (generic ESP32, no screen)"
-group = "other"
-description = "The generic image from web.esphome.io: no screen driver, so the display stays dark. Only for adopting a blank ESP32 into Home Assistant and then flashing your own config. For a CYD with a working screen use \"ESPHome for Home Assistant (with screen)\" above, or the \"ESPHome CYD starter YAML\" (Copy config)."
+name = "ESPHome (official, for Home Assistant)"
+group = "home-assistant"
+pinned = true
+profiles = ["cyd-2432s028r", "cyd-2432s028r-2usb", "cyd-2432s024", "cyd-2432s032", "cyd-3248s035"]
+description = "The official ESPHome firmware: the stock ESP32 image that ESPHome's web installer (web.esphome.io, ESP Web Tools) puts on a new board, byte for byte. It offers Wi-Fi setup over USB (Improv serial) and Bluetooth, plus a fallback hotspot, so Home Assistant finds it and you can adopt it. The screen stays dark until you adopt it in Home Assistant and install your own YAML, exactly as on a real board."
+emulator_notes = "Checked in the emulator: Improv over serial and Bluetooth (BLE Improv service) and the fallback hotspot esphome-web-xxxxxx start, Send Wi-Fi details joins it, and Home Assistant reaches the API on 6053 through the published port. The screen stays dark (nothing drives the backlight on GPIO21), as on a real board."
+notes = "Generic ESP32 build with no display driver: that comes with your own YAML after adoption (the \"ESPHome CYD starter YAML\" entry has one for this board)."
 home_assistant = true
-first_setup = { improv = true, hotspot = "esphome-web-xxxxxx", password = "", page = "http://192.168.4.1", note = "no screen: use Send Wi-Fi details (Improv over serial) or join its hotspot" }
+first_setup = { improv = true, hotspot = "esphome-web-xxxxxx", password = "", page = "http://192.168.4.1", note = "the screen stays dark: use Send Wi-Fi details (Improv over USB) or join its hotspot" }
+steps = ["The screen stays dark until you install your own YAML. That is normal: a real board does the same.", "After adding it to Home Assistant: in the ESPHome Builder add-on, Adopt it, put your display config in its YAML (the ESPHome CYD starter YAML in Install firmware… has one) and Install."]
 
 [[overrides]]
 id = "circuitpython"

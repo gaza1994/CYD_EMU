@@ -20,8 +20,8 @@ target, and it also builds and runs on Linux.
    **Retry**, or **I already have the ROM ELFs** to pick a folder.
 3. **+ New device** > ESP32-2432S028R original (micro-USB) > **Create**, then **Power on**. A new board has blank
    flash and loops on `invalid header`, the same as a real erased chip.
-4. Press **Install firmware...** and pick a firmware from the gallery (ESPHome for Home
-   Assistant with screen, openHASP, NerdMiner, Bruce, Marauder, CYD-Klipper, ...). One click downloads it, checks its SHA-256, writes it
+4. Press **Install firmware...** and pick a firmware from the gallery (the official ESPHome
+   image for Home Assistant, openHASP, NerdMiner, Bruce, Marauder, CYD-Klipper, ...). One click downloads it, checks its SHA-256, writes it
    at the right offsets and boots it. See [Install firmware gallery](#install-firmware-gallery).
    You can also drag your own firmware `.bin` onto the window, or use **Install from web**
    with a manifest URL.
@@ -266,14 +266,25 @@ have not been run.
 
 ## Install firmware gallery
 
-The gallery is grouped: **Home Assistant** (ESPHome for Home Assistant with screen, openHASP,
+The gallery is grouped: **Home Assistant** (official ESPHome, openHASP,
 Tasmota), **Tools & fun** (Bruce, Marauder, NerdMiner, CYD-Klipper, weather dashboards, ...),
 **Programming** (MicroPython, the ESPHome CYD starter YAML, ESP32-Cheap-Yellow-Display examples) and
-**Other / advanced** (ESPHome Web, CircuitPython). Every card has a **First Wi-Fi setup**
+**Other / advanced** (CircuitPython, cyd-lab's custom ESPHome demo). Every card has a **First Wi-Fi setup**
 line: Improv over USB, the firmware's own hotspot (name, password, setup page), or none.
 
-**ESPHome for Home Assistant (with screen)** is pinned at the top. It's a factory image
-built by cyd-lab from `firmware/esphome-ha/cyd-2432s028r.yaml` (ESPHome 2026.10.0) and
+Entries are the firmware projects' own official images, downloaded from where the project
+publishes them. The one exception is flagged **custom build** (see below).
+
+**ESPHome (official, for Home Assistant)** is pinned at the top. It's the stock ESP32
+image that ESPHome's web installer (web.esphome.io / ESP Web Tools) writes to a new board,
+SHA-256 pinned: Improv over serial and Bluetooth, the fallback hotspot `esphome-web-xxxxxx`,
+the native API and OTA. As on a real board, the screen stays dark (nothing drives the
+backlight on GPIO21) until you adopt it in Home Assistant and install your own YAML with a
+display config. After installing it the setup checklist offers Send Wi-Fi details (Improv
+over serial) or the hotspot, publishes the API port, and ticks once Home Assistant connects.
+
+**Custom demo (not official firmware): ESPHome with screen** is in Other / advanced,
+flagged **custom build**. It's a factory image built by cyd-lab from `firmware/esphome-ha/cyd-2432s028r.yaml` (ESPHome 2026.10.0) and
 shipped inside the exe (`assets/firmware/`, SHA-256 checked like a download). It drives
 the ILI9341 screen with LVGL ("Ready to adopt in Home Assistant", device name, IP and
 status, an Identify button), the XPT2046 touch, backlight, RGB LED and light sensor. Wi-Fi
@@ -287,10 +298,6 @@ Improv (connected in about 4 s) and the API through a published port with aioesp
 Rebuild it with `tools/build_esphome_ha.py` (runs `esphome compile`, copies
 `firmware.factory.bin` to `assets/firmware/` and updates `sha256`/`size` in
 `assets/cyd-lab-catalog.toml`). (`dashboard_import` is not set yet.)
-
-**ESPHome Web** (the generic image from web.esphome.io) has no screen driver: the display
-stays dark and it's only for adopting a blank ESP32 into Home Assistant. In the emulator it
-crashes when it turns Bluetooth on, so its Improv setup never finishes.
 
 **Install firmware...** (first button on the Firmware row) opens a gallery of ready-made
 firmware for the selected device's board. The list comes from a curated catalogue,
