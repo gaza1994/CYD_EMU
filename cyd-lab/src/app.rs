@@ -1587,6 +1587,11 @@ impl DeviceView {
                 }
             }
         }
+        if crate::consolelog::hidden_engine_hint(&line) {
+            // An esp32sim command-line tip: console.log only (see hidden_engine_hint).
+            self.console_log.line(&line);
+            return;
+        }
         self.push_line(stream, line);
     }
 

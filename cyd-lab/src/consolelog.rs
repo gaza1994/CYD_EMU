@@ -86,6 +86,22 @@ pub fn now_stamp() -> String {
     utc_stamp(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
 }
 
+/// Engine hints that tell you to pass an esp32sim command-line flag, which nobody types in
+/// cyd-lab: kept out of the on-screen console (they are still written to `console.log`).
+/// Only these three; every other `[emu]` line stays. What each one says is already in the UI:
+/// - `[emu] phone: hotspot 'X' is secured; give its password with --ap-client ...`: the
+///   Device hotspot window has the password field (prefilled from the catalogue).
+/// - `[emu] wifi: the firmware is looking for 'X', but the access point is 'Y': use --wifi ...`
+///   and `[emu] wifi: the firmware wants 'X' as a WPA2 network; give its passphrase with
+///   --wifi ...`: the engine also reports `wifi_wanted`, shown as the "Firmware is looking
+///   for ..." banner with Use this name (and a password field for a secured network).
+pub fn hidden_engine_hint(line: &str) -> bool {
+    let l = line.trim_start();
+    (l.starts_with("[emu] phone: hotspot '") && l.contains("' is secured; give its password with --ap-client "))
+        || (l.starts_with("[emu] wifi: the firmware is looking for '") && l.contains(": use --wifi "))
+        || (l.starts_with("[emu] wifi: the firmware wants '") && l.contains("give its passphrase with --wifi "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +135,28 @@ mod tests {
         assert_eq!(utc_stamp(0), "1970-01-01 00:00:00 UTC");
         assert_eq!(utc_stamp(951_782_400), "2000-02-29 00:00:00 UTC");
         assert_eq!(utc_stamp(1_792_890_000), "2026-10-25 01:00:00 UTC");
+    }
+
+    #[test]
+    fn hides_only_engine_hints_about_cli_flags() {
+        for l in [
+            "[emu] phone: hotspot 'CYD-38B8' is secured; give its password with --ap-client ssid=CYD-38B8,psk=PASS",
+            "[emu] wifi: the firmware is looking for 'HomeNet', but the access point is 'esp32sim': use --wifi ssid=HomeNet[,psk=PASS] or --wifi any",
+            "[emu] wifi: the firmware wants 'HomeNet' as a WPA2 network; give its passphrase with --wifi ssid=*,psk=PASS (or ssid=HomeNet,psk=PASS). Refusing the join",
+        ] {
+            assert!(hidden_engine_hint(l), "{l}");
+        }
+        for l in [
+            "[emu] device hotspot: 'CYD-38B8' bssid 24:0a:c4:8e:b8:39 channel 1 (WPA2-PSK)",
+            "[emu] phone: lease 192.168.4.2 from 192.168.4.1; --ap-fwd connections go through",
+            "[emu] wifi: the firmware is looking for a network whose SSID is not UTF-8 ([ff]); match-any cannot serve it",
+            "[emu] serial: UART0 at 127.0.0.1:22170 (esptool --port rfc2217://127.0.0.1:22170, or socket:// for raw bytes)",
+            "[emu] no esp32 mask ROM ELF found (pass --rom, or use --boot app)",
+            "[cyd-lab] Firmware is looking for Wi-Fi \"HomeNet\", but this device's access point offers \"esp32sim\"",
+            "[  441][W][NET ] AP 'CYD-38B8' up, portal at http://192.168.4.1",
+            "use --wifi ssid=x: firmware printing the same words without the [emu] prefix",
+        ] {
+            assert!(!hidden_engine_hint(l), "{l}");
+        }
     }
 }
