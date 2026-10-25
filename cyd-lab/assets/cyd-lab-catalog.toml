@@ -178,17 +178,26 @@ first_setup = { note = "put your Wi-Fi in the YAML (secrets) before you compile 
 [[overrides]]
 id = "wm-hello-world"
 group = "programming"
-first_setup = { note = "no Wi-Fi" }
+# "Web Installer" in the catalogue is the website it is flashed from, not a web server: the
+# image has no Wi-Fi or network stack at all (checked in the emulator with --wifi any: no DHCP,
+# no wifi_wanted, nothing on port 80, no Improv, nothing on serial after the bootloader).
+name = "Hello World example"
+description = "Basics/1-HelloWorld from the ESP32-Cheap-Yellow-Display examples (flashed from their web installer page): draws \"Hello\" and \"World\" on the screen and nothing else. No Wi-Fi, no web page, no Improv, no serial output; the network settings make no difference."
+first_setup = { note = "none: it has no Wi-Fi (no web page, no Improv)" }
 
 [[overrides]]
 id = "wm-touch-test"
 group = "programming"
+name = "Touch test example"
+description = "Basics/2-TouchTest from the ESP32-Cheap-Yellow-Display examples (flashed from their web installer page): shows where you touch the screen. No Wi-Fi or web page."
+first_setup = { note = "none: it has no Wi-Fi" }
 first_setup = { note = "no Wi-Fi" }
 
 [[overrides]]
 id = "wm-lvgl9"
 group = "programming"
-first_setup = { note = "no Wi-Fi" }
+description = "LVGL 9 demo from the ESP32-Cheap-Yellow-Display examples (flashed from their web installer page): a SquareLine-style Profile / Analytics screen. No Wi-Fi or web page."
+first_setup = { note = "none: it has no Wi-Fi" }
 
 [[overrides]]
 id = "esphome-web"
