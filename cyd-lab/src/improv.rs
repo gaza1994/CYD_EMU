@@ -210,8 +210,17 @@ pub enum Event {
     Info(Vec<String>),
     /// The address the board gave after joining (its web page).
     Url(String),
+    /// The firmware answered with its own text console ("unknown command"): no Improv.
+    NoImprov,
     /// The session ended. `Err` = could not talk to the port or no answer.
     Done(Result<String, String>),
+}
+
+/// Does this console text look like a firmware's own command line rejecting the Improv
+/// packet (e.g. CYD Weather Dashboard: `unknown command 'improv…' (try: settings, …)`)?
+pub fn text_console_reply(text: &str) -> bool {
+    let l = text.to_ascii_lowercase();
+    ["unknown command", "command not found", "unknown cmd", "invalid command", "unrecognized command", "unrecognised command", "not a command"].iter().any(|k| l.contains(k))
 }
 
 /// What to do in a session.
@@ -293,6 +302,8 @@ fn session(s: &mut TcpStream, job: Job, mut lines: Lines, events: &Sender<Event>
     let mut sent_wifi = false;
     let mut url: Option<String> = None;
     let mut provisioned_at: Option<Instant> = None;
+    // What the firmware printed as text this session (to spot a text console's reply).
+    let mut said = String::new();
     let send = |s: &mut TcpStream, p: Vec<u8>| -> Result<(), String> {
         s.write_all(&p).and_then(|_| s.write_all(b"\n")).map_err(|e| format!("serial port: {e}"))
     };
@@ -314,6 +325,19 @@ fn session(s: &mut TcpStream, job: Job, mut lines: Lines, events: &Sender<Event>
             Ok(n) => {
                 let (text, packets) = parser.feed(&buf[..n]);
                 lines.push(&text);
+                if state.is_none() && packets.is_empty() {
+                    said.push_str(&String::from_utf8_lossy(&text));
+                    if said.len() > 1024 {
+                        let cut = (said.len() - 512..said.len()).find(|&k| said.is_char_boundary(k)).unwrap_or(said.len());
+                        said.drain(..cut);
+                    }
+                    if text_console_reply(&said) {
+                        // Its own command line answered: stop here (no second packet, no Wi-Fi
+                        // packet) so its console gets one line of noise at most.
+                        let _ = events.send(Event::NoImprov);
+                        break Err("this firmware has its own text console, not Improv Wi-Fi (it answered \"unknown command\"): set it up through its hotspot instead".into());
+                    }
+                }
                 for p in packets {
                     match p {
                         Packet::State(st) => {
@@ -480,6 +504,53 @@ mod tests {
         assert_eq!(sniff_setup("[C][wifi:440]: Local MAC: 24:0A:C4:01:02:03"), None);
         // What firmware without Improv prints when a tool sends it a packet.
         assert_eq!(sniff_setup("IMPROV\x01\x03 Command not found"), None);
+        assert!(text_console_reply("[     99768][W][CONSOLE] unknown command 'improv\u{1}\u{3}\u{2}' (try: settings, get, set, save, load, reset)"));
+        assert!(text_console_reply("IMPROV\x01\x03 Command not found"));
+        assert!(!text_console_reply("[I][wifi:1123]: Starting fallback AP!"));
+    }
+
+    /// A firmware with its own text console (CYD Weather Dashboard) answers the packet with
+    /// "unknown command": the session stops there, without a second packet or a Wi-Fi packet.
+    #[test]
+    fn text_console_reply_ends_the_session_after_one_packet() {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        let fw = std::thread::spawn(move || {
+            let (mut c, _) = l.accept().unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 256];
+            c.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+            if let Ok(n) = c.read(&mut buf) {
+                got.extend_from_slice(&buf[..n]);
+            }
+            c.write_all(b"[     99768][W][CONSOLE] unknown command 'improv\x01\x03\x02' (try: settings, get, set, save, load, reset)\r\n").unwrap();
+            // Anything more within 2 s (the 1.2 s resend, a Wi-Fi packet) is noise.
+            let until = Instant::now() + Duration::from_millis(2000);
+            while Instant::now() < until {
+                match c.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(_) => {}
+                }
+            }
+            got
+        });
+        let (console, _crx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
+        start(port, Job::Provision { ssid: "net".into(), password: "password1".into() }, console, std::sync::Arc::new(|| {}), tx).unwrap();
+        let mut no_improv = false;
+        let done = loop {
+            match rx.recv_timeout(Duration::from_secs(5)).expect("session ends") {
+                Event::NoImprov => no_improv = true,
+                Event::Done(r) => break r,
+                _ => {}
+            }
+        };
+        assert!(no_improv);
+        assert!(done.unwrap_err().contains("text console"));
+        let got = fw.join().unwrap();
+        assert_eq!(got.windows(6).filter(|w| w == b"IMPROV").count(), 1, "{got:?}");
     }
 
     #[test]

@@ -969,6 +969,9 @@ struct ImprovUi {
     /// Improv over serial / it is waiting for a Wi-Fi network.
     capable: bool,
     waiting_log: bool,
+    /// A session found a text console instead ("unknown command"): don't offer Improv again
+    /// this run.
+    no_improv: bool,
 }
 
 /// Firmware queued for flash.bin. Applied once the engine is stopped (it owns the file
@@ -1370,6 +1373,7 @@ impl DeviceView {
                     Event::Error(e) => self.improv.error = Some(e),
                     Event::Info(v) => self.improv.info = v,
                     Event::Url(u) => self.improv.url = Some(u),
+                    Event::NoImprov => self.improv.no_improv = true,
                     Event::Done(r) => {
                         let kind = self.improv.busy.take();
                         self.improv.rx = None;
@@ -3950,12 +3954,27 @@ impl CydLabApp {
                         None => "This firmware is waiting for Wi-Fi setup:".to_string(),
                     };
                     ui.label(RichText::new(lead).color(Color32::WHITE));
-                    let improv_tip = if improv_ready || d.improv.capable { send_tip.clone() } else { format!("{send_tip}\n\nIts log doesn't say it supports Improv: if it doesn't, it ignores this (or prints an error) and you set it up through its hotspot instead.") };
-                    if ui.add_enabled(send_enabled, egui::Button::new("Send Wi-Fi details")).on_hover_text(improv_tip).clicked() {
-                        job = Some(provision.clone());
+                    // Improv only where it can work: the firmware said it has it, or the catalogue
+                    // does, or there is no hotspot to use instead. Firmware with its own text
+                    // console (CYD Weather Dashboard) would only print "unknown command".
+                    let improv_known = improv_ready || d.improv.capable || d.dev.meta.guide.as_ref().is_some_and(|g| g.improv);
+                    let offer_send = !d.improv.no_improv && (improv_known || seen_ap.is_none());
+                    if offer_send {
+                        let improv_tip = if improv_known { send_tip.clone() } else { format!("{send_tip}\n\nIts log doesn't say it supports Improv: if it doesn't, it ignores this (or prints an error) and you set it up through its hotspot instead.") };
+                        if ui.add_enabled(send_enabled, egui::Button::new("Send Wi-Fi details")).on_hover_text(improv_tip).clicked() {
+                            job = Some(provision.clone());
+                        }
                     }
                     if seen_ap.is_some() {
-                        ui.label(RichText::new("or join it from the Hotspot tag above").small().color(Color32::from_gray(220)));
+                        if offer_send {
+                            ui.label(RichText::new("or").small().color(Color32::from_gray(220)));
+                        }
+                        if ui.button("Join its hotspot…").on_hover_text("Opens the Device hotspot window beside the screen: join the network, then its setup page opens in your browser.").clicked() {
+                            if d.tag_win != Some(TagWin::Hotspot) {
+                                d.tag_win = Some(TagWin::Hotspot);
+                                d.tag_win_new = true;
+                            }
+                        }
                     }
                 });
             });
@@ -3978,6 +3997,7 @@ impl CydLabApp {
                     (Some("provision"), None) => "sending…".into(),
                     (Some(_), _) => "asking the firmware…".into(),
                     (None, Some(s)) => format!("firmware: {}", s.label()),
+                    (None, _) if d.improv.no_improv => "this firmware has its own text console, not Improv: use its hotspot".into(),
                     (None, None) if alive && d.improv.capable => "its log says it supports Improv (nothing sent yet)".into(),
                     (None, None) if alive && connected => "on Wi-Fi".into(),
                     (None, None) if alive => "nothing is sent until you ask (Check sends an Improv request)".into(),
