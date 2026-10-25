@@ -1402,6 +1402,7 @@ impl DeviceView {
                 Some(OtaClue::RolledBack) => {
                     self.ota_trial = None;
                     self.ota_rolled_back = true;
+                    self.ota_restarted_in_trial = false;
                 }
                 None => {}
             }
@@ -2957,6 +2958,7 @@ impl CydLabApp {
             // Expire a trial that never ends (firmware without safe_mode never says it).
             if d.ota_trial.is_some_and(|t| t.elapsed() > Duration::from_secs(150)) {
                 d.ota_trial = None;
+                d.ota_restarted_in_trial = false;
             }
             if (power_toggle && running || en) && d.ota_trial.is_some() {
                 d.ota_restarted_in_trial = true;
