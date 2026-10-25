@@ -31,6 +31,7 @@ fn help(chip: &str, code: i32) -> ! {
     eprintln!("  --console usb|uart0|both|none   which consoles to print (uart0 shows the ROM and bootloader)");
     eprintln!("  --wifi ssid=…,psk=…   a virtual access point with DHCP, DNS, NTP and NAT to the host network");
     eprintln!("                        (no psk: open; any SSID or passphrase, \\, for a comma; `any` or ssid=*: the SSID the firmware asks for)");
+    eprintln!("                        (change it while running with the web channel's {{\"t\":\"wifi\"}}: the firmware is disconnected and rejoins)");
     eprintln!("  --hostfwd tcp:H:HP-G:GP  publish a guest TCP port on the host (repeatable; needs --wifi)");
     eprintln!("  --ap-client ssid=…,psk=…  a phone that joins the guest's own hotspot (SoftAP setup portals; classic ESP32)");
     eprintln!("  --ap-fwd tcp:H:HP-G:GP  publish a port on the guest's hotspot through the phone (repeatable; G defaults to 192.168.4.1)");
