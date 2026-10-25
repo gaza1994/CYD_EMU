@@ -74,6 +74,18 @@ pub struct DeviceMeta {
     /// The setup checklist shown after a catalogue install (`[guide]`), kept until closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guide: Option<Guide>,
+    /// The tab chosen in the device panel's right-hand pane (setup checklist or console);
+    /// None picks one from the checklist's state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_tab: Option<PaneTab>,
+}
+
+/// The device panel's right-hand pane: the setup checklist or the console.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PaneTab {
+    Setup,
+    Console,
 }
 
 /// The setup checklist after installing a catalogue firmware. Most steps tick themselves
@@ -211,6 +223,7 @@ impl DeviceStore {
             network: crate::network::DeviceNetwork::for_new_device(wifi),
             screen_window: ScreenWindow::default(),
             guide: None,
+            pane_tab: None,
         };
         let dev = Device { id, dir, meta };
         write_blank_flash(&dev.flash_path(), profile.flash.size_bytes())?;
@@ -466,8 +479,10 @@ mod tests {
             wifi_sent: true,
             ..Default::default()
         });
+        dev.meta.pane_tab = Some(PaneTab::Console);
         store.update_meta(&dev).unwrap();
         assert_eq!(store.load(&dev.id).unwrap().meta.guide, dev.meta.guide);
+        assert_eq!(store.load(&dev.id).unwrap().meta.pane_tab, Some(PaneTab::Console));
         dev.meta.guide = None;
         store.update_meta(&dev).unwrap();
         assert!(store.load(&dev.id).unwrap().meta.guide.is_none());

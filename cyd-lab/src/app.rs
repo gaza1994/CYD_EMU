@@ -623,9 +623,13 @@ struct DeviceView {
     guide_reopened: bool,
     /// Checklist: the firmware was on Wi-Fi in this run (so losing it unticks the step).
     guide_wifi_seen: bool,
+    /// Checklist: a step is waiting for the user (last frame), for the Setup tab's dot.
+    guide_needs_user: bool,
+    /// Console lines (counted from the start of the run) seen on the Console tab, for its dot.
+    console_seen: u64,
 }
 
-use crate::device::Guide;
+use crate::device::{Guide, PaneTab};
 
 /// Room kept under the gallery's list for its footer (checkbox and hint lines).
 const GALLERY_FOOTER: f32 = 84.0;
@@ -848,18 +852,20 @@ fn ha_box(ui: &mut egui::Ui, api_port: Option<u16>) {
     let host = cached_lan_ip().map(|ip| ip.to_string());
     egui::Frame::new().fill(Color32::from_rgb(16, 28, 40)).stroke(Stroke::new(1.0, Color32::from_rgb(70, 110, 150))).inner_margin(8.0).corner_radius(4.0).show(ui, |ui| {
         ui.label(RichText::new("In Home Assistant: Settings > Devices & services > Add integration > ESPHome, then enter:").small());
+        // Smaller in a narrow pane, so Host and its Copy button still fit.
+        let size = if ui.available_width() < 300.0 { 15.0 } else { 20.0 };
         egui::Grid::new("ha-box").num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
             let row = |ui: &mut egui::Ui, k: &str, v: Option<String>| {
                 ui.label(k);
                 match v {
                     Some(v) => {
-                        ui.label(RichText::new(&v).monospace().size(20.0).strong().color(Color32::WHITE));
+                        ui.label(RichText::new(&v).monospace().size(size).strong().color(Color32::WHITE));
                         if ui.button("Copy").clicked() {
                             ui.ctx().copy_text(v);
                         }
                     }
                     None => {
-                        ui.label(RichText::new("—").size(20.0));
+                        ui.label(RichText::new("—").size(size));
                         ui.label("");
                     }
                 }
@@ -1093,6 +1099,8 @@ impl DeviceView {
             guide_all_set: None,
             guide_reopened: false,
             guide_wifi_seen: false,
+            guide_needs_user: false,
+            console_seen: 0,
         }
     }
 
@@ -2476,6 +2484,8 @@ impl CydLabApp {
                 notes: e.steps.clone(),
                 ..Default::default()
             });
+            // A new checklist opens on the Setup tab.
+            d.dev.meta.pane_tab = None;
             // A fresh checklist must not inherit the old firmware's Wi-Fi / Home Assistant
             // state: it would be ticked again before the new firmware even runs.
             d.wifi_watch = Default::default();
@@ -3104,11 +3114,62 @@ impl CydLabApp {
             ui.set_min_height(avail.y);
             ui.vertical(|ui| self.screen_ui(ui, i, profile.as_ref()));
             ui.separator();
+            // The rest of the width, and no more: wide content wraps or scrolls inside it.
+            let w = ui.available_width();
             ui.vertical(|ui| {
-                self.guide_ui(ui, i, alive);
-                self.console_ui(ui, i);
+                ui.set_width(w);
+                self.pane_ui(ui, i, alive);
             });
         });
+    }
+
+    /// The right-hand pane: tabs for the setup checklist and the console, each getting the
+    /// full height (just the console when there is no checklist).
+    fn pane_ui(&mut self, ui: &mut egui::Ui, i: usize, alive: bool) {
+        let d = &mut self.devices[i];
+        let lines = d.console_dropped + d.console.len() as u64;
+        let Some(g) = &d.dev.meta.guide else {
+            d.console_seen = lines;
+            self.console_ui(ui, i);
+            return;
+        };
+        // Unless chosen: the checklist while it has steps left, else the console.
+        let tab = d.dev.meta.pane_tab.unwrap_or(if g.collapsed { PaneTab::Console } else { PaneTab::Setup });
+        let setup_dot = d.guide_needs_user && tab != PaneTab::Setup;
+        let console_dot = lines > d.console_seen && tab != PaneTab::Console;
+        let mut chosen = None;
+        ui.horizontal(|ui| {
+            for (t, label, dot, tip) in [
+                (PaneTab::Setup, "Setup", setup_dot, "The setup checklist for this firmware"),
+                (PaneTab::Console, "Console", console_dot, "The board's serial console (UART0)"),
+            ] {
+                let r = ui.selectable_label(tab == t, RichText::new(format!("{label}  ")).strong()).on_hover_text(tip);
+                if dot {
+                    let c = if t == PaneTab::Setup { Color32::from_rgb(240, 180, 60) } else { Color32::from_rgb(120, 170, 240) };
+                    ui.painter().circle_filled(egui::pos2(r.rect.right() - 6.0, r.rect.center().y), 3.0, c);
+                }
+                if r.clicked() && tab != t {
+                    chosen = Some(t);
+                }
+            }
+        });
+        ui.separator();
+        if let Some(t) = chosen {
+            d.dev.meta.pane_tab = Some(t);
+            if let Err(e) = d.dev.save() {
+                d.lab(format!("could not save device settings: {e:#}"));
+            }
+        }
+        let tab = chosen.unwrap_or(tab);
+        if tab == PaneTab::Setup {
+            egui::ScrollArea::vertical().id_salt(("setup", &d.dev.id)).auto_shrink(false).show(ui, |ui| self.guide_ui(ui, i, alive, true));
+        } else {
+            // Still run every frame: the steps tick themselves and the list folds when done.
+            self.guide_ui(ui, i, alive, false);
+            self.console_ui(ui, i);
+            let d = &mut self.devices[i];
+            d.console_seen = d.console_dropped + d.console.len() as u64;
+        }
     }
 
     /// One line of chips under the header: firmware, Wi-Fi, Home Assistant, serial. Neutral
@@ -3216,7 +3277,9 @@ impl CydLabApp {
 
     /// The setup checklist after a catalogue install: compact, dismissable, and each step
     /// ticks itself from what the device actually did.
-    fn guide_ui(&mut self, ui: &mut egui::Ui, i: usize, alive: bool) {
+    /// `full`: on the Setup tab (the whole list, unfolded); else the one-line status when
+    /// every step is done, or nothing.
+    fn guide_ui(&mut self, ui: &mut egui::Ui, i: usize, alive: bool, full: bool) {
         let Some(mut g) = self.devices[i].dev.meta.guide.clone() else {
             return;
         };
@@ -3264,6 +3327,7 @@ impl CydLabApp {
         // Done: "All set" for a moment, then fold into one line (remembered in device.toml).
         // Anything unticked later brings the full list back.
         let now = Instant::now();
+        let mut folded_now = false;
         if !all_done {
             g.collapsed = false;
             d.guide_all_set = None;
@@ -3272,8 +3336,26 @@ impl CydLabApp {
             let since = *d.guide_all_set.get_or_insert(now);
             match ALL_SET_HOLD.checked_sub(now - since) {
                 Some(left) if !left.is_zero() => ui.ctx().request_repaint_after(left),
-                _ => g.collapsed = true,
+                _ => {
+                    // Folded: back to the console.
+                    g.collapsed = true;
+                    d.dev.meta.pane_tab = None;
+                    folded_now = true;
+                }
             }
+        }
+        let needs_user = !all_done && !installing;
+        if needs_user != d.guide_needs_user {
+            d.guide_needs_user = needs_user;
+            ui.ctx().request_repaint();
+        }
+        if all_done && full && g.collapsed && !folded_now {
+            // The Setup tab shows the steps: unfold (folds again on the Console tab).
+            g.collapsed = false;
+            d.guide_reopened = true;
+        } else if all_done && !full && !g.collapsed && d.guide_reopened {
+            g.collapsed = true;
+            d.guide_reopened = false;
         }
         let mut close = false;
         let mut reopen = false;
@@ -3284,7 +3366,9 @@ impl CydLabApp {
             ui.label(RichText::new(sym).color(c).strong());
             ui.label(if done { RichText::new(text).color(Color32::from_gray(200)) } else { RichText::new(text).strong() });
         };
-        if g.collapsed {
+        if !full && !g.collapsed {
+            // Console tab, steps left: the Setup tab's dot says so.
+        } else if g.collapsed {
             egui::Frame::new().fill(Color32::from_rgb(24, 40, 56)).inner_margin(egui::Margin::symmetric(8, 4)).corner_radius(4.0).show(ui, |ui| {
                 ui.set_width(ui.available_width().min(560.0));
                 // Buttons first (right to left), so a long name is cut short instead of the buttons.
@@ -3301,16 +3385,23 @@ impl CydLabApp {
         } else {
         egui::Frame::new().fill(Color32::from_rgb(24, 40, 56)).inner_margin(8.0).corner_radius(4.0).show(ui, |ui| {
             ui.set_width(ui.available_width().min(560.0));
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("Set up {}", g.name)).strong().color(Color32::WHITE));
-                if all_done {
-                    ui.label(RichText::new("✔ All set").strong().color(green));
-                }
-                let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
-                ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    close = ui.small_button("×").on_hover_text("Hide this checklist").clicked();
-                    if all_done && d.guide_reopened {
-                        fold = ui.small_button("Fold").on_hover_text("Back to the one-line status").clicked();
+            // Buttons first (right to left), so a long name wraps beside them in a narrow pane.
+            // The buttons sit at the top right (a child, so they take no row of their own);
+            // the name wraps in the width left beside them.
+            let buttons = if all_done && d.guide_reopened { 80.0 } else { 30.0 };
+            let top = ui.cursor().min;
+            let row = egui::Rect::from_min_size(egui::pos2(top.x + ui.available_width() - buttons, top.y), egui::vec2(buttons, ui.spacing().interact_size.y));
+            let mut b = ui.new_child(egui::UiBuilder::new().max_rect(row).layout(egui::Layout::right_to_left(egui::Align::Center)));
+            close = b.small_button("×").on_hover_text("Hide this checklist").clicked();
+            if all_done && d.guide_reopened {
+                fold = b.small_button("Fold").on_hover_text("Back to the one-line status and the console").clicked();
+            }
+            ui.scope(|ui| {
+                ui.set_max_width((ui.available_width() - buttons).max(80.0));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("Set up {}", g.name)).strong().color(Color32::WHITE));
+                    if all_done {
+                        ui.label(RichText::new("✔ All set").strong().color(green));
                     }
                 });
             });
@@ -3404,14 +3495,22 @@ impl CydLabApp {
         });
         }
         if reopen {
+            // The one-line status or its "Show steps": the Setup tab.
             g.collapsed = false;
             d.guide_reopened = true;
+            d.dev.meta.pane_tab = Some(PaneTab::Setup);
         }
         if fold {
             g.collapsed = true;
             d.guide_reopened = false;
+            d.dev.meta.pane_tab = None;
         }
-        ui.add_space(4.0);
+        if close {
+            d.dev.meta.pane_tab = None;
+        }
+        if full || g.collapsed {
+            ui.add_space(4.0);
+        }
         let after = (!close).then_some(g);
         if after != Some(before) {
             d.dev.meta.guide = after;

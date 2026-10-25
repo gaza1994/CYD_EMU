@@ -1284,6 +1284,7 @@ mod tests {
                 network: Default::default(),
                 screen_window: Default::default(),
                 guide: None,
+                pane_tab: None,
             },
         };
         (profile, device)
