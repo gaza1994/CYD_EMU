@@ -504,12 +504,92 @@ fn mismatch(wanted: &str, ap: &str) -> String {
 /// An ESPHome native-API client connecting, as the firmware logs it
 /// (`[D][api.connection:2816]: Home Assistant 2026.10.1 (10.0.2.2): connected`): the client's
 /// name. `None` for any other line (also "disconnected").
+#[cfg(test)]
 pub fn api_client_connected(line: &str) -> Option<String> {
+    api_client_event(line).filter(|e| e.connected).map(|e| e.name)
+}
+
+/// Who an API client is, by the name it gave the firmware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiClientKind {
+    /// "Home Assistant 2026.10.1": the device is added to Home Assistant.
+    HomeAssistant,
+    /// "ESPHome Logs 2026.10.0": the ESPHome dashboard's log viewer, not Home Assistant.
+    DashboardLogs,
+    /// aioesphomeapi scripts, other tools.
+    Other,
+}
+
+pub fn api_client_kind(name: &str) -> ApiClientKind {
+    if name.starts_with("Home Assistant") {
+        ApiClientKind::HomeAssistant
+    } else if name.starts_with("ESPHome Logs") || name.starts_with("ESPHome Dashboard") {
+        ApiClientKind::DashboardLogs
+    } else {
+        ApiClientKind::Other
+    }
+}
+
+/// An API client connecting or going away, from ESPHome's `[api.connection]` log lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiClientEvent {
+    /// "name (address)", as logged: tells two clients with one name apart.
+    pub key: String,
+    pub name: String,
+    pub connected: bool,
+}
+
+pub fn api_client_event(line: &str) -> Option<ApiClientEvent> {
     let rest = &line[line.find("[api.connection")?..];
     let msg = rest.split_once("]:")?.1.trim();
-    let who = msg.strip_suffix(": connected").or_else(|| msg.strip_suffix(": Connected successfully"))?;
+    let (who, how) = msg.rsplit_once(": ")?;
+    let how = how.trim().to_ascii_lowercase();
+    let connected = match how.as_str() {
+        "connected" | "connected successfully" => true,
+        "disconnected" | "disconnecting" | "connection closed" | "socket closed" | "closed" => false,
+        _ if how.starts_with("disconnect") || how.contains("closed") || how.contains("reading failed") || how.contains("timeout") => false,
+        _ => return None,
+    };
+    let who = who.trim();
     let name = who.rsplit_once(" (").map(|(n, _)| n).unwrap_or(who).trim();
-    (!name.is_empty()).then(|| name.to_string())
+    (!name.is_empty()).then(|| ApiClientEvent { key: who.to_string(), name: name.to_string(), connected })
+}
+
+/// The API clients the firmware's log says are connected, this run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApiClients {
+    /// (key, name), oldest first.
+    pub list: Vec<(String, String)>,
+}
+
+impl ApiClients {
+    pub fn feed(&mut self, line: &str) {
+        let Some(e) = api_client_event(line) else { return };
+        self.list.retain(|(k, _)| *k != e.key);
+        if e.connected {
+            self.list.push((e.key, e.name));
+        }
+    }
+    /// The connected Home Assistant's name ("Home Assistant 2026.10.1").
+    pub fn home_assistant(&self) -> Option<&str> {
+        self.list.iter().rev().map(|(_, n)| n.as_str()).find(|n| api_client_kind(n) == ApiClientKind::HomeAssistant)
+    }
+    pub fn dashboard_logs(&self) -> bool {
+        self.list.iter().any(|(_, n)| api_client_kind(n) == ApiClientKind::DashboardLogs)
+    }
+    pub fn names(&self) -> Vec<String> {
+        self.list.iter().map(|(k, _)| k.clone()).collect()
+    }
+}
+
+/// A log line saying Home Assistant refused an action the device asked for (the device
+/// is not allowed to perform Home Assistant actions / make service calls).
+pub fn ha_action_refused(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    (l.contains("not allowed") || l.contains("refus") || l.contains("denied"))
+        && (l.contains("home assistant action") || l.contains("service call") || l.contains("perform action") || l.contains("homeassistant.action") || l.contains("homeassistant.service"))
+        || l.contains("allow the device to perform home assistant actions")
+        || l.contains("allow the device to make home assistant service calls")
 }
 
 #[cfg(test)]
@@ -522,6 +602,25 @@ mod tests {
         assert_eq!(api_client_connected("[12:00:01][D][api.connection:2816]: Home Assistant 2026.10.1 (10.0.2.2): connected").as_deref(), Some("Home Assistant 2026.10.1"));
         assert_eq!(api_client_connected("[D][api.connection:2816]: aioesphomeapi (10.0.2.2): disconnected"), None);
         assert_eq!(api_client_connected("[D][api:323]: Accept 10.0.2.2"), None);
+    }
+
+    #[test]
+    fn api_clients_told_apart() {
+        let mut c = ApiClients::default();
+        c.feed("[D][api.connection:2816]: ESPHome Logs 2026.10.0 (10.0.2.2): connected");
+        assert!(c.dashboard_logs() && c.home_assistant().is_none());
+        c.feed("[12:00:01][I][api.connection:2816]: Home Assistant 2026.10.1 (10.0.2.2): connected");
+        assert_eq!(c.home_assistant(), Some("Home Assistant 2026.10.1"));
+        c.feed("[W][api.connection:200]: Home Assistant 2026.10.1 (10.0.2.2): Connection closed");
+        assert!(c.home_assistant().is_none() && c.dashboard_logs());
+        c.feed("[D][api.connection:2816]: ESPHome Logs 2026.10.0 (10.0.2.2): disconnected");
+        assert!(c.list.is_empty());
+        assert_eq!(api_client_kind("aioesphomeapi"), ApiClientKind::Other);
+        c.feed("[D][api.connection:2816]: aioesphomeapi (10.0.2.2): connected");
+        assert!(c.home_assistant().is_none() && !c.dashboard_logs() && c.list.len() == 1);
+        assert!(ha_action_refused("WARNING Can't call action light.toggle: the device is not allowed to perform Home Assistant actions"));
+        assert!(ha_action_refused("[W][homeassistant.action]: service call refused"));
+        assert!(!ha_action_refused("[D][api.connection]: Home Assistant 2026.10.1 (10.0.2.2): connected"));
     }
 
     #[test]

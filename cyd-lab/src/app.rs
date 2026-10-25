@@ -601,8 +601,10 @@ struct DeviceView {
     /// After installing a firmware with a first-setup guide (the Home Assistant entry):
     /// its id, shown as a step card until dismissed.
     /// The setup checklist after installing a catalogue firmware that needs setting up.
-    /// The last ESPHome API client the firmware logged as connected.
-    api_client: Option<String>,
+    /// The ESPHome API clients the firmware's log says are connected (this run).
+    api_clients: crate::network::ApiClients,
+    /// The log showed Home Assistant refusing an action this device asked for (this run).
+    ha_action_refused: bool,
     /// Checklist: when every step was first seen ticked (the brief "All set" before folding).
     guide_all_set: Option<Instant>,
     /// Checklist re-opened from its one-line status: don't fold it again by itself.
@@ -994,7 +996,8 @@ impl DeviceView {
             ap: ApUi::default(),
             install: InstallUi::default(),
             fwd: Default::default(),
-            api_client: None,
+            api_clients: Default::default(),
+            ha_action_refused: false,
             guide_all_set: None,
             guide_reopened: false,
             guide_wifi_seen: false,
@@ -1232,9 +1235,8 @@ impl DeviceView {
     fn log(&mut self, stream: Stream, line: String) {
         let line = strip_ansi(&line);
         if stream != Stream::Lab {
-            if let Some(c) = crate::network::api_client_connected(&line) {
-                self.api_client = Some(c);
-            }
+            self.api_clients.feed(&line);
+            self.ha_action_refused |= crate::network::ha_action_refused(&line);
             if let Some(st) = crate::improv::sniff_console(&line) {
                 self.improv.state = Some(st);
                 self.improv.capable = true;
@@ -1777,7 +1779,8 @@ impl CydLabApp {
         d.link_lost = false;
         // A real panel starts dark: never show the previous run's last frame.
         d.screen = None;
-        d.api_client = None;
+        d.api_clients = Default::default();
+        d.ha_action_refused = false;
         d.touch_down = None;
         d.touch_since = None;
         d.touch_release_due = None;
@@ -2320,7 +2323,8 @@ impl CydLabApp {
             // state: it would be ticked again before the new firmware even runs.
             d.wifi_watch = Default::default();
             d.improv = ImprovUi::default();
-            d.api_client = None;
+            d.api_clients = Default::default();
+            d.ha_action_refused = false;
             d.fwd = Default::default();
             let _ = self.store.update_meta(&d.dev);
             if e.home_assistant {
@@ -2951,11 +2955,15 @@ impl CydLabApp {
         // Remembered in device.toml, so a finished step stays ticked after a restart.
         g.wifi_connected |= d.wifi_watch.connected;
         g.wifi_sent |= matches!(d.improv.outcome, Some(Ok(_)));
-        let ha_client = d.api_client.clone();
-        g.ha_seen |= ha_client.as_deref().is_some_and(|c| c.contains("Home Assistant"));
+        // Only a Home Assistant client ticks the step: the ESPHome dashboard's log viewer
+        // ("ESPHome Logs 2026.10.0") and other tools connect to the same API port.
+        let ha_client = d.api_clients.home_assistant().map(str::to_string);
+        let dashboard_logs = d.api_clients.dashboard_logs();
+        let log_clients = d.api_clients.names();
+        let action_refused = d.ha_action_refused;
+        g.ha_seen |= ha_client.is_some();
         // The engine's port events: a client the firmware accepted on the published API port.
         let (api_clients, api_peers) = api.map(|p| d.fwd.on_host_port(p)).map(|(n, p)| (n, p.to_vec())).unwrap_or_default();
-        g.ha_seen |= alive && api_clients > 0;
         let ha_done = g.ha_manual || g.ha_seen;
         // Wi-Fi lost in this run (the firmware logged a disconnect): the step is not done.
         if d.wifi_watch.connected {
@@ -3068,15 +3076,27 @@ impl CydLabApp {
                 }
                 ui.horizontal_wrapped(|ui| {
                     tick(ui, ha_done, if g.ha_seen { "Home Assistant connected" } else { "Add to Home Assistant" });
+                    let peers = if api_peers.is_empty() { log_clients.join("\n") } else { api_peers.join("\n") };
                     if let Some(c) = &ha_client {
-                        ui.label(RichText::new(format!("{c} connected")).small().color(green));
-                    } else if api_clients > 0 {
-                        ui.label(RichText::new(format!("API client{} connected", if api_clients == 1 { "" } else { "s" })).small().color(green)).on_hover_text(api_peers.join("\n"));
+                        ui.label(RichText::new(format!("{c} connected")).small().color(green)).on_hover_text(peers);
+                    } else if dashboard_logs {
+                        ui.label(RichText::new("ESPHome dashboard logs connected, not added to Home Assistant yet").small().color(Color32::from_rgb(240, 200, 120))).on_hover_text("The ESPHome dashboard's log viewer is connected to the API port. That is not Home Assistant: add the device to Home Assistant as below.");
+                    } else if api_clients > 0 || !log_clients.is_empty() {
+                        let n = (api_clients as usize).max(log_clients.len());
+                        ui.label(RichText::new(format!("API client{} connected (not Home Assistant)", if n == 1 { "" } else { "s" })).small().weak()).on_hover_text(peers);
                     }
                 });
                 if !ha_done {
                     ha_box(ui, api);
                     ui.checkbox(&mut g.ha_manual, "I've added it");
+                }
+                let actions_tip = "Buttons that call Home Assistant actions need \"Allow the device to perform Home Assistant actions\" in the device's ESPHome options (Home Assistant: Settings > Devices & services > ESPHome > the device > Configure).";
+                if action_refused {
+                    egui::Frame::new().fill(Color32::from_rgb(90, 60, 10)).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
+                        ui.label(RichText::new(format!("Home Assistant refused an action from this device. {actions_tip}")).small().color(Color32::WHITE));
+                    });
+                } else if g.ha_seen || ha_client.is_some() {
+                    ui.label(RichText::new(format!("Tip: {actions_tip}")).small().weak());
                 }
             }
             if let Some(text) = (!g.config.is_empty()).then(|| crate::catalog::Entry::template_text(&g.config)).flatten() {
