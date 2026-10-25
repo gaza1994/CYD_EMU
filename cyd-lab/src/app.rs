@@ -5212,6 +5212,8 @@ mod tests {
         let profile = ProfileLibrary::load(None).get("esp32-2432s028r").unwrap().clone();
         let dev = store.create("Weather", &profile).unwrap();
         let mut d = DeviceView::new(dev, Arc::new(|| {}));
+        d.log(Stream::Stderr, "[emu] virtual AP 'cyd-lab' bssid 02:53:49:4d:00:01 channel 6 (open)".into());
+        d.log(Stream::Stdout, "invalid header: 0xffffffff".into());
         d.log(Stream::Stdout, "[  1203][I][main] Mystery firmware v1: starting portal".into());
         assert!(!d.hotspot_relevant(true), "nothing recognisable yet");
         d.log(Stream::Stderr, "[emu] device hotspot: 'Mystery-7F3A' bssid 24:0a:c4:00:7f:3a channel 6 (open)".into());

@@ -59,6 +59,12 @@ impl Plan {
 /// `Starting AP: name`, `AP started: name`), Tasmota (`WIF: AP1 tasmota-XXXX`-style
 /// `Starting AccessPoint` lines are too varied, so only quoted names are taken there).
 pub fn sniff_ssid(line: &str) -> Option<String> {
+    // The engine's own lines: only its report of the guest's hotspot counts. `[emu] virtual AP
+    // 'cyd-lab' …` is the emulated router the guest joins, printed at every power-on.
+    let t = line.trim_start();
+    if t.starts_with("[emu]") && !t.starts_with("[emu] device hotspot:") {
+        return None;
+    }
     let lower = line.to_ascii_lowercase();
     for key in ["ap ssid:", "softap ssid:", "softap ssid =", "starting ap:", "ap started:", "access point:", "hotspot:", "wifimanager ap:", "temporary access point", "opening access point"] {
         if let Some(at) = lower.find(key) {
@@ -80,7 +86,7 @@ pub fn sniff_ssid(line: &str) -> Option<String> {
 }
 
 /// `AP 'name' up` (CYD Weather Dashboard) or `AP "name" started`: a quoted name right after
-/// the word AP.
+/// the word AP, followed by a word saying it is up (not `connecting to AP 'home'`).
 fn quoted_after_ap(line: &str) -> Option<String> {
     let b = line.as_bytes();
     for (at, _) in line.match_indices(|c| c == '\'' || c == '"') {
@@ -94,7 +100,9 @@ fn quoted_after_ap(line: &str) -> Option<String> {
             continue;
         }
         let name = line[at + 1..].split(q).next().unwrap_or("");
-        if !name.is_empty() && name.len() <= 32 && line[at + 1 + name.len()..].starts_with(q) {
+        let after = line[at + 1 + name.len()..].strip_prefix(q).map(|r| r.trim_start().to_ascii_lowercase());
+        let up = after.is_some_and(|r| ["up", "started", "start", "ready", "running", "enabled", "active", "created", "is up", "online"].iter().any(|w| r.strip_prefix(w).is_some_and(|x| x.is_empty() || !x.as_bytes()[0].is_ascii_alphanumeric())));
+        if !name.is_empty() && name.len() <= 32 && up {
             return Some(name.to_string());
         }
     }
@@ -529,6 +537,12 @@ mod tests {
         assert_eq!(sniff_ssid("map 'level1' loaded"), None);
         assert_eq!(sniff_ssid("snap 'x'"), None);
         assert_eq!(sniff_ssid("AP 'unterminated"), None);
+        // The engine's emulated router, and a station joining a network, are not the guest's hotspot.
+        assert_eq!(sniff_ssid("[emu] virtual AP 'cyd-lab' bssid 02:53:49:4d:00:01 channel 6 (open)"), None);
+        assert_eq!(sniff_ssid("[emu] phone: hotspot 'HASP-3b6ba3' is secured"), None);
+        assert_eq!(sniff_ssid("Connecting to AP 'HomeNet' ..."), None);
+        assert_eq!(sniff_ssid("AP 'cyd-x' upgraded"), None);
+        assert_eq!(sniff_ssid("softAP 'Setup-2' running on ch 1").as_deref(), Some("Setup-2"));
         let mut l = vec![];
         remember(&mut l, "a".into());
         remember(&mut l, "b".into());
