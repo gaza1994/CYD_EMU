@@ -732,7 +732,7 @@ Ctrl-C/close), saving even when the log pipe is closed, `--serial-tcp` (RFC2217)
 7. **Release a held touch when the `--web` client disconnects**, so a dropped link can't
    leave a finger down on the device.
 8. **An event when a client connects to a forwarded port** (for example `{"t":"fwd",
-   "port":6053,"peer":"192.168.1.20"}`), so "Home Assistant connected" doesn't depend on
+   "port":6053,"peer":"192.0.2.20"}`), so "Home Assistant connected" doesn't depend on
    the firmware's log.
 9. **Bluetooth** (ESPHome Web and Marauder crash or degrade without it).
 
