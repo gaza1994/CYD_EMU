@@ -1,0 +1,47 @@
+[package]
+name = "cyd-lab"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Gareth Johnstone"]
+description = "Desktop manager for emulated ESP32 'Cheap Yellow Display' boards (esp32sim front end)"
+publish = false
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "clipboard", "persistence", "glow", "wayland", "x11"] }
+# monochrome_emoji_fonts: since egui 0.37 the default fonts no longer include the
+# emoji fallbacks, so ✔ ○ ✕ ⚠ ⏻ etc. drew as empty boxes without it.
+egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+directories = "6"
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+rfd = "0.17"
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+url = "2"
+serde_json = "1"
+sha2 = "0.10"
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
+zip = { version = "9.1.0", default-features = false, features = ["deflate-flate2"] }
+socket2 = { version = "0.6", features = ["all"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# Windows: render with wgpu/DirectX 12 (falls back to the WARP software
+# adapter on VMs and RDP sessions without a GPU driver); glow/OpenGL stays as a
+# runtime fallback. Elsewhere glow only.
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "clipboard", "persistence", "glow", "wgpu_no_default_features"] }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

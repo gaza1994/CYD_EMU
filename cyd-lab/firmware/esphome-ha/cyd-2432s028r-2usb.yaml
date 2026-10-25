@@ -1,0 +1,233 @@
+# ESPHome for Home Assistant (with screen): a ready-to-adopt image for the
+# ESP32-2432S028R "Cheap Yellow Display", two-USB version (USB-C + micro-USB): native
+# 320x240 landscape ILI9341-compatible panel + XPT2046 with X/Y swapped. The display and
+# touch blocks are the ones proven on a real two-USB unit (ILI9341 320x240, no transform,
+# LVGL rotation 180). Everything else matches cyd-2432s028r.yaml (the micro-USB board).
+#
+# What it does out of the box:
+#   - the screen shows "Ready to adopt in Home Assistant" with the device name, IP and state;
+#   - Wi-Fi setup over USB serial (Improv), or through its own setup hotspot + captive portal;
+#   - the Home Assistant API (no encryption key, so adoption needs no secrets) and OTA updates;
+#   - backlight, RGB LED and light sensor (LDR) as Home Assistant entities, touch on the screen.
+# No Bluetooth (esp32_improv / BLE is left out on purpose).
+#
+# Built by cyd-lab's tools/build_esphome_ha.py:
+#   esphome compile firmware/esphome-ha/cyd-2432s028r-2usb.yaml
+# The flashable image is the factory .bin (write at 0x0).
+#
+# To customise: in Home Assistant's ESPHome add-on (ESPHome Device Builder) "take control"
+# of the device, or start a new device from this file, then update it over the air.
+# TODO: a dashboard_import package URL would let the add-on adopt it in one click; that needs
+# a public copy of this file, which has not been published yet.
+
+substitutions:
+  name: cyd-panel
+  friendly_name: CYD Panel
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: true
+  build_path: build/cyd-panel-2usb
+  project:
+    name: cyd-lab.esphome-ha-cyd
+    version: "1.0.0"
+    # same project name as the micro-USB image: one entry, picked per board
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  baud_rate: 115200
+  hardware_uart: UART0
+
+api:
+  id: ha_api
+
+ota:
+  - platform: esphome
+
+wifi:
+  id: wifi_comp
+  ap: {}
+
+captive_portal:
+
+improv_serial:
+
+spi:
+  - id: tft_spi
+    clk_pin: GPIO14
+    mosi_pin: GPIO13
+    miso_pin: GPIO12
+  - id: touch_spi
+    clk_pin: GPIO25
+    mosi_pin: GPIO32
+    miso_pin: GPIO39
+
+output:
+  - platform: ledc
+    pin: GPIO21
+    id: backlight_pwm
+  - platform: ledc
+    id: led_r
+    pin: { number: GPIO4, inverted: true }
+  - platform: ledc
+    id: led_g
+    pin: { number: GPIO16, inverted: true }
+  - platform: ledc
+    id: led_b
+    pin: { number: GPIO17, inverted: true }
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: Backlight
+    id: backlight
+    restore_mode: ALWAYS_ON
+  - platform: rgb
+    name: RGB LED
+    id: rgb_led
+    red: led_r
+    green: led_g
+    blue: led_b
+    restore_mode: ALWAYS_OFF
+
+sensor:
+  - platform: adc
+    pin: GPIO34
+    name: Light level
+    attenuation: 12db
+    update_interval: 10s
+  - platform: wifi_signal
+    name: Wi-Fi signal
+    update_interval: 60s
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: IP address
+      id: ip_addr
+
+button:
+  - platform: restart
+    name: Restart
+
+display:
+  - platform: ili9xxx
+    id: tft
+    model: ILI9341
+    spi_id: tft_spi
+    cs_pin: GPIO15
+    dc_pin: GPIO2
+    invert_colors: false
+    dimensions: { width: 320, height: 240 }
+    auto_clear_enabled: false
+    update_interval: never
+
+touchscreen:
+  - platform: xpt2046
+    id: touch
+    spi_id: touch_spi
+    cs_pin: GPIO33
+    interrupt_pin: GPIO36
+    update_interval: 50ms
+    threshold: 400
+    calibration:
+      x_min: 208
+      x_max: 3823
+      y_min: 282
+      y_max: 3835
+    transform:
+      swap_xy: true
+      mirror_x: true
+      mirror_y: true
+
+lvgl:
+  displays: [tft]
+  touchscreens: [touch]
+  buffer_size: 25%
+  rotation: 180
+  log_level: WARN
+  style_definitions:
+    - id: small_text
+      text_font: montserrat_14
+      text_color: 0xB0B0B0
+  pages:
+    - id: main_page
+      bg_color: 0x101418
+      widgets:
+        - label:
+            id: lbl_title
+            align: TOP_MID
+            y: 14
+            text_font: montserrat_18
+            text_color: 0xFFFFFF
+            text: "Ready to adopt in Home Assistant"
+        - label:
+            id: lbl_name
+            align: TOP_MID
+            y: 52
+            text_font: montserrat_18
+            text_color: 0x41BDF5
+            text: "${name}"
+        - label:
+            id: lbl_ip
+            align: TOP_MID
+            y: 82
+            styles: small_text
+            text: "IP: -"
+        - label:
+            id: lbl_state
+            align: TOP_MID
+            y: 110
+            width: 300
+            long_mode: WRAP
+            text_align: CENTER
+            text_font: montserrat_14
+            text_color: 0xFFD54F
+            text: "Starting..."
+        - button:
+            id: btn_identify
+            align: BOTTOM_MID
+            y: -16
+            width: 160
+            height: 44
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "Identify"
+            on_click:
+              - light.toggle: rgb_led
+              - lvgl.label.update:
+                  id: lbl_touch
+                  text: !lambda |-
+                    static int n = 0;
+                    return std::string("Touched ") + std::to_string(++n) + "x";
+        - label:
+            id: lbl_touch
+            align: BOTTOM_LEFT
+            x: 6
+            y: -4
+            styles: small_text
+            text: ""
+
+interval:
+  - interval: 2s
+    then:
+      - lvgl.label.update:
+          id: lbl_name
+          text: !lambda return App.get_name();
+      - lvgl.label.update:
+          id: lbl_ip
+          text: !lambda |-
+            if (!id(wifi_comp).is_connected()) return std::string("IP: not on Wi-Fi yet");
+            return std::string("IP: ") + id(ip_addr).state;
+      - lvgl.label.update:
+          id: lbl_state
+          text: !lambda |-
+            if (id(ha_api).is_connected()) return std::string("Connected to Home Assistant");
+            if (id(wifi_comp).is_connected()) return std::string("On Wi-Fi. In Home Assistant: Settings > Devices & services (Discovered, or add ESPHome)");
+            return std::string("Waiting for Wi-Fi: send Wi-Fi details over USB (Improv) or join the hotspot ") + App.get_name();

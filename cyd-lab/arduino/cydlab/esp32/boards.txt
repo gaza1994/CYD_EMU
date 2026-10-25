@@ -1,0 +1,156 @@
+# cyd-lab board for Arduino IDE 2 / arduino-cli: the emulated ESP32-2432S028R ("CYD").
+# Derived from esp32:esp32 3.3.12's jczn_2432s028r entry (build/menu settings copied),
+# with the core, variant and upload tool taken from the installed esp32:esp32 platform.
+
+menu.PartitionScheme=Partition Scheme
+menu.CPUFreq=CPU Frequency
+menu.FlashMode=Flash Mode
+menu.FlashFreq=Flash Frequency
+menu.FlashSize=Flash Size
+menu.UploadSpeed=Upload Speed
+menu.LoopCore=Arduino Runs On
+menu.EventsCore=Events Run On
+menu.DebugLevel=Core Debug Level
+menu.EraseFlash=Erase All Flash Before Sketch Upload
+menu.ZigbeeMode=Zigbee Mode
+
+cyd2432s028r.name=ESP32-2432S028R CYD (cyd-lab, emulated)
+
+# Matches the ports cyd-lab-discovery reports (properties.cydlab = cyd-lab profile id).
+cyd2432s028r.upload_port.0.cydlab=esp32-2432s028r
+
+# Everything comes from Espressif's platform (esp32:esp32 3.x must be installed).
+cyd2432s028r.build.core=esp32:esp32
+cyd2432s028r.build.variant=esp32:jczn_2432s028r
+cyd2432s028r.bootloader.tool=esp32:esptool_py
+cyd2432s028r.bootloader.tool.default=esp32:esptool_py
+cyd2432s028r.upload.tool=esp32:esptool_py
+cyd2432s028r.upload.tool.default=esp32:esptool_py
+# Uploads to a cyd-lab port: esptool with --port {upload.port.address} (rfc2217://127.0.0.1:PORT).
+cyd2432s028r.upload.tool.cydlab=esp32:esptool_py
+
+cyd2432s028r.upload.maximum_size=1310720
+cyd2432s028r.upload.maximum_data_size=327680
+cyd2432s028r.upload.flags=
+cyd2432s028r.upload.erase_cmd=
+cyd2432s028r.upload.extra_flags=
+cyd2432s028r.serial.disableDTR=true
+cyd2432s028r.serial.disableRTS=true
+cyd2432s028r.build.tarch=xtensa
+cyd2432s028r.build.bootloader_addr=0x1000
+cyd2432s028r.build.target=esp32
+cyd2432s028r.build.mcu=esp32
+cyd2432s028r.build.board=ESP32_2432S028R
+cyd2432s028r.build.f_cpu=240000000L
+cyd2432s028r.build.flash_size=4MB
+cyd2432s028r.build.flash_freq=40m
+cyd2432s028r.build.flash_mode=dio
+cyd2432s028r.build.boot=dio
+cyd2432s028r.build.partitions=default
+cyd2432s028r.build.defines=
+cyd2432s028r.build.loop_core=
+cyd2432s028r.build.event_core=
+cyd2432s028r.menu.PartitionScheme.default=Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS)
+cyd2432s028r.menu.PartitionScheme.default.build.partitions=default
+cyd2432s028r.menu.PartitionScheme.defaultffat=Default 4MB with ffat (1.2MB APP/1.5MB FATFS)
+cyd2432s028r.menu.PartitionScheme.defaultffat.build.partitions=default_ffat
+cyd2432s028r.menu.PartitionScheme.no_ota=No OTA (2MB APP/2MB SPIFFS)
+cyd2432s028r.menu.PartitionScheme.no_ota.build.partitions=no_ota
+cyd2432s028r.menu.PartitionScheme.no_ota.upload.maximum_size=2097152
+cyd2432s028r.menu.PartitionScheme.noota_3g=No OTA (1MB APP/3MB SPIFFS)
+cyd2432s028r.menu.PartitionScheme.noota_3g.build.partitions=noota_3g
+cyd2432s028r.menu.PartitionScheme.noota_3g.upload.maximum_size=1048576
+cyd2432s028r.menu.PartitionScheme.noota_ffat=No OTA (2MB APP/2MB FATFS)
+cyd2432s028r.menu.PartitionScheme.noota_ffat.build.partitions=noota_ffat
+cyd2432s028r.menu.PartitionScheme.noota_ffat.upload.maximum_size=2097152
+cyd2432s028r.menu.PartitionScheme.noota_3gffat=No OTA (1MB APP/3MB FATFS)
+cyd2432s028r.menu.PartitionScheme.noota_3gffat.build.partitions=noota_3gffat
+cyd2432s028r.menu.PartitionScheme.noota_3gffat.upload.maximum_size=1048576
+cyd2432s028r.menu.PartitionScheme.huge_app=Huge APP (3MB No OTA/1MB SPIFFS)
+cyd2432s028r.menu.PartitionScheme.huge_app.build.partitions=huge_app
+cyd2432s028r.menu.PartitionScheme.huge_app.upload.maximum_size=3145728
+cyd2432s028r.menu.PartitionScheme.min_spiffs=Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS)
+cyd2432s028r.menu.PartitionScheme.min_spiffs.build.partitions=min_spiffs
+cyd2432s028r.menu.PartitionScheme.min_spiffs.upload.maximum_size=1966080
+cyd2432s028r.menu.PartitionScheme.rainmaker=RainMaker 4MB
+cyd2432s028r.menu.PartitionScheme.rainmaker.build.partitions=rainmaker
+cyd2432s028r.menu.PartitionScheme.rainmaker.upload.maximum_size=1966080
+cyd2432s028r.menu.PartitionScheme.rainmaker_4MB=RainMaker 4MB No OTA
+cyd2432s028r.menu.PartitionScheme.rainmaker_4MB.build.partitions=rainmaker_4MB_no_ota
+cyd2432s028r.menu.PartitionScheme.rainmaker_4MB.upload.maximum_size=4038656
+cyd2432s028r.menu.PartitionScheme.zigbee_zczr=Zigbee ZCZR 4MB with spiffs
+cyd2432s028r.menu.PartitionScheme.zigbee_zczr.build.partitions=zigbee_zczr
+cyd2432s028r.menu.PartitionScheme.zigbee_zczr.upload.maximum_size=1310720
+cyd2432s028r.menu.PartitionScheme.otanofs=OTA no FS (2MB APP with OTA)
+cyd2432s028r.menu.PartitionScheme.otanofs.build.custom_partitions=partitions_otanofs_4MB
+cyd2432s028r.menu.PartitionScheme.otanofs.upload.maximum_size=2031616
+cyd2432s028r.menu.PartitionScheme.all_app=Max APP (4MB APP no OTA)
+cyd2432s028r.menu.PartitionScheme.all_app.build.custom_partitions=partitions_all_app_4MB
+cyd2432s028r.menu.PartitionScheme.all_app.upload.maximum_size=4128768
+cyd2432s028r.menu.PartitionScheme.custom=Custom
+cyd2432s028r.menu.PartitionScheme.custom.build.partitions=
+cyd2432s028r.menu.PartitionScheme.custom.upload.maximum_size=4128768
+cyd2432s028r.menu.CPUFreq.240=240MHz (WiFi/BT)
+cyd2432s028r.menu.CPUFreq.240.build.f_cpu=240000000L
+cyd2432s028r.menu.CPUFreq.160=160MHz (WiFi/BT)
+cyd2432s028r.menu.CPUFreq.160.build.f_cpu=160000000L
+cyd2432s028r.menu.CPUFreq.80=80MHz (WiFi/BT)
+cyd2432s028r.menu.CPUFreq.80.build.f_cpu=80000000L
+cyd2432s028r.menu.CPUFreq.40=40MHz
+cyd2432s028r.menu.CPUFreq.40.build.f_cpu=40000000L
+cyd2432s028r.menu.CPUFreq.20=20MHz
+cyd2432s028r.menu.CPUFreq.20.build.f_cpu=20000000L
+cyd2432s028r.menu.CPUFreq.10=10MHz
+cyd2432s028r.menu.CPUFreq.10.build.f_cpu=10000000L
+cyd2432s028r.menu.FlashMode.qio=QIO
+cyd2432s028r.menu.FlashMode.qio.build.flash_mode=dio
+cyd2432s028r.menu.FlashMode.qio.build.boot=qio
+cyd2432s028r.menu.FlashFreq.80=80MHz
+cyd2432s028r.menu.FlashFreq.80.build.flash_freq=80m
+cyd2432s028r.menu.FlashFreq.40=40MHz
+cyd2432s028r.menu.FlashFreq.40.build.flash_freq=40m
+cyd2432s028r.menu.FlashSize.4M=4MB
+cyd2432s028r.menu.FlashSize.4M.build.flash_size=4MB
+cyd2432s028r.menu.UploadSpeed.921600=921600
+cyd2432s028r.menu.UploadSpeed.921600.upload.speed=921600
+cyd2432s028r.menu.UploadSpeed.115200=115200
+cyd2432s028r.menu.UploadSpeed.115200.upload.speed=115200
+cyd2432s028r.menu.UploadSpeed.256000.windows=256000
+cyd2432s028r.menu.UploadSpeed.256000.upload.speed=256000
+cyd2432s028r.menu.UploadSpeed.230400.windows.upload.speed=256000
+cyd2432s028r.menu.UploadSpeed.230400=230400
+cyd2432s028r.menu.UploadSpeed.230400.upload.speed=230400
+cyd2432s028r.menu.UploadSpeed.460800.linux=460800
+cyd2432s028r.menu.UploadSpeed.460800.macosx=460800
+cyd2432s028r.menu.UploadSpeed.460800.upload.speed=460800
+cyd2432s028r.menu.UploadSpeed.512000.windows=512000
+cyd2432s028r.menu.UploadSpeed.512000.upload.speed=512000
+cyd2432s028r.menu.LoopCore.1=Core 1
+cyd2432s028r.menu.LoopCore.1.build.loop_core=-DARDUINO_RUNNING_CORE=1
+cyd2432s028r.menu.LoopCore.0=Core 0
+cyd2432s028r.menu.LoopCore.0.build.loop_core=-DARDUINO_RUNNING_CORE=0
+cyd2432s028r.menu.EventsCore.1=Core 1
+cyd2432s028r.menu.EventsCore.1.build.event_core=-DARDUINO_EVENT_RUNNING_CORE=1
+cyd2432s028r.menu.EventsCore.0=Core 0
+cyd2432s028r.menu.EventsCore.0.build.event_core=-DARDUINO_EVENT_RUNNING_CORE=0
+cyd2432s028r.menu.DebugLevel.none=None
+cyd2432s028r.menu.DebugLevel.none.build.code_debug=0
+cyd2432s028r.menu.DebugLevel.error=Error
+cyd2432s028r.menu.DebugLevel.error.build.code_debug=1
+cyd2432s028r.menu.DebugLevel.warn=Warn
+cyd2432s028r.menu.DebugLevel.warn.build.code_debug=2
+cyd2432s028r.menu.DebugLevel.info=Info
+cyd2432s028r.menu.DebugLevel.info.build.code_debug=3
+cyd2432s028r.menu.DebugLevel.debug=Debug
+cyd2432s028r.menu.DebugLevel.debug.build.code_debug=4
+cyd2432s028r.menu.DebugLevel.verbose=Verbose
+cyd2432s028r.menu.DebugLevel.verbose.build.code_debug=5
+cyd2432s028r.menu.EraseFlash.none=Disabled
+cyd2432s028r.menu.EraseFlash.all=Enabled
+cyd2432s028r.menu.EraseFlash.all.upload.erase_cmd=-e
+cyd2432s028r.menu.ZigbeeMode.default=Disabled
+cyd2432s028r.menu.ZigbeeMode.default.build.zigbee_mode=
+cyd2432s028r.menu.ZigbeeMode.default.build.zigbee_libs=
+cyd2432s028r.menu.ZigbeeMode.zczr=Zigbee ZCZR (coordinator/router)
+cyd2432s028r.menu.ZigbeeMode.zczr.build.zigbee_mode=-DZIGBEE_MODE_ZCZR
+cyd2432s028r.menu.ZigbeeMode.zczr.build.zigbee_libs=-lesp_zb_api.zczr -lzboss_stack.zczr -lzboss_port.remote

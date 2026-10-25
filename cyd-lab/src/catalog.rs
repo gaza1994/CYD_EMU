@@ -1,0 +1,1118 @@
+//! Firmware catalogue: a list of ready-made CYD firmwares that the "Install firmware" gallery
+//! can download, verify and write in one click.
+//!
+//! The catalogue (`cyd-firmware.toml`, its config templates and thumbnails) is bundled into
+//! the app (see `tools/catalog_assets.py`). An optional refresh downloads a newer
+//! `cyd-firmware.toml` from a URL (off by default; settings.toml `[catalog]`).
+//!
+//! Source types (`[entries.source] type = …`):
+//! * `direct`: one URL written at `offset`.
+//! * `github-release`: a release asset (`asset`, optionally a member `inner` of a zip asset)
+//!   at `offset`, or a list of `parts` taken from URLs, the `asset_app` asset or members of
+//!   the `asset_bundle` zip (matched by `path_pattern`, `*` wildcards).
+//! * `manifest`: an ESP Web Tools manifest, installed like "Install from web", then checked
+//!   against `parts_verified` / `sha256_bin` when the catalogue pins them.
+//! * `config-template`: not flashable; the gallery offers to copy or save the files.
+//!
+//! Every pinned `sha256` is checked before anything is written. A part with
+//! `patch_flash_size_mb` is an ESP32 bootloader whose header flash size is rewritten (and its
+//! appended SHA-256 recomputed) after the check, as install.wled.me does for WLED.
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+pub use crate::catalog_assets::{CATALOG_TOML, TEMPLATES, THUMBS};
+
+/// cyd-lab's own additions: extra entries, gallery groups and first-setup hints
+/// (merged into every catalogue it reads, see `assets/cyd-lab-catalog.toml`).
+pub const OVERLAY_TOML: &str = include_str!("../assets/cyd-lab-catalog.toml");
+/// Firmware images built by cyd-lab and shipped inside the app (`type = "bundled"`).
+pub const BUNDLED_FIRMWARE: &[(&str, &[u8])] = &[
+    ("esphome-ha-cyd-2432s028r.factory.bin", include_bytes!("../assets/firmware/esphome-ha-cyd-2432s028r.factory.bin")),
+    ("esphome-ha-cyd-2432s028r-2usb.factory.bin", include_bytes!("../assets/firmware/esphome-ha-cyd-2432s028r-2usb.factory.bin")),
+];
+/// Configs behind cyd-lab's bundled firmware (an entry's `config`).
+pub const OVERLAY_TEMPLATES: &[(&str, &str)] = &[
+    ("esphome/cyd-panel-2432s028r.yaml", include_str!("../firmware/esphome-ha/cyd-2432s028r.yaml")),
+    ("esphome/cyd-panel-2432s028r-2usb.yaml", include_str!("../firmware/esphome-ha/cyd-2432s028r-2usb.yaml")),
+];
+
+/// Catalogue profiles whose entries also apply to a board: the two 2.8" 2432S028R
+/// variants share pins, so firmware for the micro-USB board runs on the two-USB one too.
+pub fn profile_family(profile: &str) -> Vec<&str> {
+    match profile {
+        "cyd-2432s028r-2usb" => vec!["cyd-2432s028r-2usb", "cyd-2432s028r"],
+        p => vec![p],
+    }
+}
+
+/// Screen pictures for overlay entries (the emulator's `--tft-png`, landscape).
+pub const OVERLAY_THUMBS: &[(&str, &[u8])] = &[("esphome-ha-cyd", include_bytes!("../assets/cyd-lab-thumbs/esphome-ha-cyd.png"))];
+
+/// Gallery headings, in order: (group id, heading).
+pub const GROUPS: &[(&str, &str)] = &[("home-assistant", "Home Assistant"), ("tools", "Tools & fun"), ("programming", "Programming"), ("other", "Other / advanced")];
+
+/// The catalogue format this build understands.
+pub const SCHEMA_VERSION: u32 = 1;
+const MAX_DOWNLOAD: u64 = 32 * 1024 * 1024;
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)] // schema fields kept for display/debugging
+pub struct Catalog {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub updated: String,
+    #[serde(default)]
+    pub profiles: Vec<CatProfile>,
+    #[serde(default)]
+    pub entries: Vec<Entry>,
+    #[serde(default)]
+    pub unsupported: Vec<Unsupported>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct CatProfile {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub chip: String,
+    #[serde(default)]
+    pub flash_mb: u32,
+    #[serde(default)]
+    pub display: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    Works,
+    Partial,
+    Broken,
+    #[serde(other)]
+    Untested,
+}
+
+impl Status {
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::Works => "works",
+            Status::Partial => "partial",
+            Status::Broken => "broken",
+            Status::Untested => "untested",
+        }
+    }
+    pub fn help(self) -> &'static str {
+        match self {
+            Status::Works => "Boots in the emulator and shows its normal first screen.",
+            Status::Partial => "Boots in the emulator but stops early or needs hardware/config the emulator lacks.",
+            Status::Broken => "Does not boot in the emulator today (fine on a real board).",
+            Status::Untested => "Not tried in the emulator.",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Entry {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub homepage: String,
+    #[serde(default)]
+    pub licence: String,
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    #[serde(default)]
+    pub version: String,
+    pub emulator_status: Status,
+    #[serde(default)]
+    pub emulator_notes: String,
+    #[serde(default)]
+    pub notes: String,
+    /// Hardware the firmware wants that the emulator does not model.
+    #[serde(default)]
+    pub needs: Option<Vec<String>>,
+    pub source: toml::Table,
+    /// Gallery heading (see [`GROUPS`]); unknown or empty = "other".
+    #[serde(default)]
+    pub group: String,
+    /// Listed first in its group.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Not the firmware project's own release (built by cyd-lab or a third party); see [`Entry::is_custom`].
+    #[serde(default)]
+    pub custom_build: bool,
+    /// How the firmware gets onto Wi-Fi the first time.
+    #[serde(default)]
+    pub first_setup: Option<FirstSetup>,
+    /// Extra notes for the setup checklist shown after installing it (optional).
+    #[serde(default)]
+    pub steps: Vec<String>,
+    /// Firmware Home Assistant talks to (ESPHome native API on 6053, OTA on 3232): installing
+    /// it publishes those ports and the setup checklist shows how to add it.
+    #[serde(default)]
+    pub home_assistant: bool,
+    /// A bundled config behind this firmware (offered as "Copy config").
+    #[serde(default)]
+    pub config: String,
+    /// How the board is meant to be held for this firmware (it draws landscape). Suggested
+    /// in the setup checklist; never switched silently.
+    #[serde(default)]
+    pub view_rotation: Option<u16>,
+    /// Per-board replacements (`[entries.for_profile.PROFILE]`), applied by [`Entry::for_profile`].
+    #[serde(default)]
+    pub for_profile: HashMap<String, ProfileOverride>,
+}
+
+/// What an entry changes for one board profile (e.g. its own build for that panel).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProfileOverride {
+    pub source: Option<toml::Table>,
+    pub config: Option<String>,
+    pub view_rotation: Option<u16>,
+    pub notes: Option<String>,
+    pub emulator_notes: Option<String>,
+}
+
+/// First Wi-Fi setup of a firmware: Improv over serial, its own hotspot, or something else.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct FirstSetup {
+    pub improv: bool,
+    /// The hotspot's name (`xxxxxx` = part of the MAC).
+    pub hotspot: String,
+    pub password: String,
+    /// Its setup page.
+    pub page: String,
+    pub note: String,
+}
+
+impl FirstSetup {
+    /// One line for the gallery.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if self.improv {
+            parts.push("Send Wi-Fi details (Improv over USB)".to_string());
+        }
+        if !self.hotspot.is_empty() {
+            let pw = if self.password.is_empty() { "open".to_string() } else { format!("password {}", self.password) };
+            let page = if self.page.is_empty() { String::new() } else { format!(", setup page {}", self.page) };
+            parts.push(format!("its hotspot \"{}\" ({pw}{page})", self.hotspot));
+        }
+        let mut out = parts.join(" or ");
+        if !self.note.is_empty() {
+            if out.is_empty() {
+                out = self.note.clone();
+            } else {
+                out = format!("{out}; {}", self.note);
+            }
+        }
+        out
+    }
+    /// The page's address on the hotspot network (for the "Device hotspot" form).
+    pub fn page_ip(&self) -> Option<String> {
+        let rest = self.page.split_once("://").map(|(_, r)| r).unwrap_or(&self.page);
+        let host = rest.split(['/', ':']).next().unwrap_or("");
+        (!host.is_empty()).then(|| host.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Unsupported {
+    pub name: String,
+    pub reason: String,
+    #[serde(default)]
+    pub homepage: String,
+}
+
+/// Where one part's bytes come from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum From {
+    Url { url: String, mirror: Option<String> },
+    /// A member of a zip file at `zip` (exact name, or a pattern with `*`).
+    Zip { zip: String, member: String },
+    /// Shipped inside cyd-lab ([`BUNDLED_FIRMWARE`]).
+    Bundled { file: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PartSpec {
+    pub from: From,
+    pub offset: u64,
+    pub sha256: Option<String>,
+    pub size: Option<u64>,
+    pub patch_flash_size_mb: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pinned {
+    pub path: String,
+    pub offset: u64,
+    pub sha256: String,
+    pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Spec {
+    Parts(Vec<PartSpec>),
+    Manifest { url: String, pinned: Vec<Pinned>, sha256_bin: Option<String>, size_bin: Option<u64> },
+    Template { files: Vec<String> },
+}
+
+impl Catalog {
+    /// The catalogue entry whose setup hotspot this is (a firmware's `first_setup.hotspot`
+    /// pattern fits the name), with its first-setup details (password, page). The
+    /// installed firmware (`installed`, its catalogue name) wins when several patterns match.
+    pub fn hotspot_setup_entry(&self, ssid: &str, installed: Option<&str>) -> Option<(&str, &FirstSetup)> {
+        let mut hits = self
+            .entries
+            .iter()
+            .filter_map(|e| e.first_setup.as_ref().map(|f| (e.name.as_str(), f)))
+            .filter(|(_, f)| !f.hotspot.is_empty() && crate::hotspot::ssid_matches(&f.hotspot, ssid));
+        let first = hits.next()?;
+        Some(match installed {
+            Some(n) if first.0 != n => std::iter::once(first).chain(hits).find(|(e, _)| *e == n).unwrap_or(first),
+            _ => first,
+        })
+    }
+
+    pub fn parse(text: &str) -> Result<Catalog> {
+        let v: toml::Value = toml::from_str(text).context("catalogue is not valid TOML")?;
+        let schema = v.get("schema_version").and_then(|s| s.as_integer()).ok_or_else(|| anyhow!("catalogue has no schema_version"))?;
+        if schema != SCHEMA_VERSION as i64 {
+            bail!("catalogue schema_version {schema}; this cyd-lab reads version {SCHEMA_VERSION}");
+        }
+        let mut v = v;
+        apply_overlay(&mut v, OVERLAY_TOML)?;
+        let c: Catalog = v.try_into().context("catalogue entries")?;
+        for e in &c.entries {
+            e.spec().with_context(|| format!("entry {}", e.id))?;
+            for p in e.for_profile.keys() {
+                e.for_profile(p).spec().with_context(|| format!("entry {} for {p}", e.id))?;
+            }
+        }
+        Ok(c)
+    }
+
+    pub fn bundled() -> Catalog {
+        Catalog::parse(CATALOG_TOML).expect("bundled catalogue parses (checked by tests)")
+    }
+
+    /// The catalogue profile for a cyd-lab board profile (`esp32-2432s028r` -> `cyd-2432s028r`).
+    pub fn profile_for(&self, board_id: &str) -> Option<&CatProfile> {
+        let b = board_id.to_ascii_lowercase();
+        let short = b.strip_prefix("esp32-").unwrap_or(&b);
+        let short = short.strip_prefix("cyd-").unwrap_or(short);
+        // 2432S024R / 2432S024C share one catalogue profile (cyd-2432s024).
+        let family = short.strip_suffix(['r', 'c']).filter(|f| f.ends_with(|c: char| c.is_ascii_digit()) && !short.ends_with("028r"));
+        self.profiles
+            .iter()
+            .find(|p| p.id == b || p.id == format!("cyd-{short}"))
+            .or_else(|| self.profiles.iter().find(|p| p.aliases.iter().any(|a| a.to_ascii_lowercase() == short)))
+            .or_else(|| family.and_then(|f| self.profiles.iter().find(|p| p.id == format!("cyd-{f}"))))
+    }
+
+    /// Entries for a catalogue profile, in catalogue order; broken ones only on request.
+    pub fn entries_for(&self, profile: &str, show_broken: bool) -> Vec<&Entry> {
+        self.entries
+            .iter()
+            .filter(|e| e.fits(profile))
+            .filter(|e| show_broken || e.emulator_status != Status::Broken)
+            .collect()
+    }
+
+    /// The gallery's sections: headings in [`GROUPS`] order, pinned entries first.
+    pub fn grouped(&self, profile: &str, show_broken: bool) -> Vec<(&'static str, Vec<&Entry>)> {
+        let all = self.entries_for(profile, show_broken);
+        GROUPS
+            .iter()
+            .filter_map(|(g, heading)| {
+                let mut v: Vec<&Entry> = all.iter().copied().filter(|e| e.group_id() == *g).collect();
+                v.sort_by_key(|e| !e.pinned);
+                (!v.is_empty()).then_some((*heading, v))
+            })
+            .collect()
+    }
+
+    pub fn hidden_broken(&self, profile: &str) -> usize {
+        self.entries.iter().filter(|e| e.fits(profile) && e.emulator_status == Status::Broken).count()
+    }
+}
+
+fn s(t: &toml::Table, k: &str) -> Option<String> {
+    t.get(k).and_then(|v| v.as_str()).map(str::to_string)
+}
+fn n(t: &toml::Table, k: &str) -> Option<u64> {
+    t.get(k).and_then(|v| v.as_integer()).and_then(|i| u64::try_from(i).ok())
+}
+fn sha(t: &toml::Table, k: &str) -> Result<Option<String>> {
+    match s(t, k) {
+        Some(h) if h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()) => Ok(Some(h.to_ascii_lowercase())),
+        Some(h) => bail!("{k} is not a SHA-256: {h}"),
+        None => Ok(None),
+    }
+}
+
+/// `*` matches any run of characters.
+pub fn glob(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == name;
+    }
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if !name.starts_with(first) || !name[first.len()..].ends_with(last) || name.len() < first.len() + last.len() {
+        return false;
+    }
+    let mut rest = &name[first.len()..name.len() - last.len()];
+    for mid in &parts[1..parts.len() - 1] {
+        match rest.find(mid) {
+            Some(i) => rest = &rest[i + mid.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Merge cyd-lab's overlay into a catalogue: add/replace `[[entries]]`, set fields from
+/// `[[overrides]]` (by id; ids the catalogue lacks are skipped).
+fn apply_overlay(v: &mut toml::Value, overlay: &str) -> Result<()> {
+    let o: toml::Table = toml::from_str(overlay).context("cyd-lab-catalog.toml")?;
+    let Some(entries) = v.as_table_mut().map(|t| t.entry("entries").or_insert_with(|| toml::Value::Array(Vec::new()))).and_then(|e| e.as_array_mut()) else {
+        bail!("catalogue entries is not a list");
+    };
+    let id_of = |e: &toml::Value| e.get("id").and_then(|i| i.as_str()).map(str::to_string);
+    for add in o.get("entries").and_then(|e| e.as_array()).into_iter().flatten() {
+        let id = id_of(add);
+        entries.retain(|e| id.is_none() || id_of(e) != id);
+        entries.push(add.clone());
+    }
+    for ov in o.get("overrides").and_then(|e| e.as_array()).into_iter().flatten() {
+        let Some(t) = ov.as_table() else { continue };
+        let id = id_of(ov);
+        if let Some(e) = entries.iter_mut().find(|e| id.is_some() && id_of(e) == id).and_then(|e| e.as_table_mut()) {
+            for (k, val) in t {
+                if k != "id" {
+                    e.insert(k.clone(), val.clone());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+impl Entry {
+    /// Listed for this catalogue profile or one in its family ([`profile_family`]).
+    pub fn fits(&self, profile: &str) -> bool {
+        profile_family(profile).iter().any(|f| self.profiles.iter().any(|p| p == f))
+    }
+
+    /// Made for a sibling board, not listed for this one itself (e.g. a micro-USB 2432S028R
+    /// build shown for the two-USB board).
+    pub fn borrowed_for(&self, profile: &str) -> bool {
+        !self.profiles.iter().any(|p| p == profile) && self.fits(profile)
+    }
+
+    /// This entry for a device's board (`cyd-3248s035c`) shown under catalogue profile
+    /// `profile` (`cyd-3248s035`): the catalogue profile's `for_profile` replacements, then
+    /// the board's own on top. Boards sharing one catalogue profile (3248S035C capacitive vs
+    /// 3248S035R resistive) can need different builds.
+    pub fn for_board(&self, board: &str, profile: &str) -> Entry {
+        let e = self.for_profile(profile);
+        let b = board.to_ascii_lowercase();
+        let b = b.strip_prefix("esp32-").map(|s| format!("cyd-{s}")).unwrap_or(b);
+        if b != profile && self.for_profile.contains_key(&b) {
+            return e.for_profile(&b);
+        }
+        e
+    }
+
+    /// This entry as it applies to one board: its `for_profile` replacements filled in.
+    pub fn for_profile(&self, profile: &str) -> Entry {
+        let mut e = self.clone();
+        if let Some(o) = self.for_profile.get(profile) {
+            if let Some(src) = &o.source {
+                e.source = src.clone();
+            }
+            if let Some(c) = &o.config {
+                e.config = c.clone();
+            }
+            if o.view_rotation.is_some() {
+                e.view_rotation = o.view_rotation.filter(|r| *r != 0);
+            }
+            if let Some(n) = &o.notes {
+                e.notes = n.clone();
+            }
+            if let Some(n) = &o.emulator_notes {
+                e.emulator_notes = n.clone();
+            }
+        }
+        e
+    }
+
+    /// Gallery group id (one of [`GROUPS`]).
+    pub fn group_id(&self) -> &str {
+        GROUPS.iter().map(|(g, _)| *g).find(|g| *g == self.group).unwrap_or("other")
+    }
+
+    pub fn kind(&self) -> &str {
+        self.source.get("type").and_then(|v| v.as_str()).unwrap_or("")
+    }
+
+    /// A custom build rather than the upstream project's official image: flagged in the gallery.
+    pub fn is_custom(&self) -> bool {
+        self.custom_build || self.kind() == "bundled"
+    }
+
+    pub fn is_template(&self) -> bool {
+        self.kind() == "config-template"
+    }
+
+    /// What the emulator does not model that this firmware wants. Uses the entry's `needs`
+    /// when the catalogue has one, else what the verification notes found.
+    pub fn needs(&self) -> Vec<String> {
+        if let Some(n) = &self.needs {
+            return n.clone();
+        }
+        let v: &[&str] = match self.id.as_str() {
+            "marauder" => &["SD card", "Bluetooth (its older controller)"],
+            "wled" => &["LED strip (no screen UI)"],
+            "bruce" => &["RF / IR / NRF24 add-on modules"],
+            _ => &[],
+        };
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    pub fn thumbnail(&self) -> Option<&'static [u8]> {
+        THUMBS.iter().chain(OVERLAY_THUMBS).find(|(id, _)| *id == self.id).map(|(_, b)| *b)
+    }
+
+    /// Bundled text of a config template file (`templates/…`).
+    pub fn template_text(file: &str) -> Option<&'static str> {
+        TEMPLATES.iter().chain(OVERLAY_TEMPLATES).find(|(f, _)| *f == file).map(|(_, t)| *t)
+    }
+
+    pub fn spec(&self) -> Result<Spec> {
+        let t = &self.source;
+        match self.kind() {
+            "direct" => Ok(Spec::Parts(vec![PartSpec {
+                from: From::Url { url: s(t, "url").ok_or_else(|| anyhow!("direct source without url"))?, mirror: s(t, "cdn") },
+                offset: n(t, "offset").unwrap_or(0),
+                sha256: sha(t, "sha256")?,
+                size: n(t, "size"),
+                patch_flash_size_mb: None,
+            }])),
+            "github-release" => {
+                let repo = s(t, "repo").ok_or_else(|| anyhow!("github-release without repo"))?;
+                let tag = s(t, "tag").ok_or_else(|| anyhow!("github-release without tag"))?;
+                let asset_url = |a: &str| format!("https://github.com/{repo}/releases/download/{tag}/{a}");
+                if let Some(parts) = t.get("parts").and_then(|p| p.as_array()) {
+                    let app = s(t, "asset_app");
+                    let bundle = s(t, "asset_bundle");
+                    let mut out = Vec::new();
+                    for p in parts {
+                        let p = p.as_table().ok_or_else(|| anyhow!("parts must be tables"))?;
+                        let from = if let Some(u) = s(p, "url") {
+                            From::Url { url: u, mirror: None }
+                        } else if let Some(pat) = s(p, "path_pattern") {
+                            match (&app, &bundle) {
+                                (Some(a), _) if glob(&pat, a) => From::Url { url: asset_url(a), mirror: None },
+                                (_, Some(b)) => From::Zip { zip: asset_url(b), member: pat },
+                                _ => bail!("part {pat} matches no asset"),
+                            }
+                        } else {
+                            bail!("part without url or path_pattern");
+                        };
+                        out.push(PartSpec {
+                            from,
+                            offset: n(p, "offset").ok_or_else(|| anyhow!("part without offset"))?,
+                            sha256: sha(p, "sha256")?,
+                            size: n(p, "size"),
+                            patch_flash_size_mb: n(p, "patch_flash_size_mb").map(|m| m as u32),
+                        });
+                    }
+                    if out.is_empty() {
+                        bail!("no parts");
+                    }
+                    return Ok(Spec::Parts(out));
+                }
+                let asset = s(t, "asset").ok_or_else(|| anyhow!("github-release without asset or parts"))?;
+                let from = match s(t, "inner") {
+                    Some(inner) => From::Zip { zip: asset_url(&asset), member: inner },
+                    None => From::Url { url: asset_url(&asset), mirror: s(t, "cdn") },
+                };
+                Ok(Spec::Parts(vec![PartSpec { from, offset: n(t, "offset").unwrap_or(0), sha256: sha(t, "sha256")?, size: n(t, "size"), patch_flash_size_mb: None }]))
+            }
+            "manifest" => {
+                let mut pinned = Vec::new();
+                for p in t.get("parts_verified").and_then(|p| p.as_array()).into_iter().flatten() {
+                    let p = p.as_table().ok_or_else(|| anyhow!("parts_verified must be tables"))?;
+                    pinned.push(Pinned {
+                        path: s(p, "path").unwrap_or_default(),
+                        offset: n(p, "offset").ok_or_else(|| anyhow!("parts_verified without offset"))?,
+                        sha256: sha(p, "sha256")?.ok_or_else(|| anyhow!("parts_verified without sha256"))?,
+                        size: n(p, "size"),
+                    });
+                }
+                Ok(Spec::Manifest { url: s(t, "url").ok_or_else(|| anyhow!("manifest source without url"))?, pinned, sha256_bin: sha(t, "sha256_bin")?, size_bin: n(t, "size_bin") })
+            }
+            "bundled" => Ok(Spec::Parts(vec![PartSpec {
+                from: From::Bundled { file: s(t, "file").ok_or_else(|| anyhow!("bundled source without file"))? },
+                offset: n(t, "offset").unwrap_or(0),
+                sha256: sha(t, "sha256")?,
+                size: n(t, "size"),
+                patch_flash_size_mb: None,
+            }])),
+            "config-template" => {
+                let mut files: Vec<String> = t.get("files").and_then(|f| f.as_array()).into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect();
+                files.extend(s(t, "file"));
+                if files.is_empty() {
+                    bail!("config-template without files");
+                }
+                Ok(Spec::Template { files })
+            }
+            k => bail!("unknown source type {k:?}"),
+        }
+    }
+
+    /// Is every byte that will be written pinned by a SHA-256 in the catalogue?
+    pub fn pinned(&self) -> bool {
+        match self.spec() {
+            Ok(Spec::Parts(p)) => p.iter().all(|p| p.sha256.is_some()),
+            Ok(Spec::Manifest { pinned, sha256_bin, .. }) => !pinned.is_empty() || sha256_bin.is_some(),
+            _ => false,
+        }
+    }
+
+    /// The URL a user could paste into "Install from web" instead (manifest entries).
+    pub fn manifest_url(&self) -> Option<String> {
+        match self.spec() {
+            Ok(Spec::Manifest { url, .. }) => Some(url),
+            _ => None,
+        }
+    }
+}
+
+pub fn sha256_hex(d: &[u8]) -> String {
+    Sha256::digest(d).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Rewrite an ESP32 bootloader's header flash size (byte 3, high nibble) and, when the image
+/// carries an appended SHA-256, recompute it, as esptool and install.wled.me do.
+pub fn patch_bootloader_flash_size(d: &mut [u8], mb: u32) -> Result<()> {
+    let nib: u8 = match mb {
+        1 => 0,
+        2 => 1,
+        4 => 2,
+        8 => 3,
+        16 => 4,
+        _ => bail!("unsupported flash size {mb} MB"),
+    };
+    if d.len() < 24 || d[0] != 0xE9 {
+        bail!("not an ESP32 image (no 0xE9 magic)");
+    }
+    d[3] = (d[3] & 0x0F) | (nib << 4);
+    let mut pos = 24usize;
+    for _ in 0..d[1] {
+        let len = u32::from_le_bytes(d.get(pos + 4..pos + 8).ok_or_else(|| anyhow!("truncated segment header"))?.try_into().unwrap()) as usize;
+        pos += 8 + len;
+    }
+    // Checksum byte at the end of 16-byte padding, then the SHA-256 of everything before.
+    let hs = pos + (16 - (pos + 1) % 16) % 16 + 1;
+    if d[23] == 1 {
+        if hs + 32 > d.len() {
+            bail!("truncated image: no room for the appended SHA-256");
+        }
+        let h = Sha256::digest(&d[..hs]);
+        d[hs..hs + 32].copy_from_slice(&h);
+    }
+    Ok(())
+}
+
+/// Downloads (with a cache of verified files, keyed by SHA-256).
+pub struct Fetcher {
+    pub cache: Option<PathBuf>,
+    zips: HashMap<String, Vec<u8>>,
+}
+
+pub fn http_get(url: &str) -> Result<Vec<u8>> {
+    if let Some(p) = url.strip_prefix("file://") {
+        return std::fs::read(p).with_context(|| format!("reading {p}"));
+    }
+    let mut resp = ureq::get(url).header("User-Agent", concat!("cyd-lab/", env!("CARGO_PKG_VERSION"))).call().with_context(|| format!("GET {url}"))?;
+    resp.body_mut().with_config().limit(MAX_DOWNLOAD).read_to_vec().with_context(|| format!("reading {url}"))
+}
+
+impl Fetcher {
+    pub fn new(cache: Option<PathBuf>) -> Fetcher {
+        Fetcher { cache, zips: HashMap::new() }
+    }
+
+    fn cached(&self, sha: &str) -> Option<Vec<u8>> {
+        let p = self.cache.as_ref()?.join(format!("{sha}.bin"));
+        let d = std::fs::read(p).ok()?;
+        (sha256_hex(&d) == sha).then_some(d)
+    }
+
+    fn store(&self, sha: &str, d: &[u8]) {
+        if let Some(c) = &self.cache {
+            let _ = std::fs::create_dir_all(c);
+            let tmp = c.join(format!("{sha}.part"));
+            if std::fs::write(&tmp, d).is_ok() {
+                let _ = std::fs::rename(&tmp, c.join(format!("{sha}.bin")));
+            }
+        }
+    }
+
+    fn zip_member(&mut self, zip: &str, member: &str, progress: &mut dyn FnMut(String)) -> Result<(String, Vec<u8>)> {
+        if !self.zips.contains_key(zip) {
+            progress(format!("downloading {zip}"));
+            let d = http_get(zip)?;
+            self.zips.insert(zip.to_string(), d);
+        }
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(&self.zips[zip][..])).with_context(|| format!("{zip} is not a zip file"))?;
+        let names: Vec<String> = z.file_names().filter_map(|r| r.ok().map(|c| c.to_string())).collect();
+        let base = |n: &str| n.rsplit('/').next().unwrap_or(n).to_string();
+        let hits: Vec<&String> = names.iter().filter(|n| *n == member || glob(member, n) || glob(member, &base(n))).collect();
+        let name = match hits.as_slice() {
+            [one] => (*one).clone(),
+            [] => bail!("{member} is not in {zip}"),
+            many => bail!("{member} matches {} files in {zip}", many.len()),
+        };
+        let mut f = z.by_name(&name)?;
+        let mut d = Vec::new();
+        f.read_to_end(&mut d)?;
+        Ok((name, d))
+    }
+
+    /// Bytes for one part, verified against its pinned size and SHA-256, patched if asked.
+    pub fn part(&mut self, p: &PartSpec, progress: &mut dyn FnMut(String)) -> Result<(Vec<u8>, String)> {
+        let label = match &p.from {
+            From::Url { url, .. } => url.clone(),
+            From::Zip { zip, member } => format!("{member} from {}", zip.rsplit('/').next().unwrap_or(zip)),
+            From::Bundled { file } => format!("{file} (built into cyd-lab)"),
+        };
+        if let From::Bundled { file } = &p.from {
+            let d = BUNDLED_FIRMWARE.iter().find(|(f, _)| f == file).map(|(_, d)| d.to_vec()).ok_or_else(|| anyhow!("{label}: not in this build of cyd-lab"))?;
+            if let Some(h) = &p.sha256 {
+                if &sha256_hex(&d) != h {
+                    bail!("{label}: SHA-256 does not match the catalogue's {h}; nothing was written.");
+                }
+                progress(format!("{label}: SHA-256 OK"));
+            }
+            return Ok((d, label));
+        }
+        let mut data = match p.sha256.as_deref().and_then(|h| self.cached(h)) {
+            Some(d) => {
+                progress(format!("{label}: using the verified copy in the download cache"));
+                d
+            }
+            None => {
+                let d = match &p.from {
+                    From::Url { url, mirror } => {
+                        progress(format!("downloading {url}"));
+                        match (http_get(url), mirror) {
+                            (Ok(d), _) => d,
+                            (Err(e), Some(m)) => {
+                                progress(format!("{e:#}; trying {m}"));
+                                http_get(m)?
+                            }
+                            (Err(e), None) => return Err(e),
+                        }
+                    }
+                    From::Zip { zip, member } => self.zip_member(zip, member, progress)?.1,
+                    From::Bundled { .. } => unreachable!("handled above"),
+                };
+                if let Some(sz) = p.size {
+                    if d.len() as u64 != sz {
+                        bail!("{label}: got {} bytes, the catalogue says {sz}. The file changed upstream; nothing was written.", d.len());
+                    }
+                }
+                if let Some(h) = &p.sha256 {
+                    let got = sha256_hex(&d);
+                    if &got != h {
+                        bail!("{label}: SHA-256 {got} does not match the catalogue's {h}. The file changed upstream (or the download is damaged); nothing was written.");
+                    }
+                    progress(format!("{label}: SHA-256 OK"));
+                    self.store(h, &d);
+                }
+                d
+            }
+        };
+        if let Some(mb) = p.patch_flash_size_mb {
+            patch_bootloader_flash_size(&mut data, mb).with_context(|| format!("{label}: reflagging the bootloader"))?;
+            progress(format!("{label}: bootloader reflagged to {mb} MB flash (header + SHA-256 rewritten)"));
+        }
+        Ok((data, label))
+    }
+}
+
+/// Download and verify everything an entry writes. Always a fresh install (erase first).
+pub fn prepare(e: &Entry, flash_size: u64, cache: Option<PathBuf>, progress: &mut dyn FnMut(String)) -> Result<crate::webinstall::Prepared> {
+    let mut parts = Vec::new();
+    match e.spec()? {
+        Spec::Template { .. } => bail!("{} is a config template: copy it, there is nothing to flash", e.name),
+        Spec::Parts(specs) => {
+            let mut f = Fetcher::new(cache);
+            for p in &specs {
+                let (d, label) = f.part(p, progress)?;
+                parts.push((p.offset, d, label));
+            }
+        }
+        Spec::Manifest { url, pinned, sha256_bin, size_bin } => {
+            let p = crate::webinstall::prepare(&url, true, flash_size, progress)?;
+            let hint = format!("The web installer now serves different files from what the catalogue checked. If you trust it, paste {url} into \"Install from web\".");
+            for pin in &pinned {
+                let Some((_, d, _)) = p.parts.iter().find(|(o, _, _)| *o == pin.offset) else {
+                    bail!("the manifest has no part at 0x{:x} ({}). {hint}", pin.offset, pin.path);
+                };
+                if sha256_hex(d) != pin.sha256 {
+                    bail!("{} (0x{:x}) does not match the catalogue's SHA-256. {hint}", pin.path, pin.offset);
+                }
+            }
+            if let Some(h) = &sha256_bin {
+                if !p.parts.iter().any(|(_, d, _)| &sha256_hex(d) == h && size_bin.is_none_or(|s| s == d.len() as u64)) {
+                    bail!("the firmware does not match the catalogue's SHA-256. {hint}");
+                }
+            }
+            if pinned.is_empty() && sha256_bin.is_none() {
+                progress("this entry is not pinned to a SHA-256: installing what the web installer serves today".into());
+            } else {
+                progress("SHA-256 OK for every pinned part".into());
+            }
+            parts = p.parts;
+        }
+    }
+    for (o, d, l) in &parts {
+        if o + d.len() as u64 > flash_size {
+            bail!("{l} ({} bytes at 0x{o:x}) doesn't fit in the device's {} MB flash", d.len(), flash_size >> 20);
+        }
+    }
+    let improv = e.first_setup.as_ref().is_some_and(|f| f.improv);
+    Ok(crate::webinstall::Prepared { name: e.name.clone(), version: e.version.clone(), erase: true, prompt_erase: false, improv, parts })
+}
+
+/// settings.toml `[catalog]`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CatalogSettings {
+    /// Fetch a newer catalogue from `url` when asked. Off by default.
+    pub refresh: bool,
+    /// Raw URL of a cyd-firmware.toml, e.g.
+    /// https://raw.githubusercontent.com/<user>/cyd-lab/main/catalog/cyd-firmware.toml
+    pub url: String,
+}
+
+/// The refreshed copy saved next to settings.toml.
+pub fn cached_path(data_root: &Path) -> PathBuf {
+    data_root.join("catalog").join("cyd-firmware.toml")
+}
+
+/// The catalogue to use: a refreshed copy when refresh is on and the copy is valid, else the
+/// bundled one. Returns a note when a saved copy was ignored.
+pub fn load(data_root: &Path, s: &CatalogSettings) -> (Catalog, Option<String>) {
+    let bundled = Catalog::bundled();
+    if !s.refresh {
+        return (bundled, None);
+    }
+    let p = cached_path(data_root);
+    match std::fs::read_to_string(&p) {
+        Err(_) => (bundled, None),
+        Ok(t) => match Catalog::parse(&t) {
+            Ok(c) if c.updated >= bundled.updated => (c, None),
+            Ok(_) => (bundled, None),
+            Err(e) => (bundled, Some(format!("ignoring {}: {e:#}", p.display()))),
+        },
+    }
+}
+
+/// Download a catalogue from `url`, check it and save it for `load`.
+pub fn refresh(url: &str, data_root: &Path) -> Result<Catalog> {
+    if !url.starts_with("https://") && !url.starts_with("file://") {
+        bail!("the catalogue URL must start with https://");
+    }
+    let text = String::from_utf8(http_get(url)?).context("catalogue is not UTF-8")?;
+    let c = Catalog::parse(&text)?;
+    if c.entries.is_empty() {
+        bail!("the downloaded catalogue has no entries");
+    }
+    let p = cached_path(data_root);
+    std::fs::create_dir_all(p.parent().unwrap())?;
+    std::fs::write(&p, text)?;
+    Ok(c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlay_adds_the_home_assistant_entry_first() {
+        let c = Catalog::bundled();
+        let g = c.grouped("cyd-2432s028r", false);
+        assert_eq!(g[0].0, "Home Assistant");
+        // The official ESPHome image leads, as on a real board; the custom demo sits in Other, flagged.
+        let official = g[0].1[0];
+        assert_eq!(official.id, "esphome-web");
+        assert!(official.name.contains("official") && !official.is_custom());
+        assert!(official.home_assistant && official.first_setup.as_ref().unwrap().improv && official.description.contains("screen stays dark"));
+        assert!(official.fits("cyd-2432s028r-2usb") && !official.borrowed_for("cyd-2432s028r-2usb"));
+        let names: Vec<&str> = g.iter().map(|(h, _)| *h).collect();
+        assert_eq!(names, ["Home Assistant", "Tools & fun", "Programming", "Other / advanced"]);
+        let ha = c.entries.iter().find(|e| e.id == "esphome-ha-cyd").unwrap();
+        assert!(ha.group_id() == "other" && ha.is_custom() && ha.name.contains("not official"));
+        assert!(ha.pinned() && ha.first_setup.as_ref().unwrap().improv && ha.home_assistant && ha.view_rotation == Some(270));
+        assert!(Entry::template_text(&ha.config).unwrap().contains("improv_serial"));
+        // Everything else is the upstream project's own image.
+        assert_eq!(c.entries.iter().filter(|e| e.is_custom()).map(|e| e.id.as_str()).collect::<Vec<_>>(), ["esphome-ha-cyd"]);
+        // Every flashable entry says how it gets onto Wi-Fi.
+        for e in c.entries.iter().filter(|e| !e.is_template() && e.profiles.iter().any(|p| p == "cyd-2432s028r")) {
+            assert!(e.first_setup.as_ref().is_some_and(|f| !f.summary().is_empty()), "{} has no first_setup", e.id);
+        }
+    }
+
+    #[test]
+    fn bundled_image_matches_its_pin() {
+        let c = Catalog::bundled();
+        let ha = c.entries.iter().find(|e| e.id == "esphome-ha-cyd").unwrap();
+        let p = prepare(ha, 4 << 20, None, &mut |_| {}).unwrap();
+        assert!(p.improv);
+        assert_eq!(p.parts.len(), 1);
+        assert_eq!(p.parts[0].0, 0);
+        assert_eq!(p.parts[0].1[0x1000], 0xE9, "factory image: bootloader at 0x1000");
+        // The two-USB board gets its own build (native landscape panel), config and no rotation hint.
+        let usb = ha.for_profile("cyd-2432s028r-2usb");
+        let Spec::Parts(parts) = usb.spec().unwrap() else { panic!() };
+        assert_eq!(parts[0].from, From::Bundled { file: "esphome-ha-cyd-2432s028r-2usb.factory.bin".into() });
+        let q = prepare(&usb, 4 << 20, None, &mut |_| {}).unwrap();
+        assert_ne!(q.parts[0].1, p.parts[0].1);
+        assert_eq!(usb.view_rotation, None);
+        assert!(Entry::template_text(&usb.config).unwrap().contains("rotation: 180"));
+        assert_eq!(ha.for_profile("cyd-2432s028r").view_rotation, Some(270));
+    }
+
+    #[test]
+    fn three_point_five_boards_get_their_own_builds() {
+        // One catalogue profile (cyd-3248s035) for the capacitive C and resistive R boards; the
+        // 2.8" builds the catalogue lists never read the 3.5" boards' touch.
+        let c = Catalog::bundled();
+        let get = |id: &str| c.entries.iter().find(|e| e.id == id).unwrap();
+        let cat = c.profile_for("cyd-3248s035c").unwrap().id.clone();
+        assert_eq!(cat, "cyd-3248s035");
+        let url = |e: &Entry| match e.spec().unwrap() {
+            Spec::Parts(p) => match &p[0].from {
+                From::Url { url, .. } => url.clone(),
+                f => panic!("{f:?}"),
+            },
+            Spec::Manifest { url, .. } => url,
+            s => panic!("{s:?}"),
+        };
+        let bruce = get("bruce");
+        assert!(url(&bruce.for_board("cyd-3248s035c", &cat)).ends_with("/Bruce-CYD-3248S035C.bin"));
+        assert!(url(&bruce.for_board("cyd-3248s035r", &cat)).ends_with("/Bruce-CYD-3248S035R.bin"));
+        assert!(url(&bruce.for_board("cyd-2432s028r", "cyd-2432s028r")).ends_with("/Bruce-CYD-2432S028.bin"));
+        let k = get("cyd-klipper");
+        assert!(url(&k.for_board("cyd-3248s035c", &cat)).ends_with("/esp32-3248S035C.json"));
+        let kr = k.for_board("cyd-3248s035r", &cat);
+        assert!(url(&kr).ends_with("/esp32-3248S035C.json"));
+        assert!(kr.notes.contains("no build for the ESP32-3248S035R"));
+        assert!(url(&k.for_board("cyd-2432s028r", "cyd-2432s028r")).ends_with("/esp32-2432S028R.json"));
+    }
+
+    #[test]
+    fn first_setup_summary() {
+        let f = FirstSetup { improv: true, hotspot: "WLED-AP".into(), password: "wled1234".into(), page: "http://4.3.2.1".into(), note: String::new() };
+        assert_eq!(f.summary(), "Send Wi-Fi details (Improv over USB) or its hotspot \"WLED-AP\" (password wled1234, setup page http://4.3.2.1)");
+        assert_eq!(f.page_ip().as_deref(), Some("4.3.2.1"));
+    }
+
+    #[test]
+    fn hotspot_passwords_from_the_catalogue() {
+        let c = Catalog::bundled();
+        assert_eq!(c.hotspot_setup_entry("HASP-b1353e", None).map(|(_, f)| f.password.as_str()), Some("haspadmin"));
+        // The CYD Weather Dashboard's hotspot is CYD- and four hex digits, password cyd-setup.
+        let (name, f) = c.hotspot_setup_entry("CYD-4578", None).unwrap();
+        assert_eq!((name, f.password.as_str()), ("CYD Weather Dashboard", "cyd-setup"));
+        assert_eq!(c.hotspot_setup_entry("HASP-b1353e", Some("openHASP")).map(|(n, f)| (n, f.password.as_str())), Some(("openHASP", "haspadmin")));
+        assert!(c.hotspot_setup_entry("HomeNet", None).is_none());
+        assert_eq!(c.hotspot_setup_entry("NerdMinerAP", None).map(|(_, f)| f.password.as_str()), Some("MineYourCoins"));
+        assert_eq!(c.hotspot_setup_entry("WLED-AP", None).and_then(|(_, f)| f.page_ip()).as_deref(), Some("4.3.2.1"));
+        assert!(c.hotspot_setup_entry("SomeoneElse", None).is_none());
+    }
+
+    #[test]
+    fn bundled_catalogue_parses() {
+        let c = Catalog::bundled();
+        assert_eq!(c.schema_version, 1);
+        assert!(c.entries.len() >= 19);
+        for e in &c.entries {
+            let spec = e.spec().unwrap();
+            if let Spec::Template { files } = spec {
+                for f in files {
+                    assert!(Entry::template_text(&f).is_some(), "template {f} bundled");
+                }
+            }
+        }
+        assert!(c.entries.iter().find(|e| e.id == "openhasp").unwrap().thumbnail().is_some());
+    }
+
+    #[test]
+    fn profile_filter_hides_broken() {
+        let c = Catalog::bundled();
+        let p = c.profile_for("esp32-2432s028r").unwrap();
+        assert_eq!(p.id, "cyd-2432s028r");
+        assert!(c.profile_for("ttgo-tdisplay").is_none());
+        let shown = c.entries_for(&p.id, false);
+        assert!(shown.iter().any(|e| e.id == "nerdminer"));
+        // CircuitPython boots since the engine runs its BLE; nothing bundled is broken now.
+        assert!(shown.iter().any(|e| e.id == "circuitpython" && e.emulator_status == Status::Works));
+        assert_eq!(c.hidden_broken(&p.id), 0);
+        assert_eq!(c.entries_for(&p.id, true).len(), shown.len());
+        assert!(c.entries.iter().any(|e| e.id == "esphome-web" && e.emulator_status == Status::Works && e.needs().is_empty()));
+        assert!(c.entries.iter().any(|e| e.id == "marauder" && e.emulator_status == Status::Partial));
+        // The two-USB 2.8" board also gets the micro-USB board's entries; others only their own.
+        let usb = c.entries_for("cyd-2432s028r-2usb", true);
+        assert!(usb.iter().any(|e| e.id == "wled") && usb.iter().any(|e| e.id == "esphome-ha-cyd"));
+        assert!(usb.iter().find(|e| e.id == "wled").unwrap().borrowed_for("cyd-2432s028r-2usb"));
+        assert!(!usb.iter().find(|e| e.id == "nerdminer").unwrap().borrowed_for("cyd-2432s028r-2usb"));
+        let s024 = c.entries_for("cyd-2432s024", true);
+        assert!(s024.iter().all(|e| e.profiles.contains(&"cyd-2432s024".to_string())));
+        assert!(!s024.iter().any(|e| e.id == "wled"));
+        // Engine board names map onto catalogue profiles.
+        assert_eq!(c.profile_for("cyd-2432s028r-2usb").unwrap().id, "cyd-2432s028r-2usb");
+        assert_eq!(c.profile_for("cyd-2432s024c").unwrap().id, "cyd-2432s024");
+        assert_eq!(c.profile_for("cyd-3248s035r").unwrap().id, "cyd-3248s035");
+        assert_eq!(c.profile_for("cyd-2432s032c").unwrap().id, "cyd-2432s032");
+        assert_eq!(c.profile_for("esp32-2432s028r-2usb").unwrap().id, "cyd-2432s028r-2usb", "the profile ids cyd-lab makes from --list-boards");
+        assert_eq!(c.profile_for("esp32-2432s024c").unwrap().id, "cyd-2432s024");
+    }
+
+    #[test]
+    fn sources_resolve() {
+        let c = Catalog::bundled();
+        let get = |id: &str| c.entries.iter().find(|e| e.id == id).unwrap().spec().unwrap();
+        let Spec::Parts(p) = get("openhasp") else { panic!() };
+        assert_eq!(p[0].from, From::Zip { zip: "https://github.com/HASwitchPlate/openHASP/releases/download/0.7.0-rc13/sunton.zip".into(), member: "build_output/firmware/esp32-2432s028r_full_4MB_v0.7.0-rc13_042fe05.bin".into() });
+        let Spec::Parts(p) = get("nerdminer") else { panic!() };
+        assert_eq!(p[0].offset, 0);
+        assert!(matches!(&p[0].from, From::Url { url, .. } if url == "https://github.com/BitMaker-hub/NerdMiner_v2/releases/download/nerdminer-release-V1.8.3/ESP32-2432S028R_factory.bin"));
+        let Spec::Parts(p) = get("marauder") else { panic!() };
+        assert_eq!(p.iter().map(|p| p.offset).collect::<Vec<_>>(), vec![0x1000, 0x8000, 0xe000, 0x10000]);
+        assert!(matches!(&p[0].from, From::Zip { member, .. } if member.ends_with(".bootloader.bin")));
+        assert!(matches!(&p[3].from, From::Url { url, .. } if url.ends_with("esp32_marauder_v1_19_2_20261023_cyd_2432S028.bin")), "app from asset_app");
+        let Spec::Parts(p) = get("wled") else { panic!() };
+        assert_eq!(p[0].patch_flash_size_mb, Some(4));
+        assert!(matches!(get("bruce"), Spec::Parts(ref p) if matches!(&p[0].from, From::Url { mirror: Some(_), .. })));
+        assert!(matches!(get("cyd-klipper"), Spec::Manifest { ref pinned, .. } if pinned.len() == 4));
+        assert!(matches!(get("esphome-cyd-starter"), Spec::Template { ref files } if files == &["templates/esphome-cyd-2432s028r.yaml"]));
+        assert!(!c.entries.iter().find(|e| e.id == "cyd-diagnostic").unwrap().pinned());
+    }
+
+    #[test]
+    fn globbing() {
+        assert!(glob("esp32_marauder_*_cyd_2432S028.bootloader.bin", "esp32_marauder_installer_v1_19_2_20261023_cyd_2432S028.bootloader.bin"));
+        assert!(!glob("esp32_marauder_*_cyd_2432S028.bootloader.bin", "esp32_marauder_installer_v1_19_2_20261023_cyd_2432S028_2usb.bootloader.bin"));
+        assert!(!glob("esp32_marauder_v1_19_2_*_cyd_2432S028.bin", "esp32_marauder_installer_v1_19_2_20261023_cyd_2432S028.bin"));
+        assert!(glob("a*b*c", "a-b-c") && !glob("a*b*c", "a-c") && glob("x", "x") && !glob("ab*ba", "aba"));
+    }
+
+    /// A minimal image: 1 segment, hash appended.
+    fn image(flash_nib: u8) -> Vec<u8> {
+        let mut d = vec![0u8; 24];
+        d[0] = 0xE9;
+        d[1] = 1;
+        d[3] = (flash_nib << 4) | 0x0f;
+        d[23] = 1;
+        d.extend(0x3fff_0000u32.to_le_bytes());
+        d.extend(5u32.to_le_bytes());
+        d.extend([1, 2, 3, 4, 5]);
+        let pos = d.len();
+        let hs = pos + (16 - (pos + 1) % 16) % 16 + 1;
+        d.resize(hs, 0);
+        let h = Sha256::digest(&d);
+        d.extend(h);
+        d.resize(4096, 0xFF);
+        d
+    }
+
+    #[test]
+    fn reflags_bootloader() {
+        let mut d = image(3);
+        patch_bootloader_flash_size(&mut d, 4).unwrap();
+        assert_eq!(d, image(2), "same image as one built for 4 MB, hash included");
+        assert_eq!(d[3] & 0x0f, 0x0f, "flash mode/speed nibble kept");
+        assert!(patch_bootloader_flash_size(&mut [0u8; 32], 4).is_err());
+        // The real WLED 8 MB bootloader (catalogue cache), checked against the catalogue's
+        // tools/mkflash.py --patch-bootloader-size output.
+        if let Ok(mut real) = std::fs::read("../catalog/dl/wled-bootloader_esp32_8m.bin") {
+            assert_eq!(sha256_hex(&real), "dd83e828882288c738d5f8916ba74d400491e6832abd65440b91f0a03fd2308e");
+            patch_bootloader_flash_size(&mut real, 4).unwrap();
+            assert_eq!(real[3], 0x20);
+            assert_eq!(sha256_hex(&real), "8320fd1ff9dd431c12b403a99e8c8ae2ccaf0e1a44c5cedb7c478f786b66e892");
+        }
+    }
+
+    #[test]
+    fn verifies_and_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let fw = dir.path().join("fw.bin");
+        std::fs::write(&fw, b"firmware").unwrap();
+        let good = sha256_hex(b"firmware");
+        let url = format!("file://{}", fw.display());
+        let mut f = Fetcher::new(Some(dir.path().join("cache")));
+        let spec = |h: &str| PartSpec { from: From::Url { url: url.clone(), mirror: None }, offset: 0, sha256: Some(h.into()), size: Some(8), patch_flash_size_mb: None };
+        let e = f.part(&spec(&"0".repeat(64)), &mut |_| {}).unwrap_err();
+        assert!(e.to_string().contains("does not match"), "{e}");
+        assert_eq!(f.part(&spec(&good), &mut |_| {}).unwrap().0, b"firmware");
+        std::fs::remove_file(&fw).unwrap();
+        let mut log = Vec::new();
+        assert_eq!(f.part(&spec(&good), &mut |l| log.push(l)).unwrap().0, b"firmware", "served from the cache");
+        assert!(log[0].contains("cache"));
+    }
+
+    #[test]
+    fn zip_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let zp = dir.path().join("a.zip");
+        {
+            let mut w = zip::ZipWriter::new(std::fs::File::create(&zp).unwrap());
+            let o = zip::write::SimpleFileOptions::default();
+            for (n, d) in [("out/fw_cyd.bin", b"one".as_slice()), ("out/fw_cyd_2usb.bin", b"two")] {
+                w.start_file(n, o).unwrap();
+                std::io::Write::write_all(&mut w, d).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let zip = format!("file://{}", zp.display());
+        let mut f = Fetcher::new(None);
+        let p = |m: &str| PartSpec { from: From::Zip { zip: zip.clone(), member: m.into() }, offset: 0, sha256: None, size: None, patch_flash_size_mb: None };
+        assert_eq!(f.part(&p("out/fw_cyd.bin"), &mut |_| {}).unwrap().0, b"one");
+        assert_eq!(f.part(&p("fw_*_2usb.bin"), &mut |_| {}).unwrap().0, b"two");
+        assert!(f.part(&p("fw_*.bin"), &mut |_| {}).is_err(), "ambiguous");
+    }
+
+    #[test]
+    fn refresh_checks_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(&bad, "schema_version = 2\n").unwrap();
+        assert!(refresh(&format!("file://{}", bad.display()), dir.path()).unwrap_err().to_string().contains("schema_version 2"));
+        assert!(refresh("http://example.com/x.toml", dir.path()).is_err());
+        let good = dir.path().join("good.toml");
+        std::fs::write(&good, CATALOG_TOML.replace("updated = \"2026-10-24\"", "updated = \"2099-01-01\"")).unwrap();
+        refresh(&format!("file://{}", good.display()), dir.path()).unwrap();
+        let on = CatalogSettings { refresh: true, url: String::new() };
+        assert_eq!(load(dir.path(), &on).0.updated, "2099-01-01");
+        assert_eq!(load(dir.path(), &CatalogSettings::default()).0.updated, "2026-10-24", "off: bundled");
+    }
+}

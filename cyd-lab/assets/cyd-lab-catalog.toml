@@ -1,0 +1,217 @@
+# cyd-lab's own additions to the firmware catalogue (cyd-firmware.toml, which is copied in
+# from ../catalog by tools/catalog_assets.py and not edited here).
+#
+# * [[entries]] are added (or replace an entry with the same id).
+# * [[overrides]] set fields on an existing entry by id.
+#
+# Extra entry fields cyd-lab reads:
+#   group       = "home-assistant" | "tools" | "programming" | "other"  (gallery heading)
+#   pinned      = true            listed first in its group
+#   custom_build = true           not the project's own release (built by cyd-lab or a third party):
+#                                 the gallery flags it; "bundled" sources always count as custom
+#   first_setup = { improv = bool, hotspot = "SSID pattern", password = "...", page = "http://...",
+#                   note = "..." }  how the firmware gets onto Wi-Fi the first time
+#   steps       = ["...", ...]    extra notes under the setup checklist shown after installing it
+#   home_assistant = true         Home Assistant talks to it (ESPHome API 6053 + OTA 3232): installing
+#                                 publishes those ports and the checklist shows how to add it
+#   config      = "file"          a bundled config the gallery offers to copy (Copy config)
+#   view_rotation = 0|90|180|270  how the board is meant to be held (suggested, never applied silently)
+#   [entries.for_profile.PROFILE]  per-board replacements for source, config, view_rotation,
+#                                 notes and emulator_notes (e.g. a build for the two-USB 2432S028R)
+# Extra source type: "bundled" (file = name under assets/firmware/, offset, sha256, size).
+
+[[entries]]
+id = "esphome-ha-cyd"
+name = "Custom demo (not official firmware): ESPHome with screen"
+description = "Not official firmware: a demo cyd-lab built from its own ESPHome YAML, to show what an adopted board can look like. For the real out-of-the-box experience use \"ESPHome (official, for Home Assistant)\". The screen shows the device name, IP and status, touch works, and the backlight, RGB LED and light sensor appear in Home Assistant. Wi-Fi setup over USB (Improv) or its own hotspot. Built by cyd-lab from its ESPHome config (no Bluetooth)."
+homepage = "https://esphome.io/"
+licence = "ESPHome: MIT (Python) + GPL-3.0 (C++)"
+profiles = ["cyd-2432s028r", "cyd-2432s028r-2usb"]
+version = "1.0.0 (ESPHome 2026.10.0)"
+emulator_status = "works"
+emulator_notes = "Checked in the emulator: ready screen, touch (Identify button), Wi-Fi details over Improv in about 4 s, Home Assistant API reached through a published port."
+notes = """For the original micro-USB ESP32-2432S028R (ILI9341 240x320, drawn landscape).
+Name: cyd-panel plus the last 6 digits of the MAC, e.g. cyd-panel-1a2b3c. No API encryption key, so Home Assistant adopts it without secrets; take control of it in the ESPHome add-on to add one.
+TODO: a one-click "Take control" (dashboard_import) needs a public copy of the config; not published yet."""
+group = "other"
+custom_build = true
+config = "esphome/cyd-panel-2432s028r.yaml"
+view_rotation = 270
+first_setup = { improv = true, hotspot = "cyd-panel-xxxxxx", password = "", page = "http://192.168.4.1", note = "" }
+home_assistant = true
+[entries.source]
+type = "bundled"
+file = "esphome-ha-cyd-2432s028r.factory.bin"
+offset = 0
+sha256 = "682ba746beb71f900ab032ec15adae1eee12268479d6652dcd06500b08a731a2"
+size = 1135504
+
+[entries.for_profile.cyd-2432s028r-2usb]
+notes = """For the two-USB ESP32-2432S028R (USB-C + micro-USB): native 320x240 landscape panel, ILI9341 320x240 with LVGL rotation 180, as proven on a real two-USB board.
+Name: cyd-panel plus the last 6 digits of the MAC, e.g. cyd-panel-1a2b3c. No API encryption key, so Home Assistant adopts it without secrets; take control of it in the ESPHome add-on to add one.
+TODO: a one-click "Take control" (dashboard_import) needs a public copy of the config; not published yet."""
+config = "esphome/cyd-panel-2432s028r-2usb.yaml"
+view_rotation = 0
+[entries.for_profile.cyd-2432s028r-2usb.source]
+type = "bundled"
+file = "esphome-ha-cyd-2432s028r-2usb.factory.bin"
+offset = 0
+sha256 = "ef691646c01c32bc65b61c337de7484c00c0db24f9595bff634b44cfa8d50340"
+size = 1135520
+
+# ---- groups and first-setup hints for the shared catalogue
+
+[[overrides]]
+id = "openhasp"
+group = "home-assistant"
+first_setup = { hotspot = "HASP-xxxxxx", password = "haspadmin", page = "http://192.168.4.1", note = "or scan the QR code on its screen" }
+
+[[overrides]]
+id = "openhasp-nightly"
+group = "home-assistant"
+first_setup = { hotspot = "HASP-xxxxxx", password = "haspadmin", page = "http://192.168.4.1", note = "or scan the QR code on its screen" }
+
+[[overrides]]
+id = "tasmota32-lvgl"
+group = "home-assistant"
+first_setup = { hotspot = "tasmota-xxxxxx-nnnn", password = "", page = "http://192.168.4.1" }
+
+[[overrides]]
+id = "tasmota-cyd-template"
+group = "home-assistant"
+
+[[overrides]]
+id = "bruce"
+group = "tools"
+first_setup = { note = "Wi-Fi is set from its own on-screen menu" }
+# The catalogue's single asset is the 2.8" 2432S028 build (XPT2046 resistive touch on SPI
+# 25/32/39/33, backlight 21). On a 3.5" board it draws but never reads touch (the 3248S035C
+# has a GT911 on I2C 33/32 and its backlight on 27), so the 3.5" boards get their own builds.
+[overrides.for_profile.cyd-3248s035]
+notes = "Bruce's own build for the ESP32-3248S035C (3.5\" capacitive, GT911 touch). Merged factory image @0."
+emulator_notes = "Checked in the emulator on cyd-3248s035c: boots to the PREV / SEL / NEXT menu (landscape); taps on the GT911 move through it. The screen dims after a while; a tap wakes it."
+[overrides.for_profile.cyd-3248s035.source]
+type = "github-release"
+repo = "BruceDevices/firmware"
+tag = "1.16.1"
+asset = "Bruce-CYD-3248S035C.bin"
+offset = 0
+sha256 = "8f612cd59340ea9047517d73e9e6e18240fb8c7710357b8e56310fc74647c034"
+size = 3652368
+cdn = "https://dl.bruce.computer/1.16.1/Bruce-CYD-3248S035C.bin"
+[overrides.for_profile.cyd-3248s035r]
+notes = "Bruce's own build for the ESP32-3248S035R (3.5\" resistive, XPT2046 touch). Merged factory image @0."
+emulator_notes = "Bruce's 3248S035R build."
+[overrides.for_profile.cyd-3248s035r.source]
+type = "github-release"
+repo = "BruceDevices/firmware"
+tag = "1.16.1"
+asset = "Bruce-CYD-3248S035R.bin"
+offset = 0
+sha256 = "cb8fb324a48e043e553677e3618f2bf6748912aacf4baab730c5b6413c158d80"
+size = 3652992
+cdn = "https://dl.bruce.computer/1.16.1/Bruce-CYD-3248S035R.bin"
+
+[[overrides]]
+id = "marauder"
+group = "tools"
+first_setup = { note = "no Wi-Fi setup: it scans and attacks from its own menu" }
+
+[[overrides]]
+id = "nerdminer"
+group = "tools"
+first_setup = { hotspot = "NerdMinerAP", password = "MineYourCoins", page = "http://192.168.4.1", note = "the QR code on its screen joins it" }
+
+[[overrides]]
+id = "cyd-klipper"
+group = "tools"
+first_setup = { note = "Wi-Fi is set on its own touch screen (network list + keyboard) after calibration" }
+# The catalogue's manifest is the 2432S028R build (resistive touch, 2.8" layout): on a 3.5"
+# board it never reads touch. CYD-Klipper publishes a 3248S035C build (GT911); there is no
+# 3248S035R build.
+[overrides.for_profile.cyd-3248s035]
+notes = "CYD-Klipper's own build for the ESP32-3248S035C (3.5\" capacitive, GT911). No calibration step on the capacitive board."
+emulator_notes = "Checked in the emulator on cyd-3248s035c: boots to 'Select a network' (landscape); a tap on Skip opens 'Choose printer type'."
+[overrides.for_profile.cyd-3248s035.source]
+type = "manifest"
+url = "https://suchmememanyskill.github.io/CYD-Klipper/esp32-3248S035C.json"
+parts_verified = [
+  { path = "out/esp32-3248S035C/bootloader.bin", offset = 4096, sha256 = "095bbcc7357184f68144ab40b152e2f6d68fc9d07f642c17c7888c533ddc67d3", size = 17536 },
+  { path = "out/esp32-3248S035C/partitions.bin", offset = 32768, sha256 = "148b959cbff1c38aa8e1d5c0ba9d612c54997b945e56a63f41223eef650653a1", size = 3072 },
+  { path = "out/esp32-3248S035C/boot_app0.bin", offset = 57344, sha256 = "f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0", size = 8192 },
+  { path = "out/esp32-3248S035C/firmware.bin", offset = 65536, sha256 = "0c7534031d70d76de55119024b392f3e99a2ca5e12be0d15ac4205ccb2450638", size = 1283648 },
+]
+[overrides.for_profile.cyd-3248s035r]
+notes = "CYD-Klipper has no build for the ESP32-3248S035R (resistive). This is its 3248S035C (capacitive GT911) build: it draws on the R board but touch will not work there."
+emulator_notes = "Made for the 3248S035C: no touch on the resistive R board."
+
+[[overrides]]
+id = "wled"
+group = "tools"
+first_setup = { improv = true, hotspot = "WLED-AP", password = "wled1234", page = "http://4.3.2.1" }
+
+[[overrides]]
+id = "cyd-weather-dashboard"
+group = "tools"
+first_setup = { hotspot = "CYD-xxxx", password = "cyd-setup", page = "http://192.168.4.1" }
+
+[[overrides]]
+id = "pranavek-weather"
+group = "tools"
+first_setup = { hotspot = "cyd-weather-setup", password = "", page = "http://192.168.4.1" }
+
+[[overrides]]
+id = "cyd-diagnostic"
+group = "tools"
+first_setup = { note = "no Wi-Fi setup: tap the screen to start the checks" }
+
+[[overrides]]
+id = "micropython"
+group = "programming"
+first_setup = { note = "no Wi-Fi setup: connect from your code (network.WLAN) over the REPL" }
+
+[[overrides]]
+id = "esphome-cyd-starter"
+group = "programming"
+first_setup = { note = "put your Wi-Fi in the YAML (secrets) before you compile it" }
+
+[[overrides]]
+id = "wm-hello-world"
+group = "programming"
+# "Web Installer" in the catalogue is the website it is flashed from, not a web server: the
+# image has no Wi-Fi or network stack at all (checked in the emulator with --wifi any: no DHCP,
+# no wifi_wanted, nothing on port 80, no Improv, nothing on serial after the bootloader).
+name = "Hello World example"
+description = "Basics/1-HelloWorld from the ESP32-Cheap-Yellow-Display examples (flashed from their web installer page): draws \"Hello\" and \"World\" on the screen and nothing else. No Wi-Fi, no web page, no Improv, no serial output; the network settings make no difference."
+first_setup = { note = "none: it has no Wi-Fi (no web page, no Improv)" }
+
+[[overrides]]
+id = "wm-touch-test"
+group = "programming"
+name = "Touch test example"
+description = "Basics/2-TouchTest from the ESP32-Cheap-Yellow-Display examples (flashed from their web installer page): shows where you touch the screen. No Wi-Fi or web page."
+first_setup = { note = "none: it has no Wi-Fi" }
+
+[[overrides]]
+id = "wm-lvgl9"
+group = "programming"
+description = "LVGL 9 demo from the ESP32-Cheap-Yellow-Display examples (flashed from their web installer page): a SquareLine-style Profile / Analytics screen. No Wi-Fi or web page."
+first_setup = { note = "none: it has no Wi-Fi" }
+
+[[overrides]]
+id = "esphome-web"
+name = "ESPHome (official, for Home Assistant)"
+group = "home-assistant"
+pinned = true
+profiles = ["cyd-2432s028r", "cyd-2432s028r-2usb", "cyd-2432s024", "cyd-2432s032", "cyd-3248s035"]
+description = "The official ESPHome firmware: the stock ESP32 image that ESPHome's web installer (web.esphome.io, ESP Web Tools) puts on a new board, byte for byte. It offers Wi-Fi setup over USB (Improv serial) and Bluetooth, plus a fallback hotspot, so Home Assistant finds it and you can adopt it. The screen stays dark until you adopt it in Home Assistant and install your own YAML, exactly as on a real board."
+emulator_notes = "Checked in the emulator: Improv over serial and Bluetooth (BLE Improv service) and the fallback hotspot esphome-web-xxxxxx start, Send Wi-Fi details joins it, and Home Assistant reaches the API on 6053 through the published port. The screen stays dark (nothing drives the backlight on GPIO21), as on a real board."
+notes = "Generic ESP32 build with no display driver: that comes with your own YAML after adoption (the \"ESPHome CYD starter YAML\" entry has one for this board)."
+home_assistant = true
+first_setup = { improv = true, hotspot = "esphome-web-xxxxxx", password = "", page = "http://192.168.4.1", note = "the screen stays dark: use Send Wi-Fi details (Improv over USB) or join its hotspot" }
+steps = ["The screen stays dark until you install your own YAML. That is normal: a real board does the same.", "After adding it to Home Assistant: in the ESPHome Builder add-on, Adopt it, put your display config in its YAML (the ESPHome CYD starter YAML in Install firmware… has one) and Install."]
+
+[[overrides]]
+id = "circuitpython"
+group = "other"
+first_setup = { note = "Wi-Fi goes in settings.toml on its USB drive" }
