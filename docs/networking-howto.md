@@ -61,6 +61,25 @@ logged (`the firmware is looking for 'X', but the access point is 'Y'`). Either 
 channel's `wifi_wanted` event carries the name, its security once known and whether it is served
 ([web-ui.md](web-ui.md)).
 
+### Changing the network while the firmware runs
+
+A front end on the web channel can change the access point live, with no restart:
+`{"t":"wifi","ssid":"other-net"}` (open), `{"t":"wifi","ssid":"other-net","psk":"PASSWORD"}`
+(WPA2-PSK) or `{"t":"wifi","any":true}` (match-any; add `psk` for WPA2 too). The values are checked
+as `--wifi`'s are and the reply is `wifi_status` ([web-ui.md](web-ui.md)). The BSSID and channel
+stay; the SSID, the security and the beacons change at once. A station joined to the old network
+is deauthenticated (reason 3), as a real access point does when its settings are saved, and the
+firmware's own reconnect logic scans and joins the new network:
+
+```
+[emu] wifi: the access point is now 'other-net' (open); the station was disconnected and will rejoin
+```
+
+This is how to fix a name or passphrase mismatch after an OTA update without a power cycle, which
+matters for ESPHome: a reboot inside the 60 s after an OTA update counts as a failed boot and rolls
+the update back. The recorded `wifi_wanted` is cleared, so the next probe is reported again,
+judged against the new network.
+
 `--net none` keeps the emulated subnet (DHCP, DNS, SNTP still answer) but refuses anything past the
 gateway with an immediate RST, so applications fail fast instead of hanging — useful when you want a
 run to be reproducible and offline.
