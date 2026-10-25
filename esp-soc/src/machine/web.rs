@@ -211,6 +211,28 @@ impl<S: Soc> Machine<S> {
                     };
                     w.send_text(&reply);
                 }
+                // the emulated access point's settings, live (`--wifi` at run time): `ssid`, `psk`
+                // (absent or empty: open), `any`; a joined station is deauthenticated and rejoins
+                // under its own retry logic. Answered with `wifi_status`.
+                "wifi" => {
+                    let any = matches!(field("any").as_deref(), Some("true" | "1"));
+                    let reply = match self.bus.station_link().and_then(|l| l.ap_mut()) {
+                        None => r#"{"t":"wifi_status","error":"no emulated access point: run with --wifi"}"#.to_string(),
+                        Some(ap) => match ap.cfg.retarget(field("ssid").as_deref(), field("psk").as_deref(), any) {
+                            Err(e) => format!("{{\"t\":\"wifi_status\",\"error\":\"{}\"}}", crate::web::json_escape(&e)),
+                            Ok(cfg) => {
+                                let disconnected = ap.reconfigure(cfg);
+                                eprintln!("[emu] wifi: the access point is now {}{}", ap.cfg.describe(),
+                                          if disconnected { "; the station was disconnected and will rejoin" } else { "" });
+                                format!("{{\"t\":\"wifi_status\",\"ssid\":\"{}\",\"secure\":{},\"any\":{},\"disconnected\":{disconnected}}}",
+                                        crate::web::json_escape(&ap.cfg.ssid), ap.cfg.psk.is_some(), ap.cfg.any)
+                            }
+                        },
+                    };
+                    // `wanted` was cleared: the next one is pushed even if it reads the same
+                    self.ws.wanted_sent.clear();
+                    w.send_text(&reply);
+                }
                 "touch" => { let x: u16 = field("x").and_then(|v| v.parse().ok()).unwrap_or(0); let y: u16 = field("y").and_then(|v| v.parse().ok()).unwrap_or(0);
                              let down = field("down").unwrap_or_default() == "1"; self.bus.touch_input(x, y, down); }
                 _ => {}

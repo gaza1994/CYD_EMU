@@ -59,6 +59,27 @@ pub fn split_spec(spec: &str) -> Vec<String> {
 }
 
 impl ApConfig {
+    /// The configuration a run-time change (the web channel's `{"t":"wifi"}`) asks for: `ssid`
+    /// and `psk` (absent or empty: open), or match-any with `any` (the `ssid` is then ignored),
+    /// validated exactly as `--wifi` is. The BSSID and channel stay, as on a real access point
+    /// whose settings are edited.
+    pub fn retarget(&self, ssid: Option<&str>, psk: Option<&str>, any: bool) -> Result<Self, String> {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace(',', "\\,");
+        let mut spec = vec![format!("chan={}", self.channel), format!("bssid={}", mac_str(&self.bssid))];
+        match (any, ssid) {
+            (true, _) => spec.push("ssid=*".into()),
+            (false, Some(s)) if s != "*" => spec.push(format!("ssid={}", esc(s))),
+            (false, Some(_)) => return Err("WiFi SSID '*' means any network: send \"any\":true".into()),
+            (false, None) => return Err("give the WiFi SSID (\"ssid\") or \"any\":true".into()),
+        }
+        if let Some(p) = psk.filter(|p| !p.is_empty()) { spec.push(format!("psk={}", esc(p))); }
+        Self::parse(&spec.join(","))
+    }
+    /// How the log and the web channel name it: `'NAME' (WPA2-PSK)`, `'NAME' (open)` or `any network`.
+    pub fn describe(&self) -> String {
+        let auth = if self.psk.is_some() { "WPA2-PSK" } else { "open" };
+        if self.any { format!("any network ({})", if self.psk.is_some() { "open and WPA2-PSK" } else { "open" }) } else { format!("'{}' ({auth})", self.ssid) }
+    }
     /// Parse the shared CLI/browser AP configuration. Unknown keys are errors so a
     /// misspelled passphrase option cannot silently configure an open network. `any` or
     /// `ssid=*` is match-any; an empty `psk=` is open; a passphrase is 8 to 63 bytes, or 64
@@ -259,6 +280,44 @@ impl VirtualAp {
         let seed = esp_periph::crypto::sha1(&[&self.wpa.pmk[..], &self.cfg.bssid[..]].concat());
         for i in 0..32 { self.wpa.anonce[i] = seed[i % 20] ^ (i as u8); }
         for i in 0..16 { self.wpa.gtk[i] = seed[(i + 3) % 20] ^ 0x5a; }
+    }
+    /// Change the network at run time, as editing a real access point's settings does: the new
+    /// SSID, passphrase and match-any take effect at once (beacons, probe responses, the RSN
+    /// element and the keys), and a station joined to the old network is told it has left
+    /// (deauthentication, reason 3 "the AP is leaving") so its own retry logic scans and joins
+    /// again. In match-any mode, the network the station last asked for (else the current name)
+    /// is served at once. The
+    /// recorded `wanted` is cleared: the next probe reports it again, judged against the new
+    /// network. Returns whether a station was disconnected; an unchanged configuration changes
+    /// nothing.
+    pub fn reconfigure(&mut self, cfg: ApConfig) -> bool {
+        let same = cfg.any == self.cfg.any && cfg.psk == self.cfg.psk && cfg.bssid == self.cfg.bssid && cfg.channel == self.cfg.channel && (cfg.any || cfg.ssid == self.cfg.ssid);
+        if same { self.wanted = None; return false; }
+        let joined = self.state != StaState::Idle;
+        // whatever was queued belongs to the old network
+        self.queue.clear();
+        if joined {
+            let (sta, bssid) = (self.sta, self.bssid);
+            let mut f = self.hdr_as(0x00c0, &sta, &bssid, &bssid);
+            f.extend_from_slice(&3u16.to_le_bytes());
+            self.send(0, f);
+        }
+        // match-any serves the name the station asked for, else the one it served or had
+        let name = self.wanted.take().map(|w| w.ssid).filter(|n| !n.is_empty()).unwrap_or_else(|| self.cfg.ssid.clone());
+        self.cfg = cfg;
+        self.state = StaState::Idle;
+        self.wpa = Wpa { replay: self.wpa.replay, ..Wpa::default() };
+        self.bssid = self.cfg.bssid;
+        self.secure = self.cfg.psk.is_some();
+        if self.cfg.any && !name.is_empty() && !self.beacons.iter().any(|b| b.ssid == name) { self.cfg.ssid = name; }
+        self.derive_keys();
+        let (ssid, bssid) = (self.cfg.ssid.clone(), self.cfg.bssid);
+        self.beacons.retain(|b| {
+            let keep = (ssid.is_empty() || b.ssid != ssid) && b.bssid != bssid;
+            if !keep { eprintln!("[emu] wifi: the nearby network '{}' ({}) clashes with the access point now and is left out", b.ssid, mac_str(&b.bssid)); }
+            keep
+        });
+        joined
     }
     /// The BSSIDs this access point is on the air as, each with whether it is WPA2: the
     /// configured one; in match-any mode, once there is an SSID, the configured one open and
