@@ -45,3 +45,7 @@ tempfile = "3"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+# cyd-lab is its own Cargo workspace; the repository root is the esp32sim
+# engine's workspace (../Cargo.toml), which cyd-lab only runs as a program.
+[workspace]

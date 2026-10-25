@@ -9,7 +9,7 @@ cyd-lab runs as an external program, one process per powered-on device.
 Written in Rust with [egui/eframe](https://github.com/emilk/egui). Windows is the main
 target, and it also builds and runs on Linux.
 
-![screenshot](../cyd-lab-screenshot-3.png)
+![screenshot](docs/screenshots/progress-2026-10-24/04-popout-2x-beside-main-full.png)
 
 ## Quick start (Windows release zip)
 
@@ -647,8 +647,9 @@ wrong network / wrong password banners for both.
 1. Install Rust with the MSVC toolchain from <https://rustup.rs> (Visual Studio Build Tools
    with "Desktop development with C++").
 2. `cargo run --release`
-3. cyd-lab looks for `esp32sim.exe` next to itself, then on `PATH`. Otherwise set it in
-   **Settings**. The ROM is downloaded on first run.
+3. cyd-lab looks for `esp32sim.exe` next to itself, then on `PATH` (a debug build also finds
+   the engine built at the repository root, `cargo build --release -p esp32sim` in `..`).
+   Otherwise set it in **Settings**. The ROM is downloaded on first run.
 4. **+ New device** → ESP32-2432S028R. Import a merged image at `0x0`, or a bootloader at
    `0x1000`, partitions at `0x8000` and app at `0x10000`. Then **Power on**.
 
@@ -671,14 +672,12 @@ cargo build --release --target x86_64-pc-windows-gnu
 ### Release zip
 
 ```
-# engine from the esp32sim fork (gaza1994/CYD_EMU, branch cyd-2432s028r), static CRT:
-(cd ../esp32sim-applab && RUSTFLAGS="-C target-feature=+crt-static" \
+# from cyd-lab/: the engine is the repository root (esp32sim fork), static CRT:
+(cd .. && CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS="-C target-feature=+crt-static" \
    cargo build --release -p esp32sim --bin esp32sim --target x86_64-pc-windows-gnu)
 cargo build --release --bins --target x86_64-pc-windows-gnu   # crt-static via .cargo/config.toml
 python3 tools/package_windows.py --bin-dir target/x86_64-pc-windows-gnu/release \
-  --engine ../esp32sim-applab/target/x86_64-pc-windows-gnu/release/esp32sim.exe \
-  --engine-src ../esp32sim-applab --strip x86_64-w64-mingw32-strip \
-  --out ../release/cyd-lab-windows-x64.zip
+  --strip x86_64-w64-mingw32-strip --out ../release/cyd-lab-windows-x64.zip
 x86_64-w64-mingw32-objdump -p cyd-lab.exe | grep "DLL Name"   # system DLLs only
 ```
 
@@ -686,10 +685,10 @@ The zip holds `cyd-lab/` with `cyd-lab.exe`, `esp32sim.exe`, `arduino/tools/*.ex
 `arduino/examples/`, `README-QUICKSTART.txt` and `LICENSES/` (both MIT licences, NOTICE with
 esp32sim's authors and upstream PR credits, and generated third-party crate lists).
 
-`.github/workflows/release.yml` does the same on `windows-latest` with the MSVC target:
-run it by hand with `engine_repo` (default `gaza1994/CYD_EMU`) and `engine_ref` (default
-`cyd-2432s028r`), or push a `v*` tag to also make a draft release. It checks the DLL imports
-with dumpbin, smoke-runs the exes and uploads the zip as an artifact.
+The repository's `.github/workflows/release.yml` (at the root) does exactly this on
+`ubuntu-latest`: run it by hand for an artifact, or push a `v*` tag (releases start at
+`v1.0.0`) to also publish that tag's GitHub Release with the zip. It checks the DLL imports and
+smoke-runs the exes on a Windows runner.
 
 ### Tests
 

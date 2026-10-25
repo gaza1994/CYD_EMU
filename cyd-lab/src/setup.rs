@@ -100,10 +100,18 @@ pub fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe().ok()?.parent().map(Path::to_path_buf)
 }
 
-/// The engine shipped next to cyd-lab (the release zip layout), if any.
+/// The engine shipped next to cyd-lab (the release zip layout), if any. A debug build in the
+/// monorepo also takes the engine built at the repository root (`../target/{release,debug}`).
 pub fn bundled_engine() -> Option<PathBuf> {
     let p = exe_dir()?.join(engine_file_name());
-    p.is_file().then_some(p)
+    if p.is_file() {
+        return Some(p);
+    }
+    if cfg!(debug_assertions) {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("target");
+        return ["release", "debug"].iter().map(|d| root.join(d).join(engine_file_name())).find(|p| p.is_file());
+    }
+    None
 }
 
 #[cfg(test)]

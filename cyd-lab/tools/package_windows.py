@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Assemble the Windows release zip (no dependencies beyond Python 3 and cargo).
 
+    # from cyd-lab/, after building the engine at the repository root:
     python tools/package_windows.py --bin-dir target/x86_64-pc-windows-gnu/release \
-        --engine ../esp32sim-applab/target/x86_64-pc-windows-gnu/release/esp32sim.exe \
-        --engine-src ../esp32sim-applab --out ../release/cyd-lab-windows-x64.zip
+        --out ../release/cyd-lab-windows-x64.zip
+
+--engine defaults to ../target/<target>/release/esp32sim.exe and --engine-src (LICENSE,
+cli/Cargo.toml) to the repository root, the esp32sim engine in this monorepo.
 
 Layout inside the zip:
     cyd-lab/cyd-lab.exe, esp32sim.exe, README-QUICKSTART.txt
@@ -15,7 +18,8 @@ release on first run and checks its SHA-256.
 """
 import argparse, json, os, shutil, subprocess, sys, tempfile, zipfile
 
-HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # cyd-lab repo
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # cyd-lab/
+REPO = os.path.dirname(HERE)  # the monorepo root: the esp32sim engine
 
 
 def third_party(manifest, target):
@@ -65,12 +69,14 @@ def crlf_copy(src, dst):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin-dir", required=True)
-    ap.add_argument("--engine", required=True)
-    ap.add_argument("--engine-src", required=True, help="esp32sim checkout (LICENSE, Cargo.toml)")
+    ap.add_argument("--engine", help="esp32sim.exe (default: <repo>/target/<target>/release/esp32sim.exe)")
+    ap.add_argument("--engine-src", default=REPO, help="esp32sim source (LICENSE, cli/Cargo.toml); default: the repository root")
     ap.add_argument("--target", default="x86_64-pc-windows-gnu")
     ap.add_argument("--out", required=True)
     ap.add_argument("--strip", default="", help="strip tool to run on the exes (optional)")
     a = ap.parse_args()
+    if not a.engine:
+        a.engine = os.path.join(REPO, "target", a.target, "release", "esp32sim.exe")
 
     stage = tempfile.mkdtemp(prefix="cydlab-pkg-")
     top = os.path.join(stage, "cyd-lab")
