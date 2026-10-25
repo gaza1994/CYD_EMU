@@ -535,6 +535,8 @@ struct DeviceView {
     /// Widest console row laid out so far: the content width only grows, so the horizontal
     /// scroll range doesn't change as long lines scroll in and out of view.
     console_width: f32,
+    /// Long console lines wrap to the view's width (on by default).
+    console_wrap: bool,
     /// The engine's latest `wifi_wanted` this run: the network the firmware asked for.
     wifi_wanted: Option<crate::network::WifiWanted>,
     /// The password typed for that network (its banner's prompt).
@@ -1050,6 +1052,7 @@ impl DeviceView {
             console_gap: 0.0,
             console_follow_at_hold: true,
             console_width: 0.0,
+            console_wrap: true,
             wifi_wanted: None,
             wanted_password: String::new(),
             autoscroll: true,
@@ -2882,6 +2885,13 @@ impl CydLabApp {
             ui.label(RichText::new(&board).weak()).on_hover_text(&board_tip);
             ui.label(RichText::new(s).small().weak()).on_hover_text(&caps_tip);
             ui.separator();
+            // The buttons and the ••• menu as one group: a narrow window wraps them together
+            // onto the next line rather than leaving ••• on a line of its own.
+            let group_id = ui.scope_id().with(("power-group", i));
+            if ui.data(|m| m.get_temp::<f32>(group_id)).is_some_and(|w| w > ui.max_rect().right() - ui.cursor().left()) {
+                ui.end_row();
+            }
+            let group = ui.horizontal(|ui| {
             let power_text = if state == RunState::Stopping { "Saving flash…" } else if running { "Power off" } else { "Power on" };
             let power_btn = egui::Button::new(RichText::new(power_text).strong()).fill(if running { Color32::from_rgb(120, 40, 40) } else { Color32::from_rgb(40, 100, 50) });
             if ui.add_enabled(state != RunState::Stopping, power_btn).clicked() {
@@ -2917,6 +2927,9 @@ impl CydLabApp {
             })
             .response
             .on_hover_text("Rename, Duplicate, Delete, Erase flash, BOOT held");
+            });
+            // Its width for next frame's wrap decision.
+            ui.data_mut(|m| m.insert_temp(group_id, group.response.rect.width()));
         });
         if let Some(a) = action {
             self.device_action(i, a);
@@ -3112,7 +3125,14 @@ impl CydLabApp {
         let avail = ui.available_size();
         ui.horizontal_top(|ui| {
             ui.set_min_height(avail.y);
-            ui.vertical(|ui| self.screen_ui(ui, i, profile.as_ref()));
+            ui.vertical(|ui| {
+                // Narrow window: the screen's toolbar wraps rather than squeezing the pane.
+                // (The screen itself keeps its integer zoom; a wider screen widens the column.)
+                if avail.x < 720.0 {
+                    ui.set_max_width((avail.x * 0.45).max(250.0));
+                }
+                self.screen_ui(ui, i, profile.as_ref())
+            });
             ui.separator();
             // The rest of the width, and no more: wide content wraps or scrolls inside it.
             let w = ui.available_width();
@@ -3371,15 +3391,12 @@ impl CydLabApp {
         } else if g.collapsed {
             egui::Frame::new().fill(Color32::from_rgb(24, 40, 56)).inner_margin(egui::Margin::symmetric(8, 4)).corner_radius(4.0).show(ui, |ui| {
                 ui.set_width(ui.available_width().min(560.0));
-                // Buttons first (right to left), so a long name is cut short instead of the buttons.
-                let row = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
-                ui.allocate_ui_with_layout(row, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // The whole text; in a narrow pane the buttons wrap onto the next line.
+                ui.horizontal_wrapped(|ui| {
+                    let text = RichText::new(format!("✔ {}", guide_summary(&g))).color(green);
+                    reopen |= ui.add(egui::Label::new(text).sense(egui::Sense::click())).on_hover_text(format!("{}: every step is done. Click to show the steps.", g.name)).clicked();
+                    reopen |= ui.small_button("Show steps").on_hover_text("Open the Setup tab").clicked();
                     close = ui.small_button("×").on_hover_text("Remove this status (the steps are not shown again for this firmware)").clicked();
-                    reopen |= ui.small_button("Show steps").clicked();
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        let text = RichText::new(format!("✔ {}", guide_summary(&g))).color(green);
-                        reopen |= ui.add(egui::Label::new(text).sense(egui::Sense::click()).truncate()).on_hover_text(format!("{}: every step is done. Click to show the steps.", g.name)).clicked();
-                    });
                 });
             });
         } else {
@@ -4277,9 +4294,12 @@ impl CydLabApp {
         let d = &mut self.devices[i];
         let mut send = false;
         let mut jump_to_end = false;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Console (UART0)").strong());
             if ui.checkbox(&mut d.autoscroll, "autoscroll").changed() && d.autoscroll {
+                jump_to_end = true;
+            }
+            if ui.checkbox(&mut d.console_wrap, "wrap").on_hover_text("Wrap long lines to the console's width (else scroll sideways)").changed() && d.autoscroll {
                 jump_to_end = true;
             }
             if ui.small_button("Clear").on_hover_text("Clears the console here (console.log in the device folder keeps it).").clicked() {
@@ -4407,7 +4427,34 @@ impl CydLabApp {
         }
         let frame = egui::Frame::new().fill(Color32::from_gray(16)).inner_margin(4.0).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            let mut area = egui::ScrollArea::both()
+            let wrap = d.console_wrap;
+            // Wrapping: each line split into rows of whole characters (monospace) that fit the
+            // view, so every row keeps the fixed height show_rows needs.
+            let cols = if wrap {
+                let font = egui::TextStyle::Monospace.resolve(ui.style());
+                let char_w = ui.fonts_mut(|f| f.glyph_width(&font, 'M')).max(1.0);
+                let view_w = ui.available_width() - ui.spacing().scroll.bar_width - ui.spacing().scroll.bar_inner_margin - 6.0;
+                ((view_w / char_w).floor() as usize).max(20)
+            } else {
+                usize::MAX
+            };
+            let mut rows: Vec<(usize, usize, usize)> = Vec::with_capacity(d.console.len());
+            for (n, (_, line)) in d.console.iter().enumerate() {
+                // Bytes >= characters: a short line is one row without counting.
+                if line.len() <= cols {
+                    rows.push((n, 0, line.len()));
+                    continue;
+                }
+                let mut start = 0;
+                for (k, (b, _)) in line.char_indices().enumerate() {
+                    if k > 0 && k % cols == 0 {
+                        rows.push((n, start, b));
+                        start = b;
+                    }
+                }
+                rows.push((n, start, line.len()));
+            }
+            let mut area = egui::ScrollArea::new([!wrap, true])
                 .id_salt(("console", &d.dev.id))
                 .auto_shrink(false)
                 .max_height(log_h)
@@ -4423,16 +4470,18 @@ impl CydLabApp {
             if jump_to_end {
                 // Past the end (the area clamps it). Not f32::MAX: show_rows turns the offset
                 // into a row number, which saturates to usize::MAX.
-                area = area.vertical_scroll_offset((d.console.len() as f32 + 2.0) * (row_h + ui.spacing().item_spacing.y));
+                area = area.vertical_scroll_offset((rows.len() as f32 + 2.0) * (row_h + ui.spacing().item_spacing.y));
             }
             let first = d.console_dropped;
-            let total = d.console.len();
+            let total = rows.len();
             let mut widest = d.console_width;
             let out = area.show_rows(ui, row_h, total, |ui, range| {
                 // Clamped: the range egui derives from the offset can run past the rows.
                 let range = range.start.min(total)..range.end.min(total);
-                let w = ui.available_width().max(d.console_width);
-                for (k, (s, line)) in d.console.range(range.clone()).enumerate() {
+                let w = if wrap { ui.available_width() } else { ui.available_width().max(d.console_width) };
+                for &(n, from, to) in &rows[range.clone()] {
+                    let (s, line) = &d.console[n];
+                    let line = &line[from..to];
                     let color = match s {
                         Stream::Stdout => Color32::from_gray(220),
                         Stream::Stderr => Color32::from_rgb(230, 170, 90),
@@ -4442,10 +4491,12 @@ impl CydLabApp {
                     // another height than show_rows assumes make the end move every frame.
                     let (rect, _) = ui.allocate_exact_size(Vec2::new(w, row_h), Sense::hover());
                     // Id by line number, not row position, so a selection stays on its text.
-                    let mut row = ui.new_child(egui::UiBuilder::new().id_salt(first + (range.start + k) as u64).max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+                    let mut row = ui.new_child(egui::UiBuilder::new().id_salt((first + n as u64, from)).max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
                     row.set_clip_rect(rect.intersect(ui.clip_rect()));
                     let r = row.add(egui::Label::new(RichText::new(line).monospace().color(color)).selectable(true).extend());
-                    widest = widest.max(r.rect.width());
+                    if !wrap {
+                        widest = widest.max(r.rect.width());
+                    }
                 }
             });
             d.console_width = widest;
@@ -4457,7 +4508,9 @@ impl CydLabApp {
         });
         ui.ctx().data_mut(|m| m.insert_temp(console_id, frame.response.rect));
         ui.horizontal(|ui| {
-            let r = ui.add_enabled(d.link_up, egui::TextEdit::singleline(&mut d.serial_input).desired_width(ui.available_width() - 60.0).hint_text("type a line for UART0 RX (needs live link)"));
+            // The hint sets the box's minimum width, so a narrow pane gets the short one.
+            let hint = if ui.available_width() < 360.0 { "UART0 RX" } else { "type a line for UART0 RX (needs live link)" };
+            let r = ui.add_enabled(d.link_up, egui::TextEdit::singleline(&mut d.serial_input).desired_width(ui.available_width() - 60.0).hint_text(hint));
             if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 send = true;
             }
