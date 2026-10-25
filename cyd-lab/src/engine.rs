@@ -201,7 +201,8 @@ impl EngineFeatures {
     }
 
     pub fn net(&self) -> crate::network::NetFeatures {
-        crate::network::NetFeatures { wifi: self.wifi, hostfwd: self.hostfwd, mdns_relay: self.mdns_relay }
+        // wifi_any (`--wifi ssid=*`) stays off until the engine change lands and is detected.
+        crate::network::NetFeatures { wifi: self.wifi, wifi_any: false, hostfwd: self.hostfwd, mdns_relay: self.mdns_relay }
     }
 
     /// Probe an engine executable (cached by path, size and mtime, so a rebuilt engine is

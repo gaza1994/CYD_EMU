@@ -3422,8 +3422,8 @@ impl CydLabApp {
             "Network: Wi-Fi off".to_string()
         } else {
             format!(
-                "Network: Wi-Fi \"{}\" · {}",
-                eff.ssid,
+                "Network: Wi-Fi {} · {}",
+                if net.accept_any && features.net().wifi_any { "any name".to_string() } else { format!("\"{}\"", eff.ssid) },
                 if ports.is_empty() { "no ports published".to_string() } else { format!("{} {}", if net.lan { ip_text.as_str() } else { "127.0.0.1" }, ports.join(", ")) }
             )
         };
@@ -3462,18 +3462,25 @@ impl CydLabApp {
                         ui.label(RichText::new("Power off to change these; they apply at the next power-on.").small().weak());
                     }
                     save |= ui.checkbox(&mut n.wifi, "Wi-Fi: offer the chip an access point").on_hover_text("The emulator runs a virtual access point; the firmware joins it as it would join your router. Nothing changes on your real Wi-Fi.").changed();
-                    egui::Grid::new(("netgrid", i)).num_columns(2).show(ui, |ui| {
-                        ui.label("Network name");
-                        save |= ui.add(egui::TextEdit::singleline(&mut n.ssid).desired_width(200.0).hint_text(if defaults.ssid.is_empty() { crate::network::FALLBACK_SSID } else { defaults.ssid.as_str() })).changed();
-                        ui.end_row();
-                        ui.label("Password");
-                        ui.horizontal(|ui| {
-                            save |= ui.add(egui::TextEdit::singleline(&mut n.password).password(!d.show_password).desired_width(200.0).hint_text("empty = open network")).changed();
-                            ui.checkbox(&mut d.show_password, "show");
+                    ui.add_enabled_ui(n.wifi, |ui| {
+                        ui.label(RichText::new("Emulated Wi-Fi network").small().strong());
+                        egui::Grid::new(("netgrid", i)).num_columns(2).show(ui, |ui| {
+                            ui.label("Network name (SSID)");
+                            save |= ui.add(egui::TextEdit::singleline(&mut n.ssid).desired_width(200.0).hint_text(if defaults.ssid.is_empty() { crate::network::FALLBACK_SSID } else { defaults.ssid.as_str() })).changed();
+                            ui.end_row();
+                            ui.label("Password");
+                            ui.horizontal(|ui| {
+                                save |= ui.add(egui::TextEdit::singleline(&mut n.password).password(!d.show_password).desired_width(200.0).hint_text("empty = open network")).on_hover_text("Optional. Empty: an open network. Stored on this PC only, in this device's device.toml.").changed();
+                                ui.checkbox(&mut d.show_password, "show");
+                            });
+                            ui.end_row();
                         });
-                        ui.end_row();
+                        let any_tip = "The emulated access point answers whatever network name the firmware looks for, so firmware with another name built in joins without changes. The password above still applies (empty = open).";
+                        save |= ui.checkbox(&mut n.accept_any, "Accept any network name").on_hover_text(any_tip).changed();
+                        if n.accept_any && !features.net().wifi_any {
+                            ui.label(RichText::new(format!("Saved for when esp32sim supports it. This engine offers only \"{}\" for now.", n.effective(&defaults).ssid)).small().weak());
+                        }
                     });
-                    ui.label(RichText::new("Use the network name and password built into the firmware (the ones it uses at home). Then the same firmware works unchanged.").small().weak());
                     if let Err(e) = crate::network::validate_wifi(&n.effective(&defaults)) {
                         ui.label(RichText::new(format!("Can't use this: {e}.")).small().color(Color32::from_rgb(230, 120, 90)));
                     }

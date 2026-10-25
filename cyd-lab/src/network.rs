@@ -10,8 +10,12 @@
 
 use serde::{Deserialize, Serialize};
 
-/// SSID used when neither the device nor the app-wide default has one.
+/// SSID used when neither the device nor the app-wide default has one (devices made
+/// before new devices got [`NEW_DEVICE_SSID`]).
 pub const FALLBACK_SSID: &str = "cyd-lab";
+
+/// The emulated network a new device offers when no app-wide default is set.
+pub const NEW_DEVICE_SSID: &str = "esp32sim";
 
 /// Wi-Fi network name and password (app-wide default for new devices).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +67,9 @@ pub struct DeviceNetwork {
     pub ssid: String,
     /// Its password; empty = an open network.
     pub password: String,
+    /// "Accept any network name": the access point answers whatever name the firmware looks
+    /// for (`--wifi ssid=*`, with `psk` when a password is set). Needs an engine with it.
+    pub accept_any: bool,
     /// "Reach from my network": publish on every interface (0.0.0.0) rather than only on
     /// this PC (127.0.0.1).
     pub lan: bool,
@@ -72,14 +79,16 @@ pub struct DeviceNetwork {
 
 impl Default for DeviceNetwork {
     fn default() -> Self {
-        DeviceNetwork { wifi: true, ssid: String::new(), password: String::new(), lan: true, forwards: Vec::new() }
+        DeviceNetwork { wifi: true, ssid: String::new(), password: String::new(), accept_any: false, lan: true, forwards: Vec::new() }
     }
 }
 
 impl DeviceNetwork {
-    /// Settings for a new device: Wi-Fi on with the app-wide details, no ports published.
+    /// Settings for a new device: Wi-Fi on with the app-wide details (else an open
+    /// "esp32sim"), no ports published.
     pub fn for_new_device(defaults: &WifiDetails) -> DeviceNetwork {
-        DeviceNetwork { ssid: defaults.ssid.clone(), password: defaults.password.clone(), ..DeviceNetwork::default() }
+        let (ssid, password) = if defaults.ssid.is_empty() { (NEW_DEVICE_SSID.to_string(), String::new()) } else { (defaults.ssid.clone(), defaults.password.clone()) };
+        DeviceNetwork { ssid, password, ..DeviceNetwork::default() }
     }
 
     /// The SSID/password the access point will offer (device, else app default, else open
@@ -168,6 +177,8 @@ pub fn wifi_spec(w: &WifiDetails) -> Result<String, String> {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NetFeatures {
     pub wifi: bool,
+    /// `--wifi ssid=*` (answer any network name).
+    pub wifi_any: bool,
     pub hostfwd: bool,
     pub mdns_relay: bool,
 }
@@ -185,7 +196,15 @@ pub fn engine_args(net: &DeviceNetwork, defaults: &WifiDetails, f: NetFeatures, 
     }
     let w = net.effective(defaults);
     let spec = match wifi_spec(&w) {
-        Ok(s) => s,
+        Ok(_) if net.accept_any && f.wifi_any => {
+            if w.password.is_empty() { "ssid=*".to_string() } else { format!("ssid=*,psk={}", w.password) }
+        }
+        Ok(s) => {
+            if net.accept_any {
+                notes.push(format!("\"Accept any network name\" needs a newer esp32sim; offering \"{}\" only", w.ssid));
+            }
+            s
+        }
         Err(e) => {
             notes.push(format!("Wi-Fi off: {e}. Fix it in the device's Network section."));
             return (a, notes);
@@ -507,6 +526,7 @@ mod tests {
         let d = WifiDetails::default();
         let mut a = DeviceNetwork::for_new_device(&d);
         assert!(a.wifi && a.lan && a.forwards.is_empty());
+        assert_eq!((a.ssid.as_str(), a.password.as_str(), a.accept_any), ("esp32sim", "", false));
         a.add_preset(&PRESETS[0], &[]);
         let pairs: Vec<(u16, u16)> = a.forwards.iter().map(|f| (f.host, f.guest)).collect();
         assert_eq!(pairs, vec![(6053, 6053), (3232, 3232)]);
@@ -533,7 +553,7 @@ mod tests {
 
     #[test]
     fn engine_command_line() {
-        let all = NetFeatures { wifi: true, hostfwd: true, mdns_relay: true };
+        let all = NetFeatures { wifi: true, wifi_any: false, hostfwd: true, mdns_relay: true };
         let mut n = DeviceNetwork { ssid: "HomeNet".into(), password: "secret123".into(), ..Default::default() };
         let (a, notes) = engine_args(&n, &WifiDetails::default(), all, &|_, _| true);
         assert_eq!(a.join(" "), "--wifi ssid=HomeNet,psk=secret123 --net nat --mdns-relay auto");
@@ -554,6 +574,25 @@ mod tests {
         // a comma can't be passed: Wi-Fi off with the reason
         let (a, notes) = engine_args(&DeviceNetwork { ssid: "a,b".into(), ..n }, &WifiDetails::default(), all, &|_, _| true);
         assert!(a.is_empty() && notes[0].contains("comma"));
+    }
+
+    #[test]
+    fn accept_any_network_name() {
+        let f = NetFeatures { wifi: true, wifi_any: false, hostfwd: false, mdns_relay: false };
+        let mut n = DeviceNetwork { ssid: "esp32sim".into(), accept_any: true, lan: false, ..Default::default() };
+        // An engine without match-any: the named network, with a note.
+        let (a, notes) = engine_args(&n, &WifiDetails::default(), f, &|_, _| true);
+        assert_eq!(a.join(" "), "--wifi ssid=esp32sim --net nat");
+        assert!(notes[0].contains("Accept any network name"));
+        let any = NetFeatures { wifi_any: true, ..f };
+        assert_eq!(engine_args(&n, &WifiDetails::default(), any, &|_, _| true).0.join(" "), "--wifi ssid=* --net nat");
+        n.password = "esp32sim-pass".into();
+        assert_eq!(engine_args(&n, &WifiDetails::default(), any, &|_, _| true).0.join(" "), "--wifi ssid=*,psk=esp32sim-pass --net nat");
+        // Saved in device.toml; older files without the field read as off.
+        let t = toml::to_string(&n).unwrap();
+        assert!(t.contains("accept_any = true"));
+        assert_eq!(toml::from_str::<DeviceNetwork>(&t).unwrap(), n);
+        assert!(!toml::from_str::<DeviceNetwork>("ssid = \"x\"").unwrap().accept_any);
     }
 
     #[test]
