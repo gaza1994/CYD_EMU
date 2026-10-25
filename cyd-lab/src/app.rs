@@ -541,6 +541,13 @@ struct DeviceView {
     wifi_wanted: Option<crate::network::WifiWanted>,
     /// The password typed for that network (its banner's prompt).
     wanted_password: String,
+    /// ESPHome finished an OTA ("Update complete") and the new app is not yet marked valid
+    /// ("Boot seems successful", about a minute after it boots): a restart now rolls it back.
+    ota_trial: Option<Instant>,
+    /// Power off or EN was pressed during that minute.
+    ota_restarted_in_trial: bool,
+    /// The console said "OTA rollback detected" (until dismissed).
+    ota_rolled_back: bool,
     /// BOOT checkbox (latched). The momentary BOOT button ORs into this.
     boot_latched: bool,
     /// GPIO0 level last sent over the live link (BOOT pressed).
@@ -1002,6 +1009,32 @@ fn flash_is_blank(path: &Path) -> bool {
 /// serial bridge, the firmware itself). The ROM's "entry 0x…" means it loaded a bootloader from
 /// flash; "invalid header: 0xffffffff" is the ROM reading erased flash; the engine's
 /// "[emu] flash: wrote …" means flash.bin changed on disk.
+
+/// Shown after ESPHome's "OTA rollback detected".
+const ROLLBACK_HINT: &str = "The new firmware was rolled back because the board restarted within a minute of the update. Install it again and leave it running for over a minute.";
+
+#[derive(Debug, PartialEq)]
+enum OtaClue {
+    /// "[esphome.ota]: Update complete": the new app boots next, on trial.
+    Finished,
+    /// "[safe_mode]: Boot seems successful": the running app is marked good.
+    Accepted,
+    /// "[safe_mode]: OTA rollback detected!": the bootloader went back to the old app.
+    RolledBack,
+}
+
+fn ota_clue(line: &str) -> Option<OtaClue> {
+    if line.contains("ota") && line.contains("Update complete") {
+        Some(OtaClue::Finished)
+    } else if line.contains("Boot seems successful") {
+        Some(OtaClue::Accepted)
+    } else if line.contains("OTA rollback detected") {
+        Some(OtaClue::RolledBack)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum FlashClue {
     Boots,
@@ -1055,6 +1088,9 @@ impl DeviceView {
             console_wrap: true,
             wifi_wanted: None,
             wanted_password: String::new(),
+            ota_trial: None,
+            ota_restarted_in_trial: false,
+            ota_rolled_back: false,
             autoscroll: true,
             boot_latched: false,
             boot_pin_low: false,
@@ -1351,6 +1387,22 @@ impl DeviceView {
             match crate::improv::sniff_setup(&line) {
                 Some(crate::improv::Clue::Improv) => self.improv.capable = true,
                 Some(crate::improv::Clue::Waiting) => self.improv.waiting_log = true,
+                None => {}
+            }
+            match ota_clue(&line) {
+                Some(OtaClue::Finished) => {
+                    self.ota_trial = Some(Instant::now());
+                    self.ota_restarted_in_trial = false;
+                    self.ota_rolled_back = false;
+                }
+                Some(OtaClue::Accepted) => {
+                    self.ota_trial = None;
+                    self.ota_restarted_in_trial = false;
+                }
+                Some(OtaClue::RolledBack) => {
+                    self.ota_trial = None;
+                    self.ota_rolled_back = true;
+                }
                 None => {}
             }
             if let Some(ssid) = crate::hotspot::sniff_ssid(&line) {
@@ -2902,6 +2954,18 @@ impl CydLabApp {
             }
             let boot = ui.add(egui::Button::new("BOOT").sense(Sense::click_and_drag())).on_hover_text("GPIO0 low while held (firmware sees the button). Hold BOOT and click EN, or tick \"BOOT held\" in the ••• menu and press EN / Power, for download mode.");
             boot_button_down = boot.is_pointer_button_down_on();
+            // Expire a trial that never ends (firmware without safe_mode never says it).
+            if d.ota_trial.is_some_and(|t| t.elapsed() > Duration::from_secs(150)) {
+                d.ota_trial = None;
+            }
+            if (power_toggle && running || en) && d.ota_trial.is_some() {
+                d.ota_restarted_in_trial = true;
+            }
+            if d.ota_restarted_in_trial {
+                ui.label(RichText::new("restarted within a minute of the update: ESPHome will roll it back").small().color(Color32::from_rgb(240, 160, 60))).on_hover_text("The new firmware had not been marked good yet (ESPHome does that about a minute after it boots). Install it again and leave it running for over a minute.");
+            } else if d.ota_trial.is_some() && running {
+                ui.label(RichText::new("new firmware on trial: leave it running a minute").small().color(Color32::from_rgb(240, 190, 40))).on_hover_text("ESPHome marks an update good about a minute after it boots (console: \"Boot seems successful\"). Power off or EN before then and the bootloader goes back to the old firmware.");
+            }
             if d.boot_latched {
                 ui.label(RichText::new("BOOT held").small().color(Color32::from_rgb(240, 190, 40))).on_hover_text("Download mode (strap 0x0f) at the next EN or Power on. Untick it in the ••• menu.");
             }
@@ -3099,6 +3163,19 @@ impl CydLabApp {
             }
         }
         // Needs attention: stays out of Details.
+        if self.devices[i].ota_rolled_back {
+            let mut dismiss = false;
+            egui::Frame::new().fill(Color32::from_rgb(90, 60, 10)).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(ROLLBACK_HINT).color(Color32::WHITE));
+                    dismiss = ui.small_button("×").on_hover_text("Hide this").clicked();
+                });
+            });
+            if dismiss {
+                self.devices[i].ota_rolled_back = false;
+            }
+        }
         self.wifi_setup_ui(ui, i, alive, &features, WifiPart::Banner);
         let open = self.devices[i].dev.meta.details_open || open_details;
         let resp = egui::CollapsingHeader::new(RichText::new("Details: serial port, network and ports, Wi-Fi setup").small())
@@ -3918,6 +3995,9 @@ impl CydLabApp {
                 ui.add_enabled_ui(!alive, |ui| {
                     if alive {
                         ui.label(RichText::new("Power off to change these; they apply at the next power-on.").small().weak());
+                        if d.ota_trial.is_some() {
+                            ui.label(RichText::new("Just updated over the air: wait about a minute (console: \"Boot seems successful\") before powering off, or ESPHome rolls the update back.").small().color(Color32::from_rgb(240, 190, 40)));
+                        }
                     }
                     save |= ui.checkbox(&mut n.wifi, "Wi-Fi: offer the chip an access point").on_hover_text("The emulator runs a virtual access point; the firmware joins it as it would join your router. Nothing changes on your real Wi-Fi.").changed();
                     ui.add_enabled_ui(n.wifi, |ui| {
@@ -3934,8 +4014,7 @@ impl CydLabApp {
                             ui.end_row();
                         });
                         // Which name the chip sees, spelled out: an empty field shows the
-                        // fallback only as grey hint text, and older devices say "cyd-lab"
-                        // while new ones say "esp32sim".
+                        // fallback only as grey hint text.
                         let now = n.effective(&defaults);
                         ui.horizontal_wrapped(|ui| {
                             ui.label(RichText::new("Current network:").small());
@@ -3943,11 +4022,11 @@ impl CydLabApp {
                             ui.label(RichText::new(if now.password.is_empty() { "open (no password)" } else { "secured (WPA2)" }).small().weak());
                         });
                         let why = if n.ssid.is_empty() && defaults.ssid.is_empty() {
-                            Some(format!("No name is set for this device, so it gets the built-in \"{}\"; new devices get \"{}\".", crate::network::FALLBACK_SSID, crate::network::NEW_DEVICE_SSID))
+                            Some(format!("No name is set for this device, so it gets the default \"{}\".", crate::network::FALLBACK_SSID))
                         } else if n.ssid.is_empty() {
                             Some("No name is set for this device, so it gets the details new devices get (Settings).".to_string())
-                        } else if n.ssid == crate::network::FALLBACK_SSID && defaults.ssid.is_empty() {
-                            Some(format!("\"{}\" was the name older devices got; new devices get \"{}\".", crate::network::FALLBACK_SSID, crate::network::NEW_DEVICE_SSID))
+                        } else if n.ssid == crate::network::V5_SSID && defaults.ssid.is_empty() {
+                            Some(format!("\"{}\" was the default in cyd-lab v5; the default is now \"{}\", as in the sample YAML and sketches.", crate::network::V5_SSID, crate::network::NEW_DEVICE_SSID))
                         } else {
                             None
                         };
@@ -3955,7 +4034,7 @@ impl CydLabApp {
                         if let Some(why) = why {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new(why).small().weak());
-                                if now.ssid != crate::network::NEW_DEVICE_SSID && ui.small_button(format!("Use \"{}\"", crate::network::NEW_DEVICE_SSID)).on_hover_text("Firmware already set up for the old name will need its Wi-Fi details changed (or tick Accept any network name)").clicked() {
+                                if now.ssid != crate::network::NEW_DEVICE_SSID && ui.small_button(format!("Use \"{}\"", crate::network::NEW_DEVICE_SSID)).on_hover_text("Firmware set up for the old name will need its Wi-Fi details changed (or tick Accept any network name)").clicked() {
                                     n.ssid = crate::network::NEW_DEVICE_SSID.to_string();
                                     n.password.clear();
                                     save = true;
@@ -4329,6 +4408,9 @@ impl CydLabApp {
             egui::Frame::new().fill(Color32::from_rgb(40, 70, 100)).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.label(RichText::new(format!("Wi-Fi changed to \"{}\". Power off and on to apply it.", now.ssid)).color(Color32::WHITE));
+                if d.ota_trial.is_some() {
+                    ui.label(RichText::new("Wait until the console says \"Boot seems successful\" (about a minute after an update) first, or ESPHome rolls the update back.").color(Color32::from_rgb(255, 210, 120)));
+                }
             });
         } else if let Some(w) = wanted {
             // The engine's wifi_wanted: the firmware asked for a network this access point
@@ -4740,6 +4822,15 @@ fn toggle_if(ui: &egui::Ui, id: egui::Id, clicked: bool) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn ota_trial_clues() {
+        assert_eq!(ota_clue("[12:00:01][I][esphome.ota:609]: Update complete"), Some(OtaClue::Finished));
+        assert_eq!(ota_clue("[I][safe_mode:154]: Boot seems successful; resetting boot loop counter"), Some(OtaClue::Accepted));
+        assert_eq!(ota_clue("[W][safe_mode:094]: OTA rollback detected! Rolled back from partition 'app1'"), Some(OtaClue::RolledBack));
+        assert_eq!(ota_clue("[I][app:100]: ESPHome version 2026.10.0"), None);
+    }
+
+
+    #[test]
     fn install_status_follows_the_pipeline() {
         let mut st = InstallUi::default();
         assert!(!st.visible() && !st.active());
@@ -4977,6 +5068,5 @@ fn url_port(url: &str) -> u16 {
 
 /// A free TCP port on 127.0.0.1 (for a forwarded setup page).
 fn free_local_port() -> Option<u16> {
-    std::net::TcpListener::bind(("127.0.0.1", 0)).ok().and_then(|l| l.local_addr().ok()).map(|a| a.port())
-}
+    std::net::TcpListener::bind(("127.0.0.1", 0)).ok().and_then(|l| l.local_addr().ok()).map(|a| a.port())}
 
