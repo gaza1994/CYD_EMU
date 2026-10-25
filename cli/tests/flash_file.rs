@@ -162,10 +162,20 @@ fn a_closed_stderr_does_not_lose_the_flash_file() {
         .args(args(&app, &["--flash-file", flash.to_str().unwrap(), "--max-seconds", "5"]))
         .current_dir(root()).stdout(Stdio::piped()).stderr(Stdio::piped())
         .spawn().unwrap();
-    // Up and running first (the boot line), then the reader goes away.
-    let mut first = String::new();
-    std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stderr.take().unwrap()), &mut first).unwrap();
-    assert!(first.contains("app boot"), "{first}");
+    // Up and running first (the boot line), then the reader goes away. Other lines can come
+    // before it (with ESP32SIM_ROM_DIR set the first is "[emu] ROM loaded from …").
+    let mut seen = String::new();
+    {
+        let mut err = std::io::BufReader::new(child.stderr.take().unwrap());
+        let booted = (0..20).any(|_| {
+            let mut line = String::new();
+            std::io::BufRead::read_line(&mut err, &mut line).unwrap() > 0 && {
+                seen.push_str(&line);
+                line.contains("app boot")
+            }
+        });
+        assert!(booted, "no \"app boot\" in the first 20 stderr lines:\n{seen}");
+    } // stderr closed here
     drop(child.stdout.take());
     std::thread::sleep(std::time::Duration::from_millis(1200));
     let signal = Command::new("kill").args(["-TERM", &child.id().to_string()]).status().unwrap();
