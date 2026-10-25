@@ -413,6 +413,20 @@ impl Entry {
         !self.profiles.iter().any(|p| p == profile) && self.fits(profile)
     }
 
+    /// This entry for a device's board (`cyd-3248s035c`) shown under catalogue profile
+    /// `profile` (`cyd-3248s035`): the catalogue profile's `for_profile` replacements, then
+    /// the board's own on top. Boards sharing one catalogue profile (3248S035C capacitive vs
+    /// 3248S035R resistive) can need different builds.
+    pub fn for_board(&self, board: &str, profile: &str) -> Entry {
+        let e = self.for_profile(profile);
+        let b = board.to_ascii_lowercase();
+        let b = b.strip_prefix("esp32-").map(|s| format!("cyd-{s}")).unwrap_or(b);
+        if b != profile && self.for_profile.contains_key(&b) {
+            return e.for_profile(&b);
+        }
+        e
+    }
+
     /// This entry as it applies to one board: its `for_profile` replacements filled in.
     pub fn for_profile(&self, profile: &str) -> Entry {
         let mut e = self.clone();
@@ -875,6 +889,34 @@ mod tests {
         assert_eq!(usb.view_rotation, None);
         assert!(Entry::template_text(&usb.config).unwrap().contains("rotation: 180"));
         assert_eq!(ha.for_profile("cyd-2432s028r").view_rotation, Some(270));
+    }
+
+    #[test]
+    fn three_point_five_boards_get_their_own_builds() {
+        // One catalogue profile (cyd-3248s035) for the capacitive C and resistive R boards; the
+        // 2.8" builds the catalogue lists never read the 3.5" boards' touch.
+        let c = Catalog::bundled();
+        let get = |id: &str| c.entries.iter().find(|e| e.id == id).unwrap();
+        let cat = c.profile_for("cyd-3248s035c").unwrap().id.clone();
+        assert_eq!(cat, "cyd-3248s035");
+        let url = |e: &Entry| match e.spec().unwrap() {
+            Spec::Parts(p) => match &p[0].from {
+                From::Url { url, .. } => url.clone(),
+                f => panic!("{f:?}"),
+            },
+            Spec::Manifest { url, .. } => url,
+            s => panic!("{s:?}"),
+        };
+        let bruce = get("bruce");
+        assert!(url(&bruce.for_board("cyd-3248s035c", &cat)).ends_with("/Bruce-CYD-3248S035C.bin"));
+        assert!(url(&bruce.for_board("cyd-3248s035r", &cat)).ends_with("/Bruce-CYD-3248S035R.bin"));
+        assert!(url(&bruce.for_board("cyd-2432s028r", "cyd-2432s028r")).ends_with("/Bruce-CYD-2432S028.bin"));
+        let k = get("cyd-klipper");
+        assert!(url(&k.for_board("cyd-3248s035c", &cat)).ends_with("/esp32-3248S035C.json"));
+        let kr = k.for_board("cyd-3248s035r", &cat);
+        assert!(url(&kr).ends_with("/esp32-3248S035C.json"));
+        assert!(kr.notes.contains("no build for the ESP32-3248S035R"));
+        assert!(url(&k.for_board("cyd-2432s028r", "cyd-2432s028r")).ends_with("/esp32-2432S028R.json"));
     }
 
     #[test]

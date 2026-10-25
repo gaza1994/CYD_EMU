@@ -2160,10 +2160,11 @@ impl CydLabApp {
         let board_name = self.profiles.get(&board).map(|p| p.name.clone()).unwrap_or_else(|| board.clone());
         let cat_profile = self.catalog.profile_for(&board).cloned();
         let show_broken = self.devices[i].gallery_broken;
+        let board_id: &str = &board;
         // (heading before this entry, entry), in gallery order.
         let grouped: Vec<(Option<&'static str>, crate::catalog::Entry)> = cat_profile
             .as_ref()
-            .map(|p| self.catalog.grouped(&p.id, show_broken).into_iter().flat_map(|(h, v)| v.into_iter().enumerate().map(move |(k, e)| ((k == 0).then_some(h), e.for_profile(&p.id)))).collect())
+            .map(|p| self.catalog.grouped(&p.id, show_broken).into_iter().flat_map(|(h, v)| v.into_iter().enumerate().map(move |(k, e)| ((k == 0).then_some(h), e.for_board(board_id, &p.id)))).collect())
             .unwrap_or_default();
         let headings: Vec<Option<&'static str>> = grouped.iter().map(|(h, _)| *h).collect();
         let entries: Vec<crate::catalog::Entry> = grouped.into_iter().map(|(_, e)| e).collect();

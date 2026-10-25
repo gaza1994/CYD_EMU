@@ -84,6 +84,33 @@ group = "home-assistant"
 id = "bruce"
 group = "tools"
 first_setup = { note = "Wi-Fi is set from its own on-screen menu" }
+# The catalogue's single asset is the 2.8" 2432S028 build (XPT2046 resistive touch on SPI
+# 25/32/39/33, backlight 21). On a 3.5" board it draws but never reads touch (the 3248S035C
+# has a GT911 on I2C 33/32 and its backlight on 27), so the 3.5" boards get their own builds.
+[overrides.for_profile.cyd-3248s035]
+notes = "Bruce's own build for the ESP32-3248S035C (3.5\" capacitive, GT911 touch). Merged factory image @0."
+emulator_notes = "Checked in the emulator on cyd-3248s035c: boots to the PREV / SEL / NEXT menu (landscape); taps on the GT911 move through it. The screen dims after a while; a tap wakes it."
+[overrides.for_profile.cyd-3248s035.source]
+type = "github-release"
+repo = "BruceDevices/firmware"
+tag = "1.16.1"
+asset = "Bruce-CYD-3248S035C.bin"
+offset = 0
+sha256 = "8f612cd59340ea9047517d73e9e6e18240fb8c7710357b8e56310fc74647c034"
+size = 3652368
+cdn = "https://dl.bruce.computer/1.16.1/Bruce-CYD-3248S035C.bin"
+[overrides.for_profile.cyd-3248s035r]
+notes = "Bruce's own build for the ESP32-3248S035R (3.5\" resistive, XPT2046 touch). Merged factory image @0."
+emulator_notes = "Bruce's 3248S035R build."
+[overrides.for_profile.cyd-3248s035r.source]
+type = "github-release"
+repo = "BruceDevices/firmware"
+tag = "1.16.1"
+asset = "Bruce-CYD-3248S035R.bin"
+offset = 0
+sha256 = "cb8fb324a48e043e553677e3618f2bf6748912aacf4baab730c5b6413c158d80"
+size = 3652992
+cdn = "https://dl.bruce.computer/1.16.1/Bruce-CYD-3248S035R.bin"
 
 [[overrides]]
 id = "marauder"
@@ -99,6 +126,24 @@ first_setup = { hotspot = "NerdMinerAP", password = "MineYourCoins", page = "htt
 id = "cyd-klipper"
 group = "tools"
 first_setup = { note = "Wi-Fi is set on its own touch screen (network list + keyboard) after calibration" }
+# The catalogue's manifest is the 2432S028R build (resistive touch, 2.8" layout): on a 3.5"
+# board it never reads touch. CYD-Klipper publishes a 3248S035C build (GT911); there is no
+# 3248S035R build.
+[overrides.for_profile.cyd-3248s035]
+notes = "CYD-Klipper's own build for the ESP32-3248S035C (3.5\" capacitive, GT911). No calibration step on the capacitive board."
+emulator_notes = "Checked in the emulator on cyd-3248s035c: boots to 'Select a network' (landscape); a tap on Skip opens 'Choose printer type'."
+[overrides.for_profile.cyd-3248s035.source]
+type = "manifest"
+url = "https://suchmememanyskill.github.io/CYD-Klipper/esp32-3248S035C.json"
+parts_verified = [
+  { path = "out/esp32-3248S035C/bootloader.bin", offset = 4096, sha256 = "095bbcc7357184f68144ab40b152e2f6d68fc9d07f642c17c7888c533ddc67d3", size = 17536 },
+  { path = "out/esp32-3248S035C/partitions.bin", offset = 32768, sha256 = "148b959cbff1c38aa8e1d5c0ba9d612c54997b945e56a63f41223eef650653a1", size = 3072 },
+  { path = "out/esp32-3248S035C/boot_app0.bin", offset = 57344, sha256 = "f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0", size = 8192 },
+  { path = "out/esp32-3248S035C/firmware.bin", offset = 65536, sha256 = "0c7534031d70d76de55119024b392f3e99a2ca5e12be0d15ac4205ccb2450638", size = 1283648 },
+]
+[overrides.for_profile.cyd-3248s035r]
+notes = "CYD-Klipper has no build for the ESP32-3248S035R (resistive). This is its 3248S035C (capacitive GT911) build: it draws on the R board but touch will not work there."
+emulator_notes = "Made for the 3248S035C: no touch on the resistive R board."
 
 [[overrides]]
 id = "wled"
