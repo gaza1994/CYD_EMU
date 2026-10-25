@@ -3912,10 +3912,15 @@ impl CydLabApp {
                 .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR | egui::scroll_area::ScrollSource::MOUSE_WHEEL)
                 .stick_to_bottom(d.autoscroll && !held);
             if jump_to_end {
-                area = area.vertical_scroll_offset(f32::MAX);
+                // Past the end (the area clamps it). Not f32::MAX: show_rows turns the offset
+                // into a row number, which saturates to usize::MAX.
+                area = area.vertical_scroll_offset((d.console.len() as f32 + 2.0) * (row_h + ui.spacing().item_spacing.y));
             }
             let first = d.console_dropped;
-            area.show_rows(ui, row_h, d.console.len(), |ui, range| {
+            let total = d.console.len();
+            area.show_rows(ui, row_h, total, |ui, range| {
+                // Clamped: the range egui derives from the offset can run past the rows.
+                let range = range.start.min(total)..range.end.min(total);
                 for (k, (s, line)) in d.console.range(range.clone()).enumerate() {
                     let color = match s {
                         Stream::Stdout => Color32::from_gray(220),
