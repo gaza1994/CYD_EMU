@@ -616,6 +616,13 @@ struct DeviceView {
     hotspot_open_at: Option<Instant>,
     /// The "Device hotspot" form: network name, password, page address.
     hotspot_form: (String, String, String),
+    /// The tag window that is open (Firmware, Wi-Fi, Ports, Serial, Hotspot): a small floating
+    /// window beside the screen, closed only by its × or Escape.
+    tag_win: Option<TagWin>,
+    /// The tag window was opened this frame: place it beside the screen.
+    tag_win_new: bool,
+    /// Where the docked screen was last drawn (with its bezel), so tag windows stay off it.
+    screen_rect: Option<Rect>,
     /// The live device-hotspot session over the control channel.
     ap: ApUi,
     install: InstallUi,
@@ -1003,6 +1010,63 @@ struct FwActions {
     pick_bin: bool,
     web_install: bool,
     import: bool,
+    /// Close the firmware window (an install was started from it).
+    close: bool,
+}
+
+/// The status tags' windows (see `DeviceView::tag_win`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+enum TagWin {
+    Firmware,
+    Wifi,
+    Ports,
+    Serial,
+    Hotspot,
+}
+
+impl TagWin {
+    fn title(self) -> &'static str {
+        match self {
+            TagWin::Firmware => "Firmware",
+            TagWin::Wifi => "Wi-Fi",
+            TagWin::Ports => "Ports and Home Assistant",
+            TagWin::Serial => "Serial port",
+            TagWin::Hotspot => "Device hotspot",
+        }
+    }
+
+    fn width(self) -> f32 {
+        match self {
+            TagWin::Hotspot => 440.0,
+            TagWin::Wifi => 500.0,
+            _ => 540.0,
+        }
+    }
+}
+
+/// Where a tag window opens: to the right of the screen (over the console) when there is
+/// room, else below it, never over it. Returns (top-left, width, max height).
+fn tag_window_place(content: Rect, screen: Option<Rect>, want: f32) -> (Pos2, f32, f32) {
+    const GAP: f32 = 10.0;
+    const MIN_W: f32 = 300.0;
+    // The title bar and frame, outside the max height egui applies to the contents.
+    const TITLE: f32 = 30.0;
+    let Some(sr) = screen else {
+        let w = want.min(content.width() * 0.5);
+        let pos = egui::pos2(content.right() - w - GAP - 16.0, content.top() + 90.0);
+        return (pos, w, content.bottom() - pos.y - GAP - TITLE);
+    };
+    // Window frame and margins add about 16 points to the content width.
+    let right = content.right() - sr.right() - 2.0 * GAP - 16.0;
+    if right >= MIN_W {
+        let w = want.min(right);
+        let pos = egui::pos2(sr.right() + GAP, sr.top());
+        return (pos, w, content.bottom() - pos.y - GAP - TITLE);
+    }
+    let below = content.bottom() - sr.bottom() - 2.0 * GAP;
+    let pos = egui::pos2(content.left() + GAP, sr.bottom() + GAP + 30.0);
+    let w = want.min(content.width() - 2.0 * GAP - 16.0);
+    (pos, w, (below - 30.0 - TITLE).max(120.0))
 }
 
 /// Which half of the network settings to draw: the Wi-Fi tag's popover or the ports one.
@@ -1032,7 +1096,7 @@ enum Tone {
 }
 
 /// A compact status chip: neutral unless something needs attention.
-fn chip(ui: &mut egui::Ui, text: impl Into<String>, tone: Tone, tip: impl Into<egui::WidgetText>) -> egui::Response {
+fn chip(ui: &mut egui::Ui, text: impl Into<String>, tone: Tone, tip: impl Into<egui::WidgetText>, selected: bool) -> egui::Response {
     let mut t = RichText::new(text.into()).small();
     let fill = match tone {
         Tone::Plain | Tone::Good => ui.visuals().widgets.inactive.weak_bg_fill,
@@ -1044,7 +1108,12 @@ fn chip(ui: &mut egui::Ui, text: impl Into<String>, tone: Tone, tip: impl Into<e
         Tone::Warn | Tone::Bad => t.color(Color32::WHITE),
         Tone::Plain | Tone::Good => t,
     };
-    ui.add(egui::Button::new(t).fill(fill).corner_radius(9.0)).on_hover_text(tip)
+    let mut b = egui::Button::new(t).fill(fill).corner_radius(9.0).selected(selected);
+    if selected {
+        // Its window is open.
+        b = b.stroke(Stroke::new(1.5, ui.visuals().selection.stroke.color));
+    }
+    ui.add(b).on_hover_text(tip)
 }
 
 fn flash_is_blank(path: &Path) -> bool {
@@ -1188,6 +1257,9 @@ impl DeviceView {
             api_clients: Default::default(),
             ha_action_refused: false,
             guide_all_set: None,
+            tag_win: None,
+            tag_win_new: false,
+            screen_rect: None,
             guide_reopened: false,
             guide_wifi_seen: false,
             guide_needs_user: false,
@@ -3112,7 +3184,7 @@ impl CydLabApp {
 
         // --- line 2: firmware, Wi-Fi, Home Assistant, serial (and a hotspot) as tags; click
         // one for its settings
-        let FwActions { pick_bin, web_install, import } = self.status_tags(ui, i, alive, &features);
+        let FwActions { pick_bin, web_install, import, .. } = self.status_tags(ui, i, alive, &features);
         let mut reopen = false;
         let mut retry_web = false;
         if self.devices[i].install.visible() {
@@ -3401,18 +3473,70 @@ impl CydLabApp {
         let wanted_pw = wanted.as_ref().is_some_and(|w| w.needs_password());
 
         self.devices[i].ap.panel_open = false;
-        let popup = |r: &egui::Response| egui::Popup::from_toggle_button_response(r).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
-        let mut status = None;
+        let open_now = self.devices[i].tag_win;
+        let mut clicked = None;
         ui.horizontal_wrapped(|ui| {
-            let r = chip(ui, fw_text, fw_tone, fw_tip);
-            popup(&r).show(|ui| {
-                ui.set_max_width(560.0);
-                self.firmware_popover(ui, i, busy, &fw_full, &mut act);
-            });
-
-            let r = chip(ui, wifi_text, wifi_tone, wifi_tip);
-            popup(&r).show(|ui| {
-                ui.set_max_width(520.0);
+            let mut tag = |ui: &mut egui::Ui, which: TagWin, text: String, tone: Tone, tip: String| {
+                if chip(ui, text, tone, tip, open_now == Some(which)).clicked() {
+                    clicked = Some(which);
+                }
+            };
+            tag(ui, TagWin::Firmware, fw_text, fw_tone, fw_tip);
+            tag(ui, TagWin::Wifi, wifi_text, wifi_tone, wifi_tip);
+            if let Some((text, tone)) = ha_tag.clone() {
+                tag(ui, TagWin::Ports, text, tone, ha_tip);
+            }
+            if let Some((text, tip)) = serial.clone() {
+                tag(ui, TagWin::Serial, text, Tone::Plain, tip);
+            }
+            if let Some(text) = hotspot.clone() {
+                tag(ui, TagWin::Hotspot, text, Tone::Plain, "The firmware's own Wi-Fi hotspot (setup mode). Click to join it and open its setup page.".to_string());
+            }
+        });
+        {
+            let d = &mut self.devices[i];
+            if let Some(w) = clicked {
+                // A tag toggles its window; another tag swaps it.
+                if d.tag_win == Some(w) {
+                    d.tag_win = None;
+                } else {
+                    d.tag_win = Some(w);
+                    d.tag_win_new = true;
+                }
+            }
+            // A tag that went away (no hotspot any more, Wi-Fi turned off) takes its window along.
+            let shown = match d.tag_win {
+                Some(TagWin::Ports) => ha_tag.is_some(),
+                Some(TagWin::Serial) => serial.is_some(),
+                Some(TagWin::Hotspot) => hotspot.is_some(),
+                _ => true,
+            };
+            if !shown {
+                d.tag_win = None;
+            }
+        }
+        let Some(which) = self.devices[i].tag_win else {
+            return act;
+        };
+        let ctx = ui.ctx().clone();
+        let mut status = None;
+        let mut open = true;
+        let d = &mut self.devices[i];
+        let mut win = egui::Window::new(format!("{} – {}", which.title(), d.dev.meta.name))
+            .id(egui::Id::unique(("tag-win", d.dev.id.clone())))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .vscroll(true);
+        let content = ctx.content_rect();
+        let (pos, width, max_h) = tag_window_place(content, d.screen_rect, which.width());
+        win = win.min_width(width.min(300.0)).max_width(width).max_height(max_h);
+        if std::mem::take(&mut d.tag_win_new) {
+            win = win.current_pos(pos);
+        }
+        win.show(&ctx, |ui| match which {
+            TagWin::Firmware => self.firmware_popover(ui, i, busy, &fw_full, &mut act),
+            TagWin::Wifi => {
                 if let Some(ssid) = &wanted_ssid {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(format!("The firmware looks for \"{ssid}\"."));
@@ -3428,52 +3552,38 @@ impl CydLabApp {
                 self.network_ui(ui, i, alive, features, NetPart::Wifi);
                 ui.separator();
                 self.wifi_setup_ui(ui, i, alive, features, WifiPart::Setup);
-            });
-
-            if let Some((text, tone)) = ha_tag {
-                let r = chip(ui, text, tone, ha_tip);
-                popup(&r).show(|ui| {
-                    ui.set_max_width(560.0);
-                    if let Some(addr) = &ha_addr {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("Home Assistant (ESPHome integration):");
-                            ui.label(RichText::new(addr).monospace().strong());
-                            if ui.small_button("Copy").clicked() {
-                                ui.ctx().copy_text(addr.clone());
-                                status = Some(format!("Copied {addr}"));
-                            }
-                        });
-                        if let Some(h) = &ha_client {
-                            ui.label(RichText::new(format!("Connected: {h}")).small());
+            }
+            TagWin::Ports => {
+                if let Some(addr) = &ha_addr {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Home Assistant (ESPHome integration):");
+                        ui.label(RichText::new(addr).monospace().strong());
+                        if ui.small_button("Copy").clicked() {
+                            ui.ctx().copy_text(addr.clone());
+                            status = Some(format!("Copied {addr}"));
                         }
-                        let actions_tip = "Buttons that call Home Assistant actions need \"Allow the device to perform Home Assistant actions\" (Home Assistant: Settings > Devices & services > ESPHome > the device > Configure).";
-                        if self.devices[i].ha_action_refused {
-                            ui.label(RichText::new(format!("Home Assistant refused an action from this device. {actions_tip}")).small().color(Color32::from_rgb(240, 190, 90)));
-                        } else {
-                            ui.label(RichText::new(format!("Tip: {actions_tip}")).small().weak());
-                        }
-                        ui.separator();
+                    });
+                    if let Some(h) = &ha_client {
+                        ui.label(RichText::new(format!("Connected: {h}")).small());
                     }
-                    self.network_ui(ui, i, alive, features, NetPart::Ports);
-                });
+                    let actions_tip = "Buttons that call Home Assistant actions need \"Allow the device to perform Home Assistant actions\" (Home Assistant: Settings > Devices & services > ESPHome > the device > Configure).";
+                    if self.devices[i].ha_action_refused {
+                        ui.label(RichText::new(format!("Home Assistant refused an action from this device. {actions_tip}")).small().color(Color32::from_rgb(240, 190, 90)));
+                    } else {
+                        ui.label(RichText::new(format!("Tip: {actions_tip}")).small().weak());
+                    }
+                    ui.separator();
+                }
+                self.network_ui(ui, i, alive, features, NetPart::Ports);
             }
-
-            if let Some((text, tip)) = serial {
-                let r = chip(ui, text, Tone::Plain, tip);
-                popup(&r).show(|ui| {
-                    ui.set_max_width(560.0);
-                    self.serial_bridge_ui(ui, i, alive, features);
-                });
-            }
-
-            if let Some(text) = hotspot {
-                let r = chip(ui, text, Tone::Plain, "The firmware's own Wi-Fi hotspot (setup mode). Click to join it and open its setup page.");
-                popup(&r).show(|ui| {
-                    ui.set_max_width(560.0);
-                    self.wifi_setup_ui(ui, i, alive, features, WifiPart::Hotspot);
-                });
-            }
+            TagWin::Serial => self.serial_bridge_ui(ui, i, alive, features),
+            TagWin::Hotspot => self.wifi_setup_ui(ui, i, alive, features, WifiPart::Hotspot),
         });
+        // Only its × or Escape close it: clicks on the screen or the console leave it open.
+        let escape = ctx.input(|inp| inp.key_pressed(egui::Key::Escape));
+        if !open || escape || std::mem::take(&mut act.close) {
+            self.devices[i].tag_win = None;
+        }
         if let Some(m) = status {
             self.status = m;
         }
@@ -3496,11 +3606,11 @@ impl CydLabApp {
             ui.add_enabled_ui(!busy, |ui| {
                 if ui.button(RichText::new("Install firmware…").strong()).on_hover_text("Ready-made firmware for this board, downloaded and checked (SHA-256)").clicked() {
                     d.gallery_open = true;
-                    ui.close();
+                    act.close = true;
                 }
                 if ui.button("Flash a .bin…").on_hover_text("Pick a firmware .bin. Merged/factory images go to 0x0, app images into the app partition; you are asked only when it is unclear. A running device is powered off, written and powered on again.").clicked() {
                     act.pick_bin = true;
-                    ui.close();
+                    act.close = true;
                 }
             });
             ui.label(RichText::new("(or drop a .bin on the window)").small().weak());
@@ -3518,7 +3628,7 @@ impl CydLabApp {
                 ui.checkbox(&mut d.web_erase, "erase first").on_hover_text("Used when the manifest leaves erasing to the user (new_install_prompt_erase). Otherwise a new install always erases, as ESP Web Tools does.");
                 if ui.add_enabled(!d.web_manifest.trim().is_empty(), egui::Button::new("Install")).clicked() {
                     act.web_install = true;
-                    ui.close();
+                    act.close = true;
                 }
             });
         });
@@ -3535,7 +3645,7 @@ impl CydLabApp {
             }
             if ui.add_enabled(!busy, egui::Button::new("Write")).clicked() {
                 act.import = true;
-                ui.close();
+                act.close = true;
             }
         });
     }
@@ -4418,6 +4528,7 @@ impl CydLabApp {
             ui.label(RichText::new("Blank flash: press Install firmware…, or drop a .bin on the window").color(Color32::from_rgb(240, 190, 40)));
         }
         if d.dev.meta.screen_window.popped {
+            d.screen_rect = None;
             ui.label(RichText::new("The screen is in its own window.").weak());
             d.screen_strip(ui, powered, running, live_link, 0);
         } else {
@@ -4427,7 +4538,7 @@ impl CydLabApp {
             let avail = Vec2::new(ui.available_width().min(ui.ctx().content_rect().width() * 0.55), ui.available_height() - strip);
             let fit = fit_zoom(avail, (vw, vh), ppp);
             let zoom = if d.main_zoom == 0 { fit } else { d.main_zoom as u32 };
-            d.screen_view(ui, panel, zoom, powered);
+            d.screen_rect = Some(ui.scope(|ui| d.screen_view(ui, panel, zoom, powered)).response.rect);
             d.screen_strip(ui, powered, running, live_link, zoom);
         }
         if pop || dock {
@@ -5200,6 +5311,27 @@ mod tests {
             lock();
             assert!(crate::device::remove_dir_retrying(&dir, std::time::Duration::from_millis(300)).is_err());
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    #[test]
+    fn tag_windows_never_cover_the_screen() {
+        // 1400x900 and 960x700 windows, screen at Fit (as drawn by screen_ui), and a screen
+        // that fills the width (zoomed): right of it, else below it.
+        let cases = [
+            (Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0)), Rect::from_min_max(Pos2::new(190.0, 170.0), Pos2::new(752.0, 592.0))),
+            (Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 700.0)), Rect::from_min_max(Pos2::new(190.0, 170.0), Pos2::new(512.0, 412.0))),
+            (Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 700.0)), Rect::from_min_max(Pos2::new(190.0, 170.0), Pos2::new(830.0, 412.0))),
+        ];
+        for (content, screen) in cases {
+            for w in [TagWin::Firmware, TagWin::Wifi, TagWin::Ports, TagWin::Serial, TagWin::Hotspot] {
+                let (pos, width, max_h) = tag_window_place(content, Some(screen), w.width());
+                // The frame adds ~16 points around the content; the title bar ~24.
+                let win = Rect::from_min_size(pos, Vec2::new(width + 16.0, max_h.min(400.0) + 24.0));
+                assert!(!win.intersects(screen), "{w:?} {win:?} covers the screen {screen:?}");
+                assert!(content.contains_rect(win), "{w:?} {win:?} leaves the window {content:?}");
+                assert!(width >= 300.0);
+            }
         }
     }
 
