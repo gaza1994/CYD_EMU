@@ -31,3 +31,17 @@ web/vendor/
 examples/hello_world-classic/.pio/
 examples/hello_world-classic/sdkconfig*
 !examples/hello_world-classic/sdkconfig.defaults
+
+# --- CYD_EMU monorepo ---
+# release zips and scratch output (the zips are built by .github/workflows/release.yml)
+/release/
+/cyd-lab/release/
+*.zip
+.dbg/
+scratch/
+# mask ROM ELFs fetched by tools/fetch-rom-elfs.sh (Apache-2.0, downloaded, not committed)
+/roms/
+# cyd-lab's own build tree and ESPHome cache (target/ above already matches it)
+/cyd-lab/firmware/esphome-ha/.esphome/
+# the root ignores *.png; cyd-lab's documentation screenshots and assets are committed
+!/cyd-lab/**/*.png

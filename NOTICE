@@ -1,0 +1,28 @@
+CYD_EMU
+=======
+
+CYD_EMU is a fork of esp32sim, https://github.com/mikroverk/esp32sim, an ESP32 emulator by
+Joakim Eriksson (@joakimeriksson), Alice (@aliceisjustplaying) and Mattia Fiumara (@mfiumara)
+and its contributors. It is maintained separately and is not affiliated with, or endorsed by,
+the esp32sim authors or Espressif Systems.
+
+- The repository root is esp32sim with this fork's changes (branch cyd-2432s028r upstream of
+  this repository): the Cheap Yellow Display boards and the features cyd-lab uses. Its full
+  history, including all upstream commits and authors, is kept. It is licensed under the MIT
+  licence in LICENSE, copyright (c) 2026 the esp32sim authors named there.
+- cyd-lab/ is the desktop workbench by Gareth Johnstone, licensed under the MIT licence in
+  cyd-lab/LICENSE, copyright (c) 2026 Gareth Johnstone.
+- esp32sim's original README is the second part of README.md, below CYD_EMU's section.
+
+Third-party code, data and firmware keep their own licences. esp32sim's list is at the end of
+README.md; cyd-lab's (firmware catalogue, ESPHome images and the crates in the
+Windows build) is cyd-lab/packaging/NOTICE.txt, which the release zip ships in LICENSES/ together
+with generated third-party crate lists.
+
+The two ESPHome example images in cyd-lab/assets/firmware/ (esphome-ha-cyd-2432s028r*.factory.bin,
+built into cyd-lab.exe) are GPL-3.0 binaries: they contain ESPHome's runtime
+(https://github.com/esphome/esphome, 2026.10.0, GPL-3.0) together with ESP-IDF (Apache-2.0) and
+LVGL (MIT). Their corresponding source is ESPHome 2026.10.0 plus the configs in
+cyd-lab/firmware/esphome-ha/ (MIT); cyd-lab/tools/build_esphome_ha.py rebuilds them. The GPL-3.0
+applies to those images only, not to the rest of this repository. Mask ROM ELFs (espressif/esp-rom-elfs,
+Apache-2.0) are downloaded at first run or by tools/fetch-rom-elfs.sh, never committed.

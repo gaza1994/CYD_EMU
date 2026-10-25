@@ -1,3 +1,75 @@
+# CYD_EMU
+
+> **This repository is a fork of [esp32sim](https://github.com/mikroverk/esp32sim)**, the ESP32
+> emulator in Rust by Joakim Eriksson, Alice and Mattia Fiumara and its contributors. All the
+> credit for the emulator itself goes to them. esp32sim's own README is kept, unchanged, below the
+> divider further down this page.
+
+The fork has a slightly different purpose from upstream. It turns esp32sim into a **Windows
+desktop emulator for Cheap Yellow Display boards** (Sunton ESP32-2432S028R and its relatives), so
+you can run and test real, unmodified firmware such as ESPHome, Arduino sketches, Bruce, openHASP
+or NerdMiner without the hardware. Everything happens over local network ports on 127.0.0.1:
+serial, flashing, Wi-Fi and Home Assistant. There's no USB or COM-port driver to install.
+
+## What the fork adds to esp32sim
+
+- **CYD board profiles**: the ESP32-2432S028R (original micro-USB and two-USB versions),
+  2432S024R/C, 2432S032R/C and 3248S035R/C, with their ILI9341, ST7789 or ST7796 panels and
+  backlight pins.
+- **Touch panels**: the XPT2046 resistive controller, plus the CST816S and GT911 capacitive ones.
+- **Live Wi-Fi**: change the emulated access point's name, password or "accept any network" while
+  the firmware runs. The station is disconnected and rejoins, with no power cycle.
+- **Device hotspots**: when the firmware opens its own access point (a setup portal, for
+  example), the engine reports it, and a virtual phone can join it.
+- **RFC 2217 serial**: UART0 on a TCP port, so esptool, PlatformIO, the Arduino IDE and ESPHome can
+  flash and monitor it at `rfc2217://127.0.0.1:PORT`. The ROM download mode and autobaud work as
+  they do on the chip.
+- **Port forwarding**: `--hostfwd` publishes guest ports (the ESPHome API on 6053, OTA, web
+  servers) on the PC, so Home Assistant can adopt an emulated device.
+- **A persistent flash file**, so what the firmware writes survives a restart, plus the small
+  engine fixes these boards needed.
+
+## cyd-lab
+
+[`cyd-lab/`](cyd-lab/) is the desktop app on top of the engine. It's a workbench of emulated CYDs,
+each with its own flash, power switch, EN and BOOT buttons, serial console and touch screen. It
+has a firmware gallery, Wi-Fi and Home Assistant setup, and an Arduino board package.
+
+**Quick start on Windows**
+
+1. Download `cyd-lab-windows-x64.zip` from the [Releases](../../releases) page.
+2. Unzip it anywhere and run `cyd-lab\cyd-lab.exe`. There's no installer and no admin rights are
+   needed. The exe isn't signed, so if SmartScreen asks, choose **More info > Run anyway**.
+3. Click **+ New device**, pick ESP32-2432S028R, then **Power on** and **Install firmware…**.
+
+The full guide is [cyd-lab/README.md](cyd-lab/README.md).
+
+## Repository layout, releases and licences
+
+- **Layout**: the repository root is the esp32sim fork, a Cargo workspace (`cli/` is the
+  `esp32sim` program, plus the chip, peripheral and CPU crates, `docs/` and `tools/`), with its
+  full upstream history. `cyd-lab/` is cyd-lab, its own Cargo workspace, with its own history.
+  Build the engine with `cargo build --release -p esp32sim`, and cyd-lab with `cargo run --release`
+  in `cyd-lab/`.
+- **Releases**: GitHub Actions (`.github/workflows/release.yml`) builds the Windows zip when a
+  `v*` tag is pushed and attaches it to that tag's release. CYD_EMU's releases start at v1.0.0;
+  esp32sim's own v0.x tags belong to upstream.
+- **Licences**: esp32sim is MIT ([LICENSE](LICENSE)) and cyd-lab is MIT
+  ([cyd-lab/LICENSE](cyd-lab/LICENSE), Gareth Johnstone). The two bundled ESPHome example images
+  are GPL-3.0 binaries. That licence covers those images only. See [NOTICE](NOTICE) for these and
+  the other third-party licences.
+
+This fork is maintained separately by Gareth Johnstone. It isn't intended to be merged upstream,
+and it isn't affiliated with or endorsed by the esp32sim authors, Espressif Systems or Sunton.
+
+---
+
+## Original esp32sim README
+
+*Everything below this line is esp32sim's README as published upstream, unchanged.*
+
+---
+
 <p align="center">
   <img src="docs/assets/esp32sim-logo-icon.png" alt="esp32sim logo: a smiling chip in an emulator window" width="240">
 </p>
