@@ -392,3 +392,180 @@ fn a_nearby_network_answers_only_probes_addressed_to_it() {
         assert_eq!(ap.queue.len(), usize::from(answers), "a1 {a1:02x?} a3 {a3:02x?}");
     }
 }
+
+const STA: [u8; 6] = [2, 3, 4, 5, 6, 7];
+
+/// A frame from the station to `bssid` (as receiver and BSSID).
+fn to(bssid: [u8; 6], fc: u16, payload: &[u8]) -> Vec<u8> {
+    let mut f = station_frame(fc, payload);
+    f[4..10].copy_from_slice(&bssid);
+    f[16..22].copy_from_slice(&bssid);
+    f
+}
+
+fn ssid_element(s: &[u8]) -> Vec<u8> { [&[0, s.len() as u8][..], s].concat() }
+
+/// The SSID element of a probe response or beacon.
+fn ssid_of(r: &[u8]) -> Vec<u8> { ies(r, 36).into_iter().find(|(id, _)| *id == 0).map(|(_, d)| d.to_vec()).unwrap() }
+
+/// A station joins `bssid` as IDF's does: open-system authentication, association and, with
+/// `psk`, the four-way handshake with its own PMK and real MICs, checking the access point's
+/// message 3 MIC, so both ends must agree on the PMK for `ssid`. Returns the authentication status.
+fn join(ap: &mut VirtualAp, bssid: [u8; 6], ssid: &[u8], psk: Option<&str>) -> u16 {
+    ap.queue.clear();
+    ap.on_station_tx(&to(bssid, 11 << 4, &[0, 0, 1, 0, 0, 0]), 0);
+    let auth = &ap.queue[0].frame;
+    assert_eq!((&auth[10..16], &auth[16..22]), (&bssid[..], &bssid[..]), "the response comes from the BSSID asked");
+    let status = u16::from_le_bytes([auth[28], auth[29]]);
+    if status != 0 { return status; }
+    ap.on_station_tx(&to(bssid, 0, &[0x11, 0, 0, 0]), 0);
+    assert_eq!(ap.state, StaState::Associated);
+    assert_eq!(&ap.queue[1].frame[10..16], &bssid[..]);
+    let Some(psk) = psk else {
+        assert_eq!(ap.queue.len(), 2, "open: no EAPOL message 1");
+        assert_eq!(u16::from_le_bytes([ap.queue[1].frame[24], ap.queue[1].frame[25]]) & 0x10, 0, "open: no Privacy");
+        return 0;
+    };
+    let m1 = ap.queue.last().unwrap().frame[32..].to_vec();
+    assert_eq!(&m1[5..7], &0x008au16.to_be_bytes());
+    let anonce: [u8; 32] = m1[17..49].try_into().unwrap();
+    let snonce = [0x5a; 32];
+    let (lo_mac, hi_mac) = if bssid <= STA { (bssid, STA) } else { (STA, bssid) };
+    let (lo_n, hi_n) = if anonce <= snonce { (anonce, snonce) } else { (snonce, anonce) };
+    let ptk = esp_periph::crypto::prf(&pmk(psk, ssid), "Pairwise key expansion", &[&lo_mac[..], &hi_mac, &lo_n, &hi_n].concat(), 384);
+    let eapol_to = |ap: &mut VirtualAp, body: Vec<u8>| { ap.queue.clear(); ap.on_station_tx(&to(bssid, 0x0108, &[&[0xaa, 0xaa, 3, 0, 0, 0, 0x88, 0x8e][..], &body].concat()), 0); };
+    let replay = u64::from_be_bytes(m1[9..17].try_into().unwrap());
+    eapol_to(ap, eapol_key(0x010a, replay, snonce, RSN_IE, Some(&ptk[..16])));
+    assert_eq!(ap.wpa.state, WpaState::AwaitingMessage4);
+    let mut m3 = ap.queue.last().unwrap().frame[32..].to_vec();
+    let recv = m3[81..97].to_vec();
+    m3[81..97].fill(0);
+    assert_eq!(&esp_periph::crypto::hmac_sha1(&ptk[..16], &m3)[..16], &recv[..], "message 3's MIC: the access point's PMK is the station's");
+    eapol_to(ap, eapol_key(0x030a, u64::from_be_bytes(m3[9..17].try_into().unwrap()), [0; 32], &[], Some(&ptk[..16])));
+    assert_eq!(ap.wpa.state, WpaState::Installed);
+    0
+}
+
+#[test]
+fn any_ssid_and_passphrase_join_with_the_handshake() {
+    for (spec, ssid, psk) in [
+        (r"ssid=My Home Wi-Fi\, 2.4 GHz,psk=correct horse battery staple", "My Home Wi-Fi, 2.4 GHz", "correct horse battery staple"),
+        ("ssid=Café ☕ Wi-Fi 🛜,psk=pässwörd über", "Café ☕ Wi-Fi 🛜", "pässwörd über"),
+        (r"ssid=back\\slash=x,psk=a\,b\\c d e f", r"back\slash=x", r"a,b\c d e f"),
+        ("ssid=0123456789abcdef0123456789abcdef,psk=12345678", "0123456789abcdef0123456789abcdef", "12345678"),
+        ("ssid=raw,psk=00112233445566778899aabbccddeeff00112233445566778899AABBCCDDEEFF", "raw", "00112233445566778899aabbccddeeff00112233445566778899AABBCCDDEEFF"),
+    ] {
+        let cfg = ApConfig::parse(spec).unwrap();
+        assert_eq!((cfg.ssid.as_str(), cfg.psk.as_deref(), cfg.any), (ssid, Some(psk), false), "{spec}");
+        let mut ap = VirtualAp::new(cfg.clone(), false);
+        ap.on_station_tx(&probe_request(&ssid_element(ssid.as_bytes())), 0);
+        assert_eq!(ap.queue.len(), 1, "{spec}");
+        assert_eq!(ssid_of(&ap.queue[0].frame), ssid.as_bytes());
+        assert_eq!(response_summary(&ap.queue[0].frame).1 & 0x10, 0x10, "Privacy");
+        assert!(response_summary(&ap.queue[0].frame).3, "RSN");
+        assert_eq!(join(&mut ap, cfg.bssid, ssid.as_bytes(), Some(psk)), 0, "{spec}");
+        assert_eq!(ap.wanted, Some(Wanted { ssid: ssid.into(), secure: Some(true) }));
+    }
+    assert_eq!(pmk("00112233445566778899aabbccddeeff00112233445566778899AABBCCDDEEFF", b"x")[31], 0xff, "64 hex digits are the PMK");
+}
+
+#[test]
+fn wifi_specs_are_validated_and_an_empty_psk_is_open() {
+    assert!(ApConfig::parse("ssid=cyd-lab,psk=").unwrap().psk.is_none());
+    assert!(ApConfig::parse("ssid=cyd-lab").unwrap().psk.is_none());
+    let any = ApConfig::parse("any").unwrap();
+    assert!(any.any && any.ssid.is_empty() && any.psk.is_none());
+    let any = ApConfig::parse("ssid=*,psk=esp32sim-pass,chan=11").unwrap();
+    assert!(any.any && any.ssid.is_empty() && any.channel == 11 && any.psk.as_deref() == Some("esp32sim-pass"));
+    assert_eq!(ApConfig::parse("ssid=any").unwrap().ssid, "any", "a network named any");
+    for spec in ["ssid=", "ssid=0123456789abcdef0123456789abcdef!", "ssid=x,psk=1234567", "ssid=x,psk=0123456789012345678901234567890123456789012345678901234567890123x",
+                 "ssid=x,psk=00112233445566778899aabbccddeeff00112233445566778899aabbccddeegg", "any,ssid=x", "ssid=x,any", "ssid=*,ssid=y"] {
+        assert!(ApConfig::parse(spec).is_err(), "accepted {spec}");
+    }
+    assert_eq!(split_spec(r"a\,b,c\\,d\e"), ["a,b", r"c\", r"d\e"]);
+}
+
+#[test]
+fn an_open_network_has_no_rsn_and_no_handshake() {
+    let cfg = ApConfig::parse("ssid=cyd-lab").unwrap();
+    let mut ap = VirtualAp::new(cfg.clone(), false);
+    ap.on_station_tx(&probe_request(&ssid_element(b"cyd-lab")), 0);
+    let (_, cap, _, rsn) = response_summary(&ap.queue[0].frame);
+    assert_eq!((cap & 0x10, rsn), (0, false));
+    assert_eq!(join(&mut ap, cfg.bssid, b"cyd-lab", None), 0);
+    assert_eq!(ap.wpa.state, WpaState::Idle);
+    let data = to(cfg.bssid, 0x0108, &[0xaa, 0xaa, 3, 0, 0, 0, 8, 0, 0x45]);
+    assert!(ap.on_station_tx(&data, 0).is_some(), "data passes in the clear");
+    assert_eq!(ap.data_from_ds(&[0u8; 14]).unwrap()[1] & 0x40, 0, "and comes back unprotected");
+}
+
+#[test]
+fn match_any_is_silent_until_a_directed_probe_then_serves_that_ssid_open_and_wpa2() {
+    let cfg = ApConfig::parse("any").unwrap();
+    let mut ap = VirtualAp::new(cfg.clone(), false);
+    assert!(ap.step(1_000_000).is_empty(), "no beacons without an SSID");
+    ap.on_station_tx(&probe_request(&[0, 0]), 1_000_000);
+    assert!(ap.queue.is_empty() && ap.wanted.is_none(), "a wildcard probe names nothing");
+    ap.on_station_tx(&probe_request(&ssid_element(b"cyd-lab")), 1_000_000);
+    assert_eq!(ap.wanted, Some(Wanted { ssid: "cyd-lab".into(), secure: None }));
+    assert_eq!(ap.cfg.ssid, "cyd-lab");
+    assert_eq!(ap.queue.len(), 2);
+    let sec = secure_bssid(&cfg.bssid);
+    assert_eq!(response_summary(&ap.queue[0].frame), (cfg.bssid, 0x0401, 6, false), "open first");
+    assert_eq!(response_summary(&ap.queue[1].frame), (sec, 0x0411, 6, true), "then WPA2");
+    assert!(ap.queue.iter().all(|q| ssid_of(&q.frame) == b"cyd-lab"));
+    assert_eq!((ap.rx_meta(&ap.queue[0].frame).1, ap.rx_meta(&ap.queue[1].frame).1), (-40, -46), "the open one is stronger");
+    ap.queue.clear();
+    let beacons = ap.step(2_000_000);
+    assert_eq!(beacons.len(), 2);
+    assert!(beacons.iter().all(|b| is_beacon(&b.frame) && ssid_of(&b.frame) == b"cyd-lab"));
+}
+
+#[test]
+fn match_any_completes_an_open_join() {
+    let cfg = ApConfig::parse("any").unwrap();
+    let mut ap = VirtualAp::new(cfg.clone(), false);
+    ap.on_station_tx(&probe_request(&ssid_element("test-net's IoT ✓".as_bytes())), 0);
+    assert_eq!(join(&mut ap, cfg.bssid, "test-net's IoT ✓".as_bytes(), None), 0);
+    assert_eq!(ap.wanted, Some(Wanted { ssid: "test-net's IoT ✓".into(), secure: Some(false) }));
+    assert!(ap.serves(false));
+    // joined: another SSID is recorded but not taken
+    ap.on_station_tx(&probe_request(&ssid_element(b"other")), 0);
+    assert_eq!(ap.cfg.ssid, "test-net's IoT ✓");
+    ap.on_station_tx(&to(cfg.bssid, 12 << 4, &[3, 0]), 0);
+    ap.on_station_tx(&probe_request(&ssid_element(b"next")), 0);
+    assert_eq!((ap.cfg.ssid.as_str(), ap.wanted.as_ref().unwrap().ssid.as_str()), ("next", "next"), "after a deauthentication it follows");
+}
+
+#[test]
+fn match_any_with_a_psk_completes_wpa2_on_the_ssid_asked() {
+    let cfg = ApConfig::parse("ssid=*,psk=esp32sim-pass").unwrap();
+    let mut ap = VirtualAp::new(cfg.clone(), false);
+    ap.on_station_tx(&probe_request(&ssid_element(b"esp32sim")), 0);
+    assert_eq!(join(&mut ap, secure_bssid(&cfg.bssid), b"esp32sim", Some("esp32sim-pass")), 0);
+    assert_eq!(ap.wanted, Some(Wanted { ssid: "esp32sim".into(), secure: Some(true) }));
+    assert_eq!(ap.wanted.as_ref().unwrap().json(ap.serves(true)), r#"{"t":"wifi_wanted","ssid":"esp32sim","secure":true,"served":true}"#);
+}
+
+#[test]
+fn match_any_without_a_psk_refuses_wpa2_and_reports_it() {
+    let cfg = ApConfig::parse("any").unwrap();
+    let mut ap = VirtualAp::new(cfg.clone(), false);
+    ap.on_station_tx(&probe_request(&ssid_element(b"my \"home\"")), 0);
+    assert_eq!(ap.wanted.as_ref().unwrap().json(true), r#"{"t":"wifi_wanted","ssid":"my \"home\"","secure":null,"served":true}"#);
+    assert_eq!(join(&mut ap, secure_bssid(&cfg.bssid), b"my \"home\"", Some("whatever!")), 1, "refused: unspecified failure");
+    assert_eq!(ap.state, StaState::Idle);
+    assert_eq!(ap.wanted, Some(Wanted { ssid: "my \"home\"".into(), secure: Some(true) }));
+    assert!(!ap.serves(true));
+    assert!(ap.on_station_tx(&to(secure_bssid(&cfg.bssid), 0, &[0x11, 0, 0, 0]), 0).is_none());
+    assert_eq!(ap.state, StaState::Idle, "no association without authentication");
+}
+
+#[test]
+fn a_fixed_access_point_records_but_does_not_answer_other_ssids() {
+    let mut ap = VirtualAp::new(config(), false);
+    ap.on_station_tx(&probe_request(&ssid_element(b"cyd-lab")), 0);
+    assert!(ap.queue.is_empty());
+    assert_eq!(ap.wanted, Some(Wanted { ssid: "cyd-lab".into(), secure: None }));
+    assert_eq!(ap.cfg.ssid, "esp32sim");
+}

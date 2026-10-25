@@ -231,6 +231,35 @@ fn the_softap_phone_state_is_pushed_on_change() {
     assert!(statuses(&web).is_empty());
 }
 
+/// The network the firmware asks for is pushed as `wifi_wanted` on each change, and a late
+/// joiner gets the latest.
+#[test]
+fn the_wanted_network_is_pushed_on_change() {
+    let mut m = esp32::machine([0; 6], 4 << 20);
+    let web = esp_soc::web::WebServer::queued();
+    m.web = Some(web.clone());
+    const PUSH: u64 = 10_000_000;
+    let wanted = |web: &esp_soc::web::WebServer| -> Vec<String> { web.take_outbox().into_iter().filter(|(k, _)| *k == 1).map(|(_, d)| String::from_utf8(d).unwrap()).filter(|s| s.contains("wifi_wanted")).collect() };
+    let link = esp_soc::SocBus::station_link(&mut m.bus).unwrap();
+    link.attach(Some(esp_soc::wifi::VirtualAp::new(esp_soc::wifi::ApConfig::parse("any").unwrap(), false)), None);
+    m.run(PUSH);
+    assert!(wanted(&web).is_empty());
+    let mut probe = vec![0x40, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 2, 3, 4, 5, 6, 7, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0];
+    probe.extend_from_slice(&[0, 7]); probe.extend_from_slice(b"cyd-lab");
+    let link = esp_soc::SocBus::station_link(&mut m.bus).unwrap();
+    link.ap_mut().unwrap().on_station_tx(&probe, 0);
+    m.run(PUSH);
+    assert_eq!(wanted(&web), [r#"{"t":"wifi_wanted","ssid":"cyd-lab","secure":null,"served":true}"#]);
+    let mut auth = probe[..24].to_vec();
+    auth[0] = 0xb0; auth[4..10].copy_from_slice(&esp_soc::wifi::secure_bssid(&[2, 0x53, 0x49, 0x4d, 0, 1])); auth.extend_from_slice(&[0, 0, 1, 0, 0, 0]);
+    let link = esp_soc::SocBus::station_link(&mut m.bus).unwrap();
+    link.ap_mut().unwrap().on_station_tx(&auth, 0);
+    m.run(PUSH);
+    assert_eq!(wanted(&web), [r#"{"t":"wifi_wanted","ssid":"cyd-lab","secure":true,"served":false}"#]);
+    m.run(PUSH);
+    assert!(wanted(&web).is_empty(), "unchanged: not re-sent");
+}
+
 #[test]
 fn analog_scripts_validate_inputs_and_keep_panel_touch_separate() {
     use esp_soc::ScriptAction;

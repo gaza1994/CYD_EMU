@@ -407,7 +407,7 @@ impl VirtualAp {
             (0, 11) if f.len() >= 30 && self.profile(&f[4..10]).is_some() => {              // authentication (open system)
                 let (alg, seq) = (u16::from_le_bytes([f[24], f[25]]), u16::from_le_bytes([f[26], f[27]]));
                 if self.log { eprintln!("[wifi] station AUTH req alg={} seq={} status={} hex={:02x?}", alg, seq, u16::from_le_bytes([f[28],f[29]]), f); }
-                let Some((bssid, secure)) = self.profile(&f[4..10]) else { return None };
+                let (bssid, secure) = self.profile(&f[4..10])?;
                 if alg == 0 && seq == 1 {
                     // the station picked a profile: now its security is known
                     let w = Some(Wanted { ssid: self.cfg.ssid.clone(), secure: Some(secure) });
