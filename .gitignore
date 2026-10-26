@@ -45,3 +45,5 @@ scratch/
 /cyd-lab/firmware/esphome-ha/.esphome/
 # the root ignores *.png; cyd-lab's documentation screenshots and assets are committed
 !/cyd-lab/**/*.png
+# and so are the root README's banner and screenshots
+!/docs/readme/*.png

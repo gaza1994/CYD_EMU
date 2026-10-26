@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset="docs/readme/banner-light.png">
+    <img src="docs/readme/banner.png" alt="CYD_EMU: Cheap Yellow Display emulator for Windows. Real screens from the emulator: an ESPHome device ready to adopt in Home Assistant, an Arduino sketch and Bruce" width="1280">
+  </picture>
+</p>
+
 # CYD_EMU
 
 > **This repository is a fork of [esp32sim](https://github.com/mikroverk/esp32sim)**, the ESP32
@@ -43,6 +50,49 @@ has a firmware gallery, Wi-Fi and Home Assistant setup, and an Arduino board pac
 3. Click **+ New device**, pick ESP32-2432S028R, then **Power on** and **Install firmware…**.
 
 The full guide is [cyd-lab/README.md](cyd-lab/README.md).
+
+## See it in action
+
+All of these are real captures of cyd-lab running unmodified firmware, on 127.0.0.1 only.
+
+<table>
+<tr>
+<td width="50%" valign="top">
+<img src="docs/readme/esphome-workbench.png" alt="cyd-lab workbench with an ESPHome device showing Ready to adopt in Home Assistant, and its serial console">
+<br><sub><b>The workbench.</b> An ESPHome device on its emulated CYD, with its power, EN and BOOT buttons, touch screen and live serial console.</sub>
+</td>
+<td width="50%" valign="top">
+<img src="docs/readme/firmware-gallery.png" alt="The Install firmware dialog: a catalogue of firmware for the selected board, with what works in the emulator">
+<br><sub><b>Firmware gallery.</b> One click installs ESPHome, Bruce, NerdMiner, Marauder and more, each with notes on what works in the emulator.</sub>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<img src="docs/readme/wifi-live-change.png" alt="The Wi-Fi popover: the emulated network renamed while the firmware runs, and the firmware asking for a different network">
+<br><sub><b>Live Wi-Fi.</b> Rename the emulated access point while the firmware runs; here ESPHome notices it's gone and falls back to its own hotspot.</sub>
+</td>
+<td width="50%" valign="top">
+<img src="docs/readme/device-hotspot-portal.png" alt="A weather station firmware's setup hotspot: cyd-lab joins it and opens its setup page in a browser beside the screen">
+<br><sub><b>Device hotspots.</b> A weather station opens its setup access point; cyd-lab joins it like a phone and opens the captive portal in your browser.</sub>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<img src="docs/readme/home-assistant-api.png" alt="The Home Assistant badge: add the ESPHome integration with host 127.0.0.1 and the forwarded API port">
+<br><sub><b>Home Assistant.</b> The ESPHome API is forwarded to a port on the PC, so Home Assistant can adopt the emulated device.</sub>
+</td>
+<td width="50%" valign="top">
+<img src="docs/readme/bruce-3.5-capacitive.png" alt="Bruce firmware's WiFi menu on an emulated ESP32-3248S035C 3.5 inch capacitive touch board">
+<br><sub><b>Other boards.</b> Bruce on the 3.5" ESP32-3248S035C, with its ST7796 panel and GT911 capacitive touch.</sub>
+</td>
+</tr>
+<tr>
+<td colspan="2" valign="top">
+<img src="docs/readme/arduino-serial-console.png" alt="An Arduino sketch uploaded with esptool over rfc2217, printing touch coordinates and echoing input in the serial console">
+<br><sub><b>Arduino and serial.</b> A sketch flashed by esptool over <code>rfc2217://127.0.0.1</code>, printing taps and echoing what you type in the serial console.</sub>
+</td>
+</tr>
+</table>
 
 ## Repository layout, releases and licences
 
