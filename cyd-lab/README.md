@@ -390,7 +390,7 @@ Tested with openHASP's CYD manifest
 part at 0x0, `new_install_prompt_erase: true`). It boots to openHASP's Wi-Fi setup screen
 (AP `HASP-xxxxxx`, QR code) with a full boot log on the console:
 
-![openHASP installed from its web manifest](../cyd-lab-screenshot-webinstall.png)
+![Firmware gallery and web installer](../docs/readme/firmware-gallery.png)
 
 Known gap: openHASP's picture comes out **mirrored left to right**. Arduino sketches
 (TFT_eSPI `ILI9341_2_DRIVER`) and the earlier test firmware draw the right way round, so
@@ -499,7 +499,7 @@ then "Hard resetting via RTS pin", and the board boots and draws. In the Serial 
 taps print `touch 1: x=41 y=80 …` and typed lines come back as `echo: …`. Set the
 device's Screen view to 270° for this landscape sketch.
 
-![CydHello uploaded with arduino-cli](../cyd-lab-screenshot-arduino.png)
+![An Arduino sketch uploaded with arduino-cli, with its serial output in the console](../docs/readme/arduino-serial-console.png)
 
 ### Arduino IDE 2 on Windows: the button (tested under wine, not yet on real Windows)
 
